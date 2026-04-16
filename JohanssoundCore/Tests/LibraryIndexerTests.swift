@@ -29,15 +29,50 @@ final class LibraryIndexerTests: XCTestCase {
             XCTFail("Expected an All Songs playlist")
             return
         }
-        let sumFromOthers = playlists
-            .filter { $0.kind == .folder || $0.kind == .looseTracks }
-            .flatMap(\.tracks)
-        XCTAssertEqual(all.tracks.count, sumFromOthers.count)
-        // Every track URL in All Songs should exist in one of the other
-        // playlists — the union must not invent tracks.
-        let otherURLs = Set(sumFromOthers.map(\.url))
+        // Under Model B, top-level folder playlists already carry the union
+        // of all their descendants' tracks, so summing top-level folders +
+        // Loose Tracks equals the All Songs total (no double-counting).
+        let topLevelFolders = playlists.filter { $0.kind == .folder }
+        let loose = playlists.filter { $0.kind == .looseTracks }
+        let topLevelTrackCount = topLevelFolders.reduce(0) { $0 + $1.tracks.count }
+            + loose.reduce(0) { $0 + $1.tracks.count }
+        XCTAssertEqual(all.tracks.count, topLevelTrackCount)
+
+        // Every track URL in All Songs should exist in one of the top-level
+        // folder or loose playlists — the union must not invent tracks.
+        let topLevelURLs = Set(
+            topLevelFolders.flatMap(\.tracks).map(\.url)
+                + loose.flatMap(\.tracks).map(\.url)
+        )
         for track in all.tracks {
-            XCTAssertTrue(otherURLs.contains(track.url))
+            XCTAssertTrue(topLevelURLs.contains(track.url))
+        }
+    }
+
+    func testFolderPlaylistHasChildrenForNestedSubfolders() async throws {
+        let fixtures = try locateFixtureFolder()
+        let playlists = try await LibraryIndexer().scan(folder: fixtures)
+        guard let artistA = playlists.first(where: { $0.name == "ArtistA" }) else {
+            XCTFail("Expected ArtistA folder playlist")
+            return
+        }
+        // ArtistA has a single sub-folder AlbumA which holds the one track.
+        XCTAssertEqual(artistA.children.map(\.name), ["AlbumA"])
+        XCTAssertEqual(artistA.kind, .folder)
+
+        guard let albumA = artistA.children.first else {
+            XCTFail("Expected AlbumA child playlist")
+            return
+        }
+        XCTAssertEqual(albumA.kind, .folder)
+        XCTAssertTrue(albumA.children.isEmpty)
+        XCTAssertEqual(albumA.tracks.count, 1)
+
+        // Union behaviour: ArtistA.tracks must include AlbumA's track(s).
+        XCTAssertEqual(artistA.tracks.count, albumA.tracks.count)
+        let artistURLs = Set(artistA.tracks.map(\.url))
+        for track in albumA.tracks {
+            XCTAssertTrue(artistURLs.contains(track.url))
         }
     }
 

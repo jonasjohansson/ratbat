@@ -4,10 +4,14 @@ import os
 
 /// Scans a music-library folder and groups tracks into ``Playlist`` values.
 ///
-/// Top-level subfolders of the root each become a folder-kind playlist.
-/// Audio files sitting directly in the root are collected into a single
-/// "Loose Tracks" playlist (omitted if none exist). A synthetic "All Songs"
-/// playlist — the union of every track — is always included first.
+/// **Model B — hierarchical folders:** every folder at any depth becomes a
+/// playlist. A folder playlist's ``Playlist/tracks`` is the *union* of every
+/// audio file discovered under it (direct children plus everything beneath
+/// each sub-folder), and its ``Playlist/children`` holds the direct
+/// sub-folder playlists so the sidebar can render the tree. Audio files
+/// sitting directly in the root are collected into a single "Loose Tracks"
+/// playlist (omitted if none exist). A synthetic "All Songs" playlist — the
+/// union of every track — is always included first.
 ///
 /// v1 walks files sequentially. That's slower than `TaskGroup`-based
 /// parallelism, but it's also simple, avoids I/O contention on spinning
@@ -34,7 +38,9 @@ public struct LibraryIndexer: Sendable {
     /// Scan `root` and return the resulting playlists.
     ///
     /// Order: "All Songs" first, then "Loose Tracks" (if any), then
-    /// folder-kind playlists sorted A–Z case-insensitively.
+    /// top-level folder-kind playlists sorted A–Z case-insensitively. Each
+    /// folder playlist carries its own sub-folders in ``Playlist/children``,
+    /// which the sidebar renders recursively.
     ///
     /// Files whose metadata can't be loaded are logged and skipped; they
     /// never fail the whole scan. That's the right trade-off for a local
@@ -42,8 +48,7 @@ public struct LibraryIndexer: Sendable {
     public func scan(folder root: URL) async throws -> [Playlist] {
         let fm = FileManager.default
 
-        // Use `contentsOfDirectory` (non-recursive) for the first-level
-        // folder-vs-file decision, then recurse inside each subfolder.
+        // First-level split: files vs folders at the root.
         let topLevel: [URL]
         do {
             topLevel = try fm.contentsOfDirectory(
@@ -62,31 +67,26 @@ public struct LibraryIndexer: Sendable {
             return []
         }
 
-        var folderPlaylists: [Playlist] = []
+        var topLevelFolderURLs: [URL] = []
         var looseURLs: [URL] = []
 
         for url in topLevel {
             let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey])
             if values?.isDirectory == true {
-                let tracks = await scanAudioFiles(in: url)
-                // Even empty subfolders become playlists — users can drop
-                // files in later and the group is still "theirs". If that
-                // feels wrong in practice we can flip this to skip empties.
-                folderPlaylists.append(
-                    Playlist(
-                        name: url.lastPathComponent,
-                        folder: url,
-                        tracks: tracks,
-                        kind: .folder
-                    )
-                )
+                topLevelFolderURLs.append(url)
             } else if values?.isRegularFile == true,
                       Self.audioExtensions.contains(url.pathExtension.lowercased()) {
                 looseURLs.append(url)
             }
         }
 
-        folderPlaylists.sort {
+        // Build folder playlists recursively, one per top-level subfolder.
+        var topLevelPlaylists: [Playlist] = []
+        for url in topLevelFolderURLs {
+            let playlist = await buildFolderPlaylist(at: url)
+            topLevelPlaylists.append(playlist)
+        }
+        topLevelPlaylists.sort {
             $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
         }
 
@@ -98,36 +98,107 @@ public struct LibraryIndexer: Sendable {
                 name: "Loose Tracks",
                 folder: root,
                 tracks: looseTracks,
+                children: [],
                 kind: .looseTracks
             )
         }
 
-        // All Songs = every folder playlist's tracks + loose tracks, in
-        // enumeration order. Global sorting (by artist/title etc.) belongs
-        // in UI-level sort controls — that's Task 1.10.
+        // All Songs = every folder playlist's (already union-ed) tracks +
+        // loose tracks. Because each folder's `.tracks` is already the union
+        // of its descendants, summing the top-level folders is enough to
+        // cover the whole tree.
         var allTracks: [Track] = []
-        for playlist in folderPlaylists { allTracks.append(contentsOf: playlist.tracks) }
+        for playlist in topLevelPlaylists { allTracks.append(contentsOf: playlist.tracks) }
         if let loose = loosePlaylist { allTracks.append(contentsOf: loose.tracks) }
         let allSongs = Playlist(
             name: "All Songs",
             folder: nil,
             tracks: allTracks,
+            children: [],
             kind: .allSongs
         )
 
         var result: [Playlist] = [allSongs]
         if let loose = loosePlaylist { result.append(loose) }
-        result.append(contentsOf: folderPlaylists)
+        result.append(contentsOf: topLevelPlaylists)
         return result
     }
 
     // MARK: - Private
 
-    /// Recursively enumerate audio files under `folder`, load metadata, and
-    /// return tracks sorted by artist → album → title (case-insensitive).
-    private func scanAudioFiles(in folder: URL) async -> [Track] {
-        let urls = enumerateAudioFiles(under: folder)
-        return await makeSortedTracks(from: urls)
+    /// Recursively build a folder playlist for `url`.
+    ///
+    /// The returned playlist:
+    /// - ``Playlist/children`` — direct sub-folder playlists, sorted A–Z.
+    /// - ``Playlist/tracks`` — union of direct audio files (sorted by
+    ///   artist/album/title) followed by each child's tracks in child
+    ///   order. That gives us a deterministic ordering without trying to
+    ///   globally re-sort across the union; the UI's column-sort controls
+    ///   can re-sort as the user wishes.
+    private func buildFolderPlaylist(at url: URL) async -> Playlist {
+        let fm = FileManager.default
+        let contents: [URL]
+        do {
+            contents = try fm.contentsOfDirectory(
+                at: url,
+                includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey],
+                options: [.skipsHiddenFiles]
+            )
+        } catch {
+            Self.log.warning(
+                "Couldn't read \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)"
+            )
+            return Playlist(
+                name: url.lastPathComponent,
+                folder: url,
+                tracks: [],
+                children: [],
+                kind: .folder
+            )
+        }
+
+        var directAudioURLs: [URL] = []
+        var subfolderURLs: [URL] = []
+        for childURL in contents {
+            let values = try? childURL.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey])
+            if values?.isDirectory == true {
+                subfolderURLs.append(childURL)
+            } else if values?.isRegularFile == true,
+                      Self.audioExtensions.contains(childURL.pathExtension.lowercased()) {
+                directAudioURLs.append(childURL)
+            }
+        }
+
+        // Recurse into sub-folders. Sequential — recursive async in a
+        // TaskGroup would complicate error handling for no obvious win on a
+        // normally-sized local library. Easy to revisit later.
+        var children: [Playlist] = []
+        children.reserveCapacity(subfolderURLs.count)
+        for subURL in subfolderURLs {
+            let child = await buildFolderPlaylist(at: subURL)
+            children.append(child)
+        }
+        children.sort {
+            $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+
+        let directTracks = await makeSortedTracks(from: directAudioURLs)
+
+        // Union: this folder's own files + every descendant's tracks (which
+        // are themselves already unioned, so this one-level concat covers
+        // the full subtree).
+        var unionTracks: [Track] = directTracks
+        for child in children {
+            unionTracks.append(contentsOf: child.tracks)
+        }
+
+        return Playlist(
+            name: url.lastPathComponent,
+            folder: url,
+            tracks: unionTracks,
+            children: children,
+            kind: .folder
+        )
     }
 
     private func makeSortedTracks(from urls: [URL]) async -> [Track] {
@@ -152,27 +223,6 @@ public struct LibraryIndexer: Sendable {
             if b != .orderedSame { return b == .orderedAscending }
             return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
         }
-    }
-
-    private func enumerateAudioFiles(under folder: URL) -> [URL] {
-        let fm = FileManager.default
-        guard let enumerator = fm.enumerator(
-            at: folder,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return []
-        }
-
-        var results: [URL] = []
-        for case let url as URL in enumerator {
-            let ext = url.pathExtension.lowercased()
-            guard Self.audioExtensions.contains(ext) else { continue }
-            let isRegular = (try? url.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile ?? false
-            guard isRegular else { continue }
-            results.append(url)
-        }
-        return results
     }
 
     private func makeTrack(for url: URL) async throws -> Track {
