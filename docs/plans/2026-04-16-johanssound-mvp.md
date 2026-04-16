@@ -6,7 +6,9 @@
 
 **Architecture:** SwiftUI multi-platform (macOS + iOS) sharing ~80% of code. macOS target is the full product (library, downloader, player, broadcaster). iOS target is listener-only v1. Download leverages bundled `invzfnc/spotify-downloader` Python script as a subprocess. Radio broadcast taps the playing audio, re-encodes to MP3, serves on HTTP via `Network.framework`, and exposes a public URL via bundled `cloudflared`.
 
-**Tech Stack:** Swift 5.9+, SwiftUI, AVFoundation, Network.framework, Python 3.12 embedded (`python-build-standalone`), `yt-dlp`, `ffmpeg` or `lame` for MP3 encoding, `cloudflared` (Go binary), Xcode 15+.
+**Tech Stack:** Swift 6.0 (strict concurrency), SwiftUI, AVFoundation, Network.framework, Python 3.12 embedded (`python-build-standalone`), `yt-dlp`, `ffmpeg` or `lame` for MP3 encoding, `cloudflared` (Go binary), Xcode 26+.
+
+> **Note:** Opting into Swift 6 strict concurrency from the start. Will require `@MainActor` / `Sendable` discipline for AVFoundation and `Network.framework` work in later phases. Worth the friction — catches concurrency bugs at compile time.
 
 **Design doc:** `../../skynet/wiki/projects/johanssound.md` (in the sibling skynet repo)
 
