@@ -1,0 +1,77 @@
+name: Johanssound
+options:
+  bundleIdPrefix: se.jonasjohansson.johanssound
+  deploymentTarget:
+    macOS: "14.0"
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGNING_REQUIRED: NO
+    CODE_SIGNING_ALLOWED: NO
+targets:
+  JohanssoundCore:
+    type: framework
+    platform: [macOS, iOS]
+    sources:
+      - JohanssoundCore
+    info:
+      path: JohanssoundCore/Info.plist
+      properties:
+        CFBundleName: JohanssoundCore
+        CFBundleDisplayName: JohanssoundCore
+        CFBundleIdentifier: se.jonasjohansson.johanssound.core
+    settings:
+      base:
+        DEFINES_MODULE: YES
+        PRODUCT_NAME: JohanssoundCore
+        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "1.0"
+  JohanssoundMac:
+    type: application
+    platform: macOS
+    sources:
+      - JohanssoundMac
+    dependencies:
+      - target: JohanssoundCore_macOS
+        link: true
+        embed: true
+    info:
+      path: JohanssoundMac/Info.plist
+      properties:
+        CFBundleName: Johanssound
+        CFBundleDisplayName: Johanssound
+        LSMinimumSystemVersion: "14.0"
+        NSHumanReadableCopyright: "Copyright (c) 2026 Jonas Johansson"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: se.jonasjohansson.johanssound.mac
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        ENABLE_HARDENED_RUNTIME: YES
+  JohanssoundIOS:
+    type: application
+    platform: iOS
+    sources:
+      - JohanssoundIOS
+    dependencies:
+      - target: JohanssoundCore_iOS
+        link: true
+        embed: true
+    info:
+      path: JohanssoundIOS/Info.plist
+      properties:
+        CFBundleName: Johanssound
+        CFBundleDisplayName: Johanssound
+        UILaunchScreen:
+          UIColorName: ""
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: se.jonasjohansson.johanssound.ios
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
