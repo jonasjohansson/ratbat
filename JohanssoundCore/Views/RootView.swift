@@ -13,6 +13,11 @@ import SwiftUI
 public struct RootView: View {
     @State private var musicFolder: URL?
     @StateObject private var player = AudioPlayer()
+    /// Owned by the view so it lives as long as the window does. Held as
+    /// optional `@State` because we can't `@StateObject` a non-
+    /// `ObservableObject`, and we want to construct it *after* `player`
+    /// is guaranteed to exist (first `onAppear`).
+    @State private var nowPlaying: NowPlayingController?
     private let config: LibraryConfig
 
     public init(config: LibraryConfig = LibraryConfig()) {
@@ -42,6 +47,11 @@ public struct RootView: View {
             if musicFolder != nil {
                 Divider()
                 PlayerView(player: player)
+            }
+        }
+        .onAppear {
+            if nowPlaying == nil {
+                nowPlaying = NowPlayingController(player: player)
             }
         }
     }
