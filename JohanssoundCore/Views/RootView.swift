@@ -29,10 +29,11 @@ public struct RootView: View {
         VStack(spacing: 0) {
             Group {
                 if let folder = musicFolder {
-                    LibraryView(folder: folder) { track in
-                        // v1: play a single track. Task 1.7 will switch
-                        // this to queue-up-the-whole-list-and-start-here.
-                        player.play(track)
+                    LibraryView(folder: folder) { tracks, startIndex in
+                        // Queue the whole library and start from the picked
+                        // track so prev/next (and media keys) traverse the
+                        // full list rather than bouncing on a one-track queue.
+                        player.play(queue: tracks, startingAt: startIndex)
                     }
                 } else {
                     FolderPickerView { url in
