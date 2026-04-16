@@ -3,59 +3,46 @@ import SwiftUI
 import AppKit
 #endif
 
-/// Shows the tracks found in a given music folder.
+/// Detail view for a single ``Playlist``.
 ///
-/// Four states:
-/// - Loading: progress indicator while the indexer scans.
-/// - Error:   a short message with the underlying localised description.
-/// - Empty:   the folder exists but contains no audio files.
-/// - List:    one row per track, sorted by the indexer.
+/// Two states:
+/// - Empty: the playlist has no tracks (rare — e.g. a selected folder that
+///   only contained non-audio files).
+/// - List:  one row per track, in the order the indexer produced them.
 ///
-/// The scan is re-triggered when `folder` changes, via `.task(id: folder)`,
-/// so swapping folders in a parent view will refresh the list without
-/// rebuilding ``LibraryView``.
+/// ``LibraryView`` is now a pure "detail" view for a playlist picked in
+/// ``PlaylistsSidebarView``. It no longer owns a ``LibraryViewModel`` —
+/// that has moved up to ``RootView`` so the sidebar and detail share one
+/// source of truth. Scanning is re-triggered by the parent via
+/// `.task(id: folder)` on the split view itself.
 ///
 /// Interaction:
 /// - Single-click (or arrow keys) selects a row via `List(selection:)`.
 /// - Double-click or Enter plays the selected track.
 /// - Right-click opens a context menu with "Play" and "Show in Finder".
 ///
-/// The `onPlay` callback hands the *whole* track list plus the starting
-/// index to the caller so the audio player can queue the full library and
+/// The `onPlay` callback hands the *whole* playlist plus the starting
+/// index to the caller so the audio player can queue the full playlist and
 /// have next/prev traverse it, rather than playing a one-track queue.
 public struct LibraryView: View {
-    @StateObject private var vm = LibraryViewModel()
-    @State private var selectedID: Track.ID?
-    public let folder: URL
+    public let playlist: Playlist
     public let onPlay: ([Track], Int) -> Void
+    @State private var selectedID: Track.ID?
 
-    public init(folder: URL, onPlay: @escaping ([Track], Int) -> Void) {
-        self.folder = folder
+    public init(playlist: Playlist, onPlay: @escaping ([Track], Int) -> Void) {
+        self.playlist = playlist
         self.onPlay = onPlay
     }
 
     public var body: some View {
         Group {
-            if vm.isLoading {
-                ProgressView("Scanning library…")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if let error = vm.error {
-                VStack(spacing: 12) {
-                    Text("Couldn't read library").font(.headline)
-                    Text(error)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                }
-                .padding()
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if vm.tracks.isEmpty {
-                Text("No audio files in this folder.")
+            if playlist.tracks.isEmpty {
+                Text("No tracks in this playlist.")
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 List(selection: $selectedID) {
-                    ForEach(vm.tracks) { track in
+                    ForEach(playlist.tracks) { track in
                         TrackRow(track: track)
                             .contentShape(Rectangle())
                             .onTapGesture(count: 2) { play(track) }
@@ -68,7 +55,7 @@ public struct LibraryView: View {
                 }
                 .onKeyPress(.return) {
                     if let id = selectedID,
-                       let track = vm.tracks.first(where: { $0.id == id }) {
+                       let track = playlist.tracks.first(where: { $0.id == id }) {
                         play(track)
                         return .handled
                     }
@@ -76,12 +63,12 @@ public struct LibraryView: View {
                 }
             }
         }
-        .task(id: folder) { await vm.load(from: folder) }
+        .navigationTitle(playlist.name)
     }
 
     private func play(_ track: Track) {
-        guard let index = vm.tracks.firstIndex(where: { $0.id == track.id }) else { return }
-        onPlay(vm.tracks, index)
+        guard let index = playlist.tracks.firstIndex(where: { $0.id == track.id }) else { return }
+        onPlay(playlist.tracks, index)
     }
 
     private func showInFinder(_ track: Track) {
