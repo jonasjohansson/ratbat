@@ -232,10 +232,30 @@ public struct LibraryIndexer: Sendable {
         let seconds = CMTimeGetSeconds(durationValue)
         let duration = seconds.isFinite ? seconds : 0
 
-        let metadata = try await asset.load(.commonMetadata)
-        let title = await firstStringValue(in: metadata, forKey: .commonKeyTitle)
-        let artist = await firstStringValue(in: metadata, forKey: .commonKeyArtist)
-        let album = await firstStringValue(in: metadata, forKey: .commonKeyAlbumName)
+        // Common metadata — covers title/artist/album/genre on most files.
+        let common = try await asset.load(.commonMetadata)
+        let title = await firstStringValue(in: common, forKey: .commonKeyTitle)
+        let artist = await firstStringValue(in: common, forKey: .commonKeyArtist)
+        let album = await firstStringValue(in: common, forKey: .commonKeyAlbumName)
+        var genre = await firstStringValue(in: common, forKey: .commonKeyType)
+
+        // Full metadata — needed to pick up format-specific identifiers for
+        // track number, year, and (some) genre tags that don't surface under
+        // the `common*` keys.
+        let allMetadata = try await asset.load(.metadata)
+        let trackNumber = await parseTrackNumber(from: allMetadata)
+        let year = await parseYear(from: allMetadata)
+        if genre == nil {
+            genre = await parseGenre(from: allMetadata)
+        }
+
+        // Bitrate: `estimatedDataRate` is bps. Convert to kbps; treat 0
+        // (or non-finite) as "unknown".
+        let bitrate = await loadBitrateKbps(for: asset)
+
+        // File-system facts — these we can always read, independent of
+        // whether metadata parsing succeeded.
+        let (fileSize, dateAdded) = fileSystemAttributes(for: url)
 
         let filenameFallback = url.deletingPathExtension().lastPathComponent
 
@@ -244,7 +264,13 @@ public struct LibraryIndexer: Sendable {
             title: nonEmpty(title) ?? filenameFallback,
             artist: nonEmpty(artist) ?? "Unknown Artist",
             album: nonEmpty(album) ?? "Unknown Album",
-            duration: duration
+            duration: duration,
+            trackNumber: trackNumber,
+            year: year,
+            genre: nonEmpty(genre),
+            bitrate: bitrate,
+            fileSize: fileSize,
+            dateAdded: dateAdded
         )
     }
 
@@ -260,6 +286,113 @@ public struct LibraryIndexer: Sendable {
             }
         }
         return nil
+    }
+
+    /// Extract a track number from ID3 `TRCK` (often shaped `"3/12"`) or
+    /// the iTunes equivalent, returning just the leading integer.
+    private func parseTrackNumber(from items: [AVMetadataItem]) async -> Int? {
+        let candidates: [AVMetadataIdentifier] = [
+            .id3MetadataTrackNumber,
+            .iTunesMetadataTrackNumber
+        ]
+        for item in items where candidates.contains(item.identifier ?? .init(rawValue: "")) {
+            // iTunes can store the track number as a numeric value; ID3
+            // typically as a string like "3/12".
+            if let number = try? await item.load(.numberValue) {
+                return number.intValue
+            }
+            if let string = try? await item.load(.stringValue) {
+                let head = string.split(separator: "/").first.map(String.init) ?? string
+                if let n = Int(head.trimmingCharacters(in: .whitespaces)) {
+                    return n
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Year parsing looks across the handful of identifiers different
+    /// tagging conventions use. We only need the 4-digit year even if the
+    /// tag carries a full `YYYY-MM-DDTHH:MM:SS` timestamp.
+    private func parseYear(from items: [AVMetadataItem]) async -> Int? {
+        let candidates: [AVMetadataIdentifier] = [
+            .id3MetadataYear,
+            .id3MetadataReleaseTime,
+            .id3MetadataRecordingTime,
+            .id3MetadataOriginalReleaseYear,
+            .iTunesMetadataReleaseDate,
+            .commonIdentifierCreationDate
+        ]
+        for item in items where candidates.contains(item.identifier ?? .init(rawValue: "")) {
+            if let number = try? await item.load(.numberValue) {
+                let n = number.intValue
+                if n >= 1000 && n <= 9999 { return n }
+            }
+            if let string = try? await item.load(.stringValue) {
+                // Scan the first four consecutive digits as the year.
+                var digits = ""
+                for ch in string where ch.isNumber {
+                    digits.append(ch)
+                    if digits.count == 4 { break }
+                }
+                if digits.count == 4, let n = Int(digits) {
+                    return n
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Genre fallback when `commonKeyType` didn't yield anything — iTunes
+    /// and ID3 both have their own genre identifiers.
+    private func parseGenre(from items: [AVMetadataItem]) async -> String? {
+        let candidates: [AVMetadataIdentifier] = [
+            .id3MetadataContentType,
+            .iTunesMetadataUserGenre,
+            .iTunesMetadataPredefinedGenre
+        ]
+        for item in items where candidates.contains(item.identifier ?? .init(rawValue: "")) {
+            if let string = try? await item.load(.stringValue),
+               !string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return string
+            }
+        }
+        return nil
+    }
+
+    /// Pull the audio track's `estimatedDataRate` and convert bps → kbps.
+    /// Returns `nil` when no audio track exists or the data rate is
+    /// non-positive (common on lossless/VBR files where AVFoundation
+    /// reports 0).
+    private func loadBitrateKbps(for asset: AVURLAsset) async -> Int? {
+        guard let audioTrack = try? await asset.loadTracks(withMediaType: .audio).first else {
+            return nil
+        }
+        guard let rate = try? await audioTrack.load(.estimatedDataRate),
+              rate.isFinite, rate > 0 else {
+            return nil
+        }
+        return Int((rate / 1000).rounded())
+    }
+
+    /// Read file size and a sensible "added to library" date. `fileSize`
+    /// falls back to 0 when the resource value is missing; `dateAdded`
+    /// falls back through `.addedToDirectoryDate` → `.contentModificationDate`
+    /// → "now" so we always return *something*.
+    private func fileSystemAttributes(for url: URL) -> (Int64, Date) {
+        let keys: Set<URLResourceKey> = [
+            .fileSizeKey,
+            .addedToDirectoryDateKey,
+            .contentModificationDateKey
+        ]
+        guard let values = try? url.resourceValues(forKeys: keys) else {
+            return (0, Date())
+        }
+        let size = Int64(values.fileSize ?? 0)
+        let date = values.addedToDirectoryDate
+            ?? values.contentModificationDate
+            ?? Date()
+        return (size, date)
     }
 
     private func nonEmpty(_ s: String?) -> String? {

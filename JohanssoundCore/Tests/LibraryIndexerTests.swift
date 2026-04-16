@@ -76,6 +76,24 @@ final class LibraryIndexerTests: XCTestCase {
         }
     }
 
+    func testTracksHaveFileSizeAndDateAdded() async throws {
+        // File-system facts (size, dateAdded) are read independently of
+        // metadata parsing, so even our tag-less fixture files should
+        // report a non-zero size and a past modification date. The
+        // optional ID3/iTunes metadata fields (trackNumber, year, genre,
+        // bitrate) are allowed to be nil on these fixtures — we just
+        // assert they don't crash the indexer.
+        let fixtures = try locateFixtureFolder()
+        let playlists = try await LibraryIndexer().scan(folder: fixtures)
+        guard let all = playlists.first(where: { $0.kind == .allSongs }) else {
+            XCTFail("Expected an All Songs playlist")
+            return
+        }
+        XCTAssertFalse(all.tracks.isEmpty)
+        XCTAssertTrue(all.tracks.allSatisfy { $0.fileSize > 0 })
+        XCTAssertTrue(all.tracks.allSatisfy { $0.dateAdded.timeIntervalSinceNow < 0 })
+    }
+
     func testLooseTracksPlaylistPresentWhenRootHasAudio() async throws {
         let fixtures = try locateFixtureFolder()
         let playlists = try await LibraryIndexer().scan(folder: fixtures)
