@@ -16,7 +16,9 @@ targets:
     type: framework
     platform: [macOS, iOS]
     sources:
-      - JohanssoundCore
+      - path: JohanssoundCore
+        excludes:
+          - Tests
     info:
       path: JohanssoundCore/Info.plist
       properties:
@@ -75,3 +77,19 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: se.jonasjohansson.johanssound.ios
         IPHONEOS_DEPLOYMENT_TARGET: "17.0"
         TARGETED_DEVICE_FAMILY: "1,2"
+  JohanssoundCoreTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - JohanssoundCore/Tests
+    dependencies:
+      - target: JohanssoundCore_macOS
+schemes:
+  JohanssoundCore:
+    build:
+      targets:
+        JohanssoundCore_macOS: all
+        JohanssoundCoreTests: [test]
+    test:
+      targets:
+        - JohanssoundCoreTests
