@@ -93,7 +93,7 @@ final class LibraryViewModelTests: XCTestCase {
             vm1.playlists.map(\.name),
             vm2.playlists.map(\.name)
         )
-        XCTAssertNil(vm2.scanProgress, "Cache hit should leave scanProgress nil")
+        XCTAssertNil(vm2.scanPhase, "Cache hit should leave scanPhase nil")
     }
 
     // MARK: - Helpers

@@ -96,23 +96,27 @@ final class LibraryIndexerTests: XCTestCase {
 
     @MainActor
     func testScanReportsProgress() async throws {
-        // The callback must see (processed, total) grow monotonically and
-        // end with processed == total. Because the scan is now parallel,
-        // interim values can land in any order across tasks, but the
-        // final tick is guaranteed to read "total / total" — that's the
-        // invariant we care about for the UI caption.
+        // Task 1.14: progress is now phase-aware. We must see at least one
+        // `.discovering` event (Phase 1 always emits a `(0, 0)` kickoff so
+        // tests and tiny libraries deterministically observe one) and end
+        // with a `.loading` whose processed == total. Interim Phase-2
+        // values are throttled so we don't assert on the call count —
+        // only that the terminal frame is correct.
         let fixtures = try locateFixtureFolder()
-        var lastCurrent = 0
-        var lastTotal = 0
-        var callCount = 0
-        _ = try await LibraryIndexer().scan(folder: fixtures) { current, total in
-            lastCurrent = current
-            lastTotal = total
-            callCount += 1
+        var sawDiscovering = false
+        var lastLoading: (processed: Int, total: Int)?
+        _ = try await LibraryIndexer().scan(folder: fixtures) { phase in
+            switch phase {
+            case .discovering:
+                sawDiscovering = true
+            case .loading(let p, let t):
+                lastLoading = (p, t)
+            }
         }
-        XCTAssertGreaterThan(lastTotal, 0, "Fixture library should contain audio files")
-        XCTAssertEqual(lastCurrent, lastTotal, "Final progress tick should equal total")
-        XCTAssertEqual(callCount, lastTotal, "Callback should fire exactly once per file")
+        XCTAssertTrue(sawDiscovering, "Should emit at least one discovering event")
+        XCTAssertNotNil(lastLoading, "Should emit at least one loading event")
+        XCTAssertGreaterThan(lastLoading?.total ?? 0, 0, "Fixture library should contain audio files")
+        XCTAssertEqual(lastLoading?.processed, lastLoading?.total, "Final loading tick should equal total")
     }
 
     func testLooseTracksPlaylistPresentWhenRootHasAudio() async throws {

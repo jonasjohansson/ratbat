@@ -13,16 +13,21 @@ import os
 /// playlist (omitted if none exist). A synthetic "All Songs" playlist — the
 /// union of every track — is always included first.
 ///
-/// **Task 1.13 (parallel + progress):** metadata loading now runs in a
-/// bounded `TaskGroup` (8 concurrent AVFoundation loads). The scan is
-/// two-pass: a fast enumeration step that collects every audio URL + the
-/// folder tree, then a parallel metadata pass that reports progress via an
-/// actor-protected counter. The counter fans out to the caller-supplied
-/// `progress` closure, which ``LibraryViewModel`` wires into a published
-/// "Scanning X / Y tracks…" string in the UI. AVFoundation's metadata APIs
-/// are already async/off-main, so we just need to keep them busy — eight
-/// concurrent loads is well above the typical spinning-disk sweet spot
-/// without hammering SSDs or network shares.
+/// **Task 1.13 (parallel + progress):** metadata loading runs in a bounded
+/// `TaskGroup` (8 concurrent AVFoundation loads). The scan is two-pass: a
+/// fast enumeration step that collects every audio URL + the folder tree,
+/// then a parallel metadata pass that reports progress via an actor-
+/// protected counter.
+///
+/// **Task 1.14 (phase-aware progress + verbose logging):** the progress
+/// callback now takes a ``ScanPhase`` instead of `(Int, Int)`. Phase 1
+/// (enumeration) emits `.discovering(folders, files)` so the UI can show
+/// live counts while the tree is being walked — previously the spinner was
+/// dead-silent until Phase 2 started. Phase 2 emits `.loading(processed,
+/// total)` just like the old counter. Both phases are throttled
+/// (~50ms / every 25 files) so extremely fast scans can't flood the main
+/// actor with updates SwiftUI can't diff. `os.Logger` now narrates the scan
+/// at `.info` level for key milestones and `.debug` for per-folder entries.
 ///
 /// `Sendable` because the type holds no state — callers can freely hand it
 /// across actor boundaries.
@@ -39,9 +44,18 @@ public struct LibraryIndexer: Sendable {
     /// without I/O contention on a spinning-disk test. Easy to tune later.
     private static let metadataConcurrency = 8
 
-    private static let log = Logger(
-        subsystem: "se.jonasjohansson.johanssound.core",
-        category: "LibraryIndexer"
+    /// Every N-th Phase-2 tick we push to the UI. Finer-grained than this
+    /// overwhelms SwiftUI's diff without adding visible motion.
+    fileprivate static let metadataTickBatch = 25
+
+    /// Minimum interval between Phase-1 emissions. Combined with the
+    /// mandatory first-emit-at-start, this gives tests a deterministic
+    /// `.discovering` event while still letting big libraries breathe.
+    fileprivate static let enumerationThrottle: TimeInterval = 0.05
+
+    fileprivate static let log = Logger(
+        subsystem: "se.jonasjohansson.johanssound",
+        category: "indexer"
     )
 
     public init() {}
@@ -57,15 +71,25 @@ public struct LibraryIndexer: Sendable {
     /// never fail the whole scan. That's the right trade-off for a local
     /// library: one corrupt file shouldn't hide the other 9,999.
     ///
-    /// - Parameter progress: Called on the main actor with `(processed, total)`
-    ///   after each file's metadata finishes loading. `total` is known up
-    ///   front thanks to the enumeration pass. Default no-op keeps non-UI
-    ///   callers (tests, future CLI) from caring.
+    /// - Parameter progress: Called on the main actor with a ``ScanPhase``
+    ///   payload — `.discovering(folders, files)` during the enumeration
+    ///   pass and `.loading(processed, total)` during metadata loading.
+    ///   Emissions are throttled so a tiny library won't flood the main
+    ///   actor; a `.discovering(0, 0)` is always fired at the very start so
+    ///   tests (and tiny libraries) deterministically see one event.
+    ///   Default no-op keeps non-UI callers (tests, future CLI) from caring.
     public func scan(
         folder root: URL,
-        progress: @escaping @MainActor @Sendable (Int, Int) -> Void = { _, _ in }
+        progress: @escaping @MainActor @Sendable (ScanPhase) -> Void = { _ in }
     ) async throws -> [Playlist] {
+        Self.log.info("Scan started for \(root.path, privacy: .public)")
+
         let fm = FileManager.default
+
+        // Always fire a zero-count discovering event up front so even a
+        // scan that finishes in <50ms still emits *some* Phase-1 signal.
+        // Tests rely on this; real libraries get it essentially for free.
+        await progress(.discovering(foldersFound: 0, filesFound: 0))
 
         // First-level split: files vs folders at the root.
         let topLevel: [URL]
@@ -104,8 +128,26 @@ public struct LibraryIndexer: Sendable {
         // instead of counting up against an unknown ceiling. Enumeration is
         // orders of magnitude faster than metadata loading — a few hundred
         // ms even on big libraries — so doing it up-front is cheap.
-        let tree = collectFolderTree(topLevelFolderURLs: topLevelFolderURLs)
+        let tracker = EnumerationTracker(onUpdate: progress)
+        // Loose-track URLs at the root count towards the Phase-1 "files
+        // found" so the UI doesn't appear to lose them between phases.
+        if !looseURLs.isEmpty {
+            await tracker.filesFound(looseURLs.count)
+        }
+        let tree = await collectFolderTree(
+            topLevelFolderURLs: topLevelFolderURLs,
+            tracker: tracker
+        )
+        let snapshot = await tracker.snapshot()
         let totalAudioCount = looseURLs.count + tree.reduce(0) { $0 + $1.totalDescendantAudioCount }
+        Self.log.info(
+            "Phase 1 done: \(snapshot.folders, privacy: .public) folders, \(totalAudioCount, privacy: .public) files"
+        )
+
+        // Final Phase-1 emit with the locked totals so the UI sees the
+        // same number it will start counting against in Phase 2 (no jump).
+        await progress(.discovering(foldersFound: snapshot.folders, filesFound: totalAudioCount))
+
         let counter = ProgressCounter(total: totalAudioCount, onUpdate: progress)
 
         // Phase 2: load metadata in parallel, reporting progress per file.
@@ -133,6 +175,10 @@ public struct LibraryIndexer: Sendable {
             )
         }
 
+        // Ensure the UI sees one final locked "X / X" before we return, even
+        // if the throttled ticker swallowed the last partial batch.
+        await counter.flush()
+
         // All Songs = every folder playlist's (already union-ed) tracks +
         // loose tracks. Because each folder's `.tracks` is already the union
         // of its descendants, summing the top-level folders is enough to
@@ -151,6 +197,7 @@ public struct LibraryIndexer: Sendable {
         var result: [Playlist] = [allSongs]
         if let loose = loosePlaylist { result.append(loose) }
         result.append(contentsOf: topLevelPlaylists)
+        Self.log.info("Scan complete: \(result.count, privacy: .public) playlists")
         return result
     }
 
@@ -175,11 +222,25 @@ public struct LibraryIndexer: Sendable {
     /// Recursively enumerate every folder under the given top-level URLs,
     /// returning the shape of the library without loading any metadata. The
     /// expensive AVFoundation work happens in Phase 2.
-    private func collectFolderTree(topLevelFolderURLs: [URL]) -> [FolderNode] {
-        topLevelFolderURLs.map { enumerateFolder(at: $0) }
+    private func collectFolderTree(
+        topLevelFolderURLs: [URL],
+        tracker: EnumerationTracker
+    ) async -> [FolderNode] {
+        var nodes: [FolderNode] = []
+        nodes.reserveCapacity(topLevelFolderURLs.count)
+        for url in topLevelFolderURLs {
+            nodes.append(await enumerateFolder(at: url, tracker: tracker))
+        }
+        return nodes
     }
 
-    private func enumerateFolder(at url: URL) -> FolderNode {
+    private func enumerateFolder(
+        at url: URL,
+        tracker: EnumerationTracker
+    ) async -> FolderNode {
+        Self.log.debug("→ \(url.lastPathComponent, privacy: .public)")
+        await tracker.folderFound()
+
         let fm = FileManager.default
         let contents: [URL]
         do {
@@ -207,7 +268,15 @@ public struct LibraryIndexer: Sendable {
             }
         }
 
-        let children = subfolderURLs.map { enumerateFolder(at: $0) }
+        if !directAudioURLs.isEmpty {
+            await tracker.filesFound(directAudioURLs.count)
+        }
+
+        var children: [FolderNode] = []
+        children.reserveCapacity(subfolderURLs.count)
+        for sub in subfolderURLs {
+            children.append(await enumerateFolder(at: sub, tracker: tracker))
+        }
         return FolderNode(url: url, directAudioURLs: directAudioURLs, children: children)
     }
 
@@ -505,35 +574,106 @@ public struct LibraryIndexer: Sendable {
     }
 }
 
+// MARK: - EnumerationTracker
+
+/// Actor-protected running counts for Phase 1 of the scan.
+///
+/// We can't just increment a `Int` from inside the recursive walk — the
+/// callback crosses the main-actor boundary, and Swift 6 strict concurrency
+/// demands the shared state live on *something*. An actor is the least-
+/// magical fit: every increment is serialised, every emission to the main
+/// actor is awaited, and because the callback itself is throttled, the walk
+/// is never blocked on UI more than ~50ms at a time.
+private actor EnumerationTracker {
+    private var folders = 0
+    private var files = 0
+    private var lastEmit = Date.distantPast
+    private let onUpdate: @MainActor @Sendable (ScanPhase) -> Void
+
+    init(onUpdate: @escaping @MainActor @Sendable (ScanPhase) -> Void) {
+        self.onUpdate = onUpdate
+    }
+
+    func folderFound() async {
+        folders += 1
+        await maybeEmit()
+    }
+
+    func filesFound(_ count: Int) async {
+        files += count
+        await maybeEmit()
+    }
+
+    func snapshot() -> (folders: Int, files: Int) {
+        (folders, files)
+    }
+
+    /// Emit at most once per `enumerationThrottle` so tree walks that churn
+    /// through thousands of files per second can't overwhelm SwiftUI.
+    private func maybeEmit() async {
+        let now = Date()
+        guard now.timeIntervalSince(lastEmit) >= LibraryIndexer.enumerationThrottle else { return }
+        lastEmit = now
+        let f = folders
+        let n = files
+        await onUpdate(.discovering(foldersFound: f, filesFound: n))
+    }
+}
+
 // MARK: - ProgressCounter
 
 /// Actor-protected running total for the parallel metadata pass.
 ///
 /// Lives outside ``LibraryIndexer`` so the TaskGroup closures can pass it
 /// around freely. Each parallel task calls `tick()` once it finishes,
-/// bumping `processed` and hopping to the main actor to notify the UI via
-/// the caller-supplied `onUpdate` closure. Keeping the counter in an actor
-/// is the path-of-least-resistance way to serialise the updates without
-/// adding a lock — Swift 6 strict concurrency makes lock-based versions
-/// uglier than they used to be.
+/// bumping `processed` and — every ``LibraryIndexer/metadataTickBatch``
+/// calls, or at `flush()` — hopping to the main actor to notify the UI via
+/// the caller-supplied `onUpdate` closure.
+///
+/// The batching matters: on a warm library with tag-less files, metadata
+/// loads can complete thousands per second, and firing a SwiftUI update
+/// that fast stalls the main thread. 25 is a "couldn't-see-the-difference"
+/// sweet spot on both tiny fixtures (one batch + flush) and real libraries
+/// (dozens of updates per second, smooth progress).
 private actor ProgressCounter {
     private let total: Int
     private var processed: Int = 0
-    private let onUpdate: @MainActor @Sendable (Int, Int) -> Void
+    private var lastEmitted: Int = 0
+    private let onUpdate: @MainActor @Sendable (ScanPhase) -> Void
 
-    init(total: Int, onUpdate: @escaping @MainActor @Sendable (Int, Int) -> Void) {
+    init(total: Int, onUpdate: @escaping @MainActor @Sendable (ScanPhase) -> Void) {
         self.total = total
         self.onUpdate = onUpdate
     }
 
-    /// Bump `processed` by one and push the new value to the UI. The hop
-    /// to the main actor is awaited so calls can't build up a backlog on
-    /// extremely fast scans (1000s of updates/sec would overwhelm SwiftUI's
-    /// diffing otherwise).
+    /// Bump `processed` by one. Emits to the UI every N ticks (and always
+    /// at `processed == total`) so the final frame is never missed.
     func tick() async {
         processed += 1
         let current = processed
         let cap = total
-        await onUpdate(current, cap)
+
+        // Narrate at ~every 100 files to Console; this is the production
+        // signal we actually want to see during a real scan. The SwiftUI
+        // update is on a finer batch (`metadataTickBatch`) for smoother
+        // motion but cheaper logs.
+        if current % 100 == 0 || current == cap {
+            LibraryIndexer.log.info("Metadata \(current, privacy: .public)/\(cap, privacy: .public)")
+        }
+
+        if current == cap || current - lastEmitted >= LibraryIndexer.metadataTickBatch {
+            lastEmitted = current
+            await onUpdate(.loading(processed: current, total: cap))
+        }
+    }
+
+    /// Ensure the caller's UI sees the final `total / total` frame — useful
+    /// when the caller batches ticks and the last partial batch would
+    /// otherwise get swallowed.
+    func flush() async {
+        guard lastEmitted < processed else { return }
+        lastEmitted = processed
+        await onUpdate(.loading(processed: processed, total: total))
     }
 }
+

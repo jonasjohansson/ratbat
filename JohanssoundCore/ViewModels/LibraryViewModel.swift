@@ -14,9 +14,10 @@ import SwiftUI
 /// - `tracks` — computed convenience returning the selected playlist's
 ///   tracks, so existing callers (e.g. ``LibraryView``'s flat list) keep
 ///   working until the sidebar lands in Task 1.9.
-/// - `scanProgress` — optional `(current, total)` tuple, non-nil only while
-///   an actual metadata scan is running. The UI turns it into a
-///   "Scanning X / Y tracks…" caption under the spinner.
+/// - `scanPhase` — optional ``ScanPhase``, non-nil only while an actual
+///   scan is running. Task 1.14 replaced the flat `(current, total)` tuple
+///   with a phase so the UI can distinguish "discovering X folders, Y
+///   tracks" (no denominator yet) from "loading X / Y tracks" (Phase 2).
 ///
 /// `@MainActor` because it publishes UI state. Deliberately narrow: no
 /// persistence beyond the indexer cache, no hot-reload, no file-system
@@ -28,22 +29,12 @@ public final class LibraryViewModel: ObservableObject {
     @Published public var selectedPlaylistID: Playlist.ID?
     @Published public private(set) var isLoading = false
     @Published public private(set) var error: String?
-    /// `(current, total)` processed-file counter, published during a scan.
-    /// Nil at rest and while a cache hit short-circuits the scan — cache
-    /// loads are instant, so there's nothing to report. The UI reads it as
-    /// "show X / Y if present, else just a spinner."
-    @Published public private(set) var scanProgress: ScanProgress?
-
-    /// Lightweight struct instead of a tuple so `@Published` plays nicely
-    /// with SwiftUI diffing (tuples aren't Equatable).
-    public struct ScanProgress: Equatable, Sendable {
-        public let current: Int
-        public let total: Int
-        public init(current: Int, total: Int) {
-            self.current = current
-            self.total = total
-        }
-    }
+    /// Current scan phase, published during a scan. Nil at rest and while a
+    /// cache hit short-circuits the scan — cache loads are instant, so
+    /// there's nothing to report. The UI switches the caption based on the
+    /// case: "Discovering files… X folders, Y tracks" during `.discovering`,
+    /// "Loading metadata… X / Y tracks" during `.loading`.
+    @Published public private(set) var scanPhase: ScanPhase?
 
     private let indexer: LibraryIndexer
 
@@ -81,10 +72,10 @@ public final class LibraryViewModel: ObservableObject {
     public func load(from folder: URL) async {
         isLoading = true
         error = nil
-        scanProgress = nil
+        scanPhase = nil
         defer {
             isLoading = false
-            scanProgress = nil
+            scanPhase = nil
         }
 
         // Fast path: use cached playlists if one exists and decodes cleanly.
@@ -96,10 +87,10 @@ public final class LibraryViewModel: ObservableObject {
             return
         }
 
-        // Slow path: full scan, with progress reported into `scanProgress`.
+        // Slow path: full scan, with progress reported into `scanPhase`.
         do {
-            let loaded = try await indexer.scan(folder: folder) { [weak self] current, total in
-                self?.scanProgress = ScanProgress(current: current, total: total)
+            let loaded = try await indexer.scan(folder: folder) { [weak self] phase in
+                self?.scanPhase = phase
             }
             self.playlists = loaded
             self.selectedPlaylistID = loaded.first?.id

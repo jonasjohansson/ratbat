@@ -70,20 +70,27 @@ public struct RootView: View {
 
     @ViewBuilder private var detailView: some View {
         if libraryVM.isLoading {
-            VStack(spacing: 8) {
+            VStack(spacing: 10) {
                 ProgressView()
-                if let progress = libraryVM.scanProgress {
-                    // Task 1.13: concrete "X / Y tracks" instead of a
-                    // generic spinner so the user can see forward motion
-                    // on big libraries where the scan takes real time.
-                    Text("Scanning \(progress.current) / \(progress.total) tracks…")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text("Scanning library…")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                // Task 1.14: phase-aware caption — Phase 1 shows a running
+                // folder/file count with no denominator (total isn't known
+                // until the tree walk finishes), Phase 2 switches to the
+                // familiar "X / Y tracks" ratio, and the nil case (the
+                // instant between starting and the first callback, or a
+                // cache miss path that hasn't emitted yet) falls back to a
+                // generic caption so the UI is never silent.
+                Group {
+                    switch libraryVM.scanPhase {
+                    case .discovering(let folders, let files):
+                        Text("Discovering files… \(folders) folders, \(files) tracks")
+                    case .loading(let processed, let total):
+                        Text("Loading metadata… \(processed) / \(total) tracks")
+                    case nil:
+                        Text("Scanning library…")
+                    }
                 }
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if let error = libraryVM.error {
