@@ -107,6 +107,10 @@ final class AudioPlayerTests: XCTestCase {
         } else {
             throw XCTSkip("Fixture folder not bundled")
         }
-        return try await LibraryIndexer().scan(folder: fixtureURL)
+        // The indexer now returns grouped playlists; "All Songs" is the
+        // first entry and contains every track, so use it as the flat list
+        // for player-level tests.
+        let playlists = try await LibraryIndexer().scan(folder: fixtureURL)
+        return playlists.first?.tracks ?? []
     }
 }

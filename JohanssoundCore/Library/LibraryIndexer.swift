@@ -2,8 +2,12 @@ import Foundation
 import AVFoundation
 import os
 
-/// Recursively scans a folder for audio files and produces `Track` records
-/// with metadata extracted via AVFoundation.
+/// Scans a music-library folder and groups tracks into ``Playlist`` values.
+///
+/// Top-level subfolders of the root each become a folder-kind playlist.
+/// Audio files sitting directly in the root are collected into a single
+/// "Loose Tracks" playlist (omitted if none exist). A synthetic "All Songs"
+/// playlist — the union of every track — is always included first.
 ///
 /// v1 walks files sequentially. That's slower than `TaskGroup`-based
 /// parallelism, but it's also simple, avoids I/O contention on spinning
@@ -27,15 +31,106 @@ public struct LibraryIndexer: Sendable {
 
     public init() {}
 
-    /// Scan `folder` recursively and return every audio file as a `Track`,
-    /// sorted by artist → album → title (case-insensitive).
+    /// Scan `root` and return the resulting playlists.
+    ///
+    /// Order: "All Songs" first, then "Loose Tracks" (if any), then
+    /// folder-kind playlists sorted A–Z case-insensitively.
     ///
     /// Files whose metadata can't be loaded are logged and skipped; they
     /// never fail the whole scan. That's the right trade-off for a local
     /// library: one corrupt file shouldn't hide the other 9,999.
-    public func scan(folder: URL) async throws -> [Track] {
-        let urls = enumerateAudioFiles(under: folder)
+    public func scan(folder root: URL) async throws -> [Playlist] {
+        let fm = FileManager.default
 
+        // Use `contentsOfDirectory` (non-recursive) for the first-level
+        // folder-vs-file decision, then recurse inside each subfolder.
+        let topLevel: [URL]
+        do {
+            topLevel = try fm.contentsOfDirectory(
+                at: root,
+                includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey],
+                options: [.skipsHiddenFiles]
+            )
+        } catch {
+            // A missing/unreadable root is surfaced as "no playlists" rather
+            // than a throw — the previous behaviour of the indexer when the
+            // deep enumerator returned nil. This keeps the view model's
+            // error UI focused on real failures (e.g. metadata parse errors).
+            Self.log.warning(
+                "Couldn't read \(root.path, privacy: .public): \(error.localizedDescription, privacy: .public)"
+            )
+            return []
+        }
+
+        var folderPlaylists: [Playlist] = []
+        var looseURLs: [URL] = []
+
+        for url in topLevel {
+            let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey])
+            if values?.isDirectory == true {
+                let tracks = await scanAudioFiles(in: url)
+                // Even empty subfolders become playlists — users can drop
+                // files in later and the group is still "theirs". If that
+                // feels wrong in practice we can flip this to skip empties.
+                folderPlaylists.append(
+                    Playlist(
+                        name: url.lastPathComponent,
+                        folder: url,
+                        tracks: tracks,
+                        kind: .folder
+                    )
+                )
+            } else if values?.isRegularFile == true,
+                      Self.audioExtensions.contains(url.pathExtension.lowercased()) {
+                looseURLs.append(url)
+            }
+        }
+
+        folderPlaylists.sort {
+            $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+
+        // Build loose-tracks playlist only if we actually have loose audio.
+        var loosePlaylist: Playlist?
+        if !looseURLs.isEmpty {
+            let looseTracks = await makeSortedTracks(from: looseURLs)
+            loosePlaylist = Playlist(
+                name: "Loose Tracks",
+                folder: root,
+                tracks: looseTracks,
+                kind: .looseTracks
+            )
+        }
+
+        // All Songs = every folder playlist's tracks + loose tracks, in
+        // enumeration order. Global sorting (by artist/title etc.) belongs
+        // in UI-level sort controls — that's Task 1.10.
+        var allTracks: [Track] = []
+        for playlist in folderPlaylists { allTracks.append(contentsOf: playlist.tracks) }
+        if let loose = loosePlaylist { allTracks.append(contentsOf: loose.tracks) }
+        let allSongs = Playlist(
+            name: "All Songs",
+            folder: nil,
+            tracks: allTracks,
+            kind: .allSongs
+        )
+
+        var result: [Playlist] = [allSongs]
+        if let loose = loosePlaylist { result.append(loose) }
+        result.append(contentsOf: folderPlaylists)
+        return result
+    }
+
+    // MARK: - Private
+
+    /// Recursively enumerate audio files under `folder`, load metadata, and
+    /// return tracks sorted by artist → album → title (case-insensitive).
+    private func scanAudioFiles(in folder: URL) async -> [Track] {
+        let urls = enumerateAudioFiles(under: folder)
+        return await makeSortedTracks(from: urls)
+    }
+
+    private func makeSortedTracks(from urls: [URL]) async -> [Track] {
         var tracks: [Track] = []
         tracks.reserveCapacity(urls.count)
 
@@ -58,8 +153,6 @@ public struct LibraryIndexer: Sendable {
             return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
         }
     }
-
-    // MARK: - Private
 
     private func enumerateAudioFiles(under folder: URL) -> [URL] {
         let fm = FileManager.default
