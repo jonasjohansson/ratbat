@@ -3,6 +3,26 @@ import XCTest
 
 final class LibraryViewModelTests: XCTestCase {
 
+    /// Cached scans are now persisted to `{root}/.johanssound-cache.json`.
+    /// Every ViewModel test that touches the fixture folder deletes that
+    /// file first, so each test exercises a real scan rather than picking
+    /// up a stale cache from an earlier run. (We also delete in tearDown
+    /// to keep the bundle clean between runs.)
+    private func clearFixtureCache() throws {
+        let fixtures = try locateFixtureFolder()
+        try? CacheStore.delete(for: fixtures)
+    }
+
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        try clearFixtureCache()
+    }
+
+    override func tearDownWithError() throws {
+        try clearFixtureCache()
+        try super.tearDownWithError()
+    }
+
     @MainActor
     func testLoadPopulatesPlaylists() async throws {
         let fixtures = try locateFixtureFolder()
@@ -44,6 +64,36 @@ final class LibraryViewModelTests: XCTestCase {
         XCTAssertTrue(vm.playlists.isEmpty)
         XCTAssertNil(vm.selectedPlaylist)
         XCTAssertTrue(vm.tracks.isEmpty)
+    }
+
+    @MainActor
+    func testSecondLoadHitsCache() async throws {
+        // First load does a real scan and (best-effort) writes a cache.
+        // If the bundle resources directory is read-only, the cache write
+        // silently fails and we skip — the test is validating cache-path
+        // behaviour, not disk permissions.
+        let fixtures = try locateFixtureFolder()
+        let vm1 = LibraryViewModel()
+        await vm1.load(from: fixtures)
+        XCTAssertFalse(vm1.playlists.isEmpty)
+
+        let cachePath = fixtures.appendingPathComponent(".johanssound-cache.json")
+        guard FileManager.default.fileExists(atPath: cachePath.path) else {
+            throw XCTSkip("Fixture folder is read-only; cache write didn't take — skipping")
+        }
+
+        // Second load: different ViewModel, same folder. Should hit the
+        // cache and return the same playlist names without invoking the
+        // indexer. We can't easily assert "didn't scan" without dependency
+        // injection, but we can verify the result is non-empty and the
+        // playlist names match, which is enough to know the path wired up.
+        let vm2 = LibraryViewModel()
+        await vm2.load(from: fixtures)
+        XCTAssertEqual(
+            vm1.playlists.map(\.name),
+            vm2.playlists.map(\.name)
+        )
+        XCTAssertNil(vm2.scanProgress, "Cache hit should leave scanProgress nil")
     }
 
     // MARK: - Helpers

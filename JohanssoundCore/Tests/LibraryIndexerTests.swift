@@ -94,6 +94,27 @@ final class LibraryIndexerTests: XCTestCase {
         XCTAssertTrue(all.tracks.allSatisfy { $0.dateAdded.timeIntervalSinceNow < 0 })
     }
 
+    @MainActor
+    func testScanReportsProgress() async throws {
+        // The callback must see (processed, total) grow monotonically and
+        // end with processed == total. Because the scan is now parallel,
+        // interim values can land in any order across tasks, but the
+        // final tick is guaranteed to read "total / total" — that's the
+        // invariant we care about for the UI caption.
+        let fixtures = try locateFixtureFolder()
+        var lastCurrent = 0
+        var lastTotal = 0
+        var callCount = 0
+        _ = try await LibraryIndexer().scan(folder: fixtures) { current, total in
+            lastCurrent = current
+            lastTotal = total
+            callCount += 1
+        }
+        XCTAssertGreaterThan(lastTotal, 0, "Fixture library should contain audio files")
+        XCTAssertEqual(lastCurrent, lastTotal, "Final progress tick should equal total")
+        XCTAssertEqual(callCount, lastTotal, "Callback should fire exactly once per file")
+    }
+
     func testLooseTracksPlaylistPresentWhenRootHasAudio() async throws {
         let fixtures = try locateFixtureFolder()
         let playlists = try await LibraryIndexer().scan(folder: fixtures)

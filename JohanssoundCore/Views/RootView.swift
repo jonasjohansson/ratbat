@@ -70,8 +70,22 @@ public struct RootView: View {
 
     @ViewBuilder private var detailView: some View {
         if libraryVM.isLoading {
-            ProgressView("Scanning library…")
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            VStack(spacing: 8) {
+                ProgressView()
+                if let progress = libraryVM.scanProgress {
+                    // Task 1.13: concrete "X / Y tracks" instead of a
+                    // generic spinner so the user can see forward motion
+                    // on big libraries where the scan takes real time.
+                    Text("Scanning \(progress.current) / \(progress.total) tracks…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Scanning library…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if let error = libraryVM.error {
             VStack(spacing: 12) {
                 Text("Couldn't read library").font(.headline)

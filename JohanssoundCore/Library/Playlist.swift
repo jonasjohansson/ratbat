@@ -18,7 +18,7 @@ import Foundation
 /// across actor boundaries, as `List` selection values, and in `Set`s /
 /// dictionary keys. The recursive `children: [Playlist]` stays Hashable via
 /// Swift's copy-on-write for value-type arrays — auto-synthesis handles it.
-public struct Playlist: Identifiable, Hashable, Sendable {
+public struct Playlist: Identifiable, Hashable, Sendable, Codable {
     public let id: UUID
     public let name: String
     /// Source folder on disk, or `nil` for synthetic playlists such as
@@ -33,7 +33,7 @@ public struct Playlist: Identifiable, Hashable, Sendable {
     public let children: [Playlist]
     public let kind: Kind
 
-    public enum Kind: Sendable, Hashable {
+    public enum Kind: Sendable, Hashable, Codable {
         case folder
         case allSongs
         case looseTracks

@@ -12,7 +12,7 @@ import Foundation
 /// the original five fields is optional (or zero-defaulted) because our
 /// test fixtures have no embedded metadata, and even production files can
 /// be missing any given tag.
-public struct Track: Identifiable, Hashable, Sendable {
+public struct Track: Identifiable, Hashable, Sendable, Codable {
     public let id: UUID
     public let url: URL
     public let title: String
