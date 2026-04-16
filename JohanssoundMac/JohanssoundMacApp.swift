@@ -5,8 +5,8 @@ import JohanssoundCore
 struct JohanssoundMacApp: App {
     var body: some Scene {
         WindowGroup {
-            HelloView()
-                .frame(minWidth: 600, minHeight: 400)
+            RootView()
+                .frame(minWidth: 800, minHeight: 600)
         }
     }
 }
