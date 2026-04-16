@@ -14,9 +14,11 @@ import SwiftUI
 public struct LibraryView: View {
     @StateObject private var vm = LibraryViewModel()
     public let folder: URL
+    public let onPlay: (Track) -> Void
 
-    public init(folder: URL) {
+    public init(folder: URL, onPlay: @escaping (Track) -> Void) {
         self.folder = folder
+        self.onPlay = onPlay
     }
 
     public var body: some View {
@@ -41,6 +43,8 @@ public struct LibraryView: View {
             } else {
                 List(vm.tracks) { track in
                     TrackRow(track: track)
+                        .contentShape(Rectangle())
+                        .onTapGesture(count: 2) { onPlay(track) }
                 }
             }
         }
