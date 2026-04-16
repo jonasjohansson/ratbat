@@ -81,7 +81,12 @@ targets:
     type: bundle.unit-test
     platform: macOS
     sources:
-      - JohanssoundCore/Tests
+      - path: JohanssoundCore/Tests
+        excludes:
+          - Fixtures
+      - path: JohanssoundCore/Tests/Fixtures
+        type: folder
+        buildPhase: resources
     dependencies:
       - target: JohanssoundCore_macOS
 schemes:
