@@ -31,15 +31,18 @@ import SwiftUI
 public struct PlaylistsSidebarView: View {
     @ObservedObject public var vm: LibraryViewModel
     @ObservedObject public var stations: StationManager
+    @ObservedObject public var radio: RadioBroadcaster
     @Binding public var selection: SidebarSelection?
 
     public init(
         vm: LibraryViewModel,
         stations: StationManager,
+        radio: RadioBroadcaster,
         selection: Binding<SidebarSelection?>
     ) {
         self.vm = vm
         self.stations = stations
+        self.radio = radio
         self._selection = selection
     }
 
@@ -112,16 +115,30 @@ public struct PlaylistsSidebarView: View {
 
     @ViewBuilder
     private func stationRow(_ station: Station) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: "antenna.radiowaves.left.and.right")
-                .foregroundStyle(.secondary)
-                .frame(width: 16)
-            Text(station.name)
-                .lineLimit(1)
-            Spacer(minLength: 4)
-            Text("\(station.queue.count)")
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.tertiary)
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 8) {
+                Image(systemName: radio.isBroadcasting
+                    ? "antenna.radiowaves.left.and.right.circle.fill"
+                    : "antenna.radiowaves.left.and.right")
+                    .foregroundStyle(radio.isBroadcasting ? .red : .secondary)
+                    .frame(width: 16)
+                Text(station.name)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                Text("\(station.queue.count)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+            }
+            // Task 3.2: when broadcasting, surface the stream URL so the
+            // user can aim VLC at it without digging through logs.
+            if radio.isBroadcasting, let url = radio.currentURL {
+                Text(url.absoluteString)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .textSelection(.enabled)
+                    .padding(.leading, 24)
+            }
         }
     }
 

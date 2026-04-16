@@ -28,6 +28,7 @@ public struct RootView: View {
     @StateObject private var player = AudioPlayer()
     @StateObject private var libraryVM = LibraryViewModel()
     @StateObject private var stations = StationManager()
+    @StateObject private var radio = RadioBroadcaster()
     @State private var sidebarSelection: SidebarSelection?
     /// Owned by the view so it lives as long as the window does. Held as
     /// optional `@State` because we can't `@StateObject` a non-
@@ -49,11 +50,17 @@ public struct RootView: View {
                         PlaylistsSidebarView(
                             vm: libraryVM,
                             stations: stations,
+                            radio: radio,
                             selection: $sidebarSelection
                         )
                         .frame(minWidth: 180)
                     } detail: {
                         detailView
+                    }
+                    .toolbar {
+                        ToolbarItem(placement: .primaryAction) {
+                            broadcastButton
+                        }
                     }
                     .task(id: folder) { await libraryVM.load(from: folder) }
                     // Mirror the unified sidebar selection back into the
@@ -93,6 +100,40 @@ public struct RootView: View {
             if nowPlaying == nil {
                 nowPlaying = NowPlayingController(player: player)
             }
+        }
+    }
+
+    /// Toolbar button that toggles the Task 3.2 broadcast spike. Lives in
+    /// `RootView` rather than `PlayerView` because it needs both `radio`
+    /// and `stations`, and the toolbar slot is a natural home for app-
+    /// wide toggles. Disabled when no station is active so the intent is
+    /// obvious. The help text doubles as a minimal status HUD.
+    @ViewBuilder private var broadcastButton: some View {
+        Button {
+            Task {
+                if radio.isBroadcasting {
+                    radio.stop()
+                } else if let station = stations.activeStation {
+                    await radio.start(queue: station.queue)
+                }
+            }
+        } label: {
+            Image(systemName: radio.isBroadcasting
+                ? "antenna.radiowaves.left.and.right.circle.fill"
+                : "antenna.radiowaves.left.and.right")
+        }
+        .disabled(!radio.isBroadcasting && stations.activeStation == nil)
+        .help(broadcastHelpText)
+    }
+
+    private var broadcastHelpText: String {
+        if radio.isBroadcasting {
+            let url = radio.currentURL?.absoluteString ?? "?"
+            return "Broadcasting at \(url) — listeners: \(radio.listenerCount). Click to stop."
+        } else if stations.activeStation != nil {
+            return "Broadcast active station"
+        } else {
+            return "Create a station first (right-click a playlist)"
         }
     }
 
