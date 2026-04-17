@@ -358,6 +358,22 @@ final class RadioBroadcasterTests: XCTestCase {
         return tracks
     }
 
+    /// Fetch a finite HTTP response (HTML, JSON, redirect — anything that
+    /// isn't an infinite AAC stream) and return the whole body plus the
+    /// response metadata. URLSession handles framing, so we don't need
+    /// custom byte-counting here.
+    nonisolated private static func fetchPayload(
+        port: UInt16,
+        path: String
+    ) async throws -> (Data, URLResponse) {
+        let url = URL(string: "http://127.0.0.1:\(port)\(path)")!
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 5
+        config.timeoutIntervalForResource = 5
+        let session = URLSession(configuration: config)
+        return try await session.data(from: url)
+    }
+
     nonisolated private static func fetchStream(
         port: UInt16,
         path: String,
@@ -465,6 +481,159 @@ final class RadioBroadcasterTests: XCTestCase {
             fired = true
             return true
         }
+    }
+
+    // MARK: - Status page / now.json
+
+    /// `GET /` returns the embedded status HTML with the right
+    /// Content-Type. We only check the structural bits (status line,
+    /// content type header, and one identifiable string from the body)
+    /// — the rest is just a literal, so tests pinning it too hard would
+    /// break every time we touch the markup.
+    @MainActor
+    func testRootPathServesHTML() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+
+        let port: UInt16 = 18_024
+        let radio = RadioBroadcaster(port: port)
+        // We need a running listener — start a station so the server
+        // is actually listening, then hit `/`.
+        let station = Station(name: "Status Test", seed: .manual, queue: tracks)
+        await radio.startBroadcast(station: station)
+        defer { radio.stopAll() }
+
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        let response = try await Self.fetchRawResponse(
+            port: port,
+            path: "/",
+            requestHeaders: [],
+            maxBytes: 16_384
+        )
+        XCTAssertTrue(
+            response.contains("HTTP/1.1 200"),
+            "Expected 200 for /, got: \(response.prefix(200))"
+        )
+        XCTAssertTrue(
+            response.lowercased().contains("content-type: text/html"),
+            "Missing text/html Content-Type: \(response.prefix(400))"
+        )
+        XCTAssertTrue(
+            response.contains("Johanssound"),
+            "Body missing Johanssound marker"
+        )
+    }
+
+    /// `GET /now.json` returns a JSON payload with one entry per
+    /// broadcasting station, including listener count, slug, stream URL
+    /// and (once the encoder has opened a track) current-track info.
+    @MainActor
+    func testNowJSONReturnsValidPayload() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+
+        let port: UInt16 = 18_025
+        let radio = RadioBroadcaster(port: port)
+        let station = Station(name: "Now JSON", seed: .manual, queue: tracks)
+        await radio.startBroadcast(station: station)
+        defer { radio.stopAll() }
+
+        // Give the encoder time to open a track so `currentTrack` populates.
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+
+        let (data, response) = try await Self.fetchPayload(
+            port: port,
+            path: "/now.json"
+        )
+
+        guard let http = response as? HTTPURLResponse else {
+            XCTFail("Not HTTP response")
+            return
+        }
+        XCTAssertEqual(http.statusCode, 200)
+        XCTAssertEqual(
+            (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased(),
+            "application/json"
+        )
+        XCTAssertEqual(
+            http.value(forHTTPHeaderField: "Access-Control-Allow-Origin"),
+            "*"
+        )
+
+        struct NowResponse: Decodable {
+            struct Station: Decodable {
+                let id: String
+                let name: String
+                let slug: String
+                let broadcasting: Bool
+                let streamURL: String?
+                let listeners: Int
+                let currentTrack: Track?
+            }
+            struct Track: Decodable {
+                let title: String
+                let artist: String
+                let album: String
+            }
+            let stations: [Station]
+        }
+
+        let decoded = try JSONDecoder().decode(NowResponse.self, from: data)
+        XCTAssertEqual(decoded.stations.count, 1)
+        let only = try XCTUnwrap(decoded.stations.first)
+        XCTAssertEqual(only.name, "Now JSON")
+        XCTAssertEqual(only.slug, "now-json")
+        XCTAssertTrue(only.broadcasting)
+        XCTAssertEqual(only.streamURL, "/stream/now-json.aac")
+        XCTAssertGreaterThanOrEqual(only.listeners, 0)
+        XCTAssertNotNil(only.currentTrack, "Expected current track after warmup")
+    }
+
+    /// Startup edge: the broadcaster is running (we need *something* to
+    /// bind the listener) but then we stop the only station. That
+    /// immediately tears the listener down — so verifying "empty /now.json"
+    /// requires a second broadcast still alive. Use two stations, stop one,
+    /// and confirm the remaining payload shrinks to one entry.
+    @MainActor
+    func testNowJSONShrinksWhenStationsStop() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+
+        let port: UInt16 = 18_026
+        let radio = RadioBroadcaster(port: port)
+        let a = Station(name: "Alpha JSON", seed: .manual, queue: tracks)
+        let b = Station(name: "Beta JSON", seed: .manual, queue: tracks)
+        await radio.startBroadcast(station: a)
+        await radio.startBroadcast(station: b)
+        defer { radio.stopAll() }
+
+        try await Task.sleep(nanoseconds: 600_000_000)
+
+        let (firstData, _) = try await Self.fetchPayload(
+            port: port,
+            path: "/now.json"
+        )
+        struct Envelope: Decodable {
+            struct S: Decodable { let name: String }
+            let stations: [S]
+        }
+        let first = try JSONDecoder().decode(Envelope.self, from: firstData)
+        XCTAssertEqual(first.stations.count, 2)
+
+        radio.stopBroadcast(stationID: a.id)
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        let (secondData, _) = try await Self.fetchPayload(
+            port: port,
+            path: "/now.json"
+        )
+        let second = try JSONDecoder().decode(Envelope.self, from: secondData)
+        XCTAssertEqual(second.stations.count, 1)
+        XCTAssertEqual(second.stations.first?.name, "Beta JSON")
     }
 
     func testAACRingBufferOverflowBumpsCursor() async {

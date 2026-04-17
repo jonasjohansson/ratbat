@@ -349,6 +349,11 @@ public final class RadioBroadcaster: ObservableObject {
                 self?.pipelines.values.first?.station.slug
             }
         }
+        let nowPayload: @Sendable () async -> Data = { [weak self] in
+            await MainActor.run { [weak self] in
+                self?.buildNowPayload() ?? Data("{\"stations\":[]}".utf8)
+            }
+        }
 
         let task = Task.detached { [weak self] in
             // Read headers to learn both the request path and whether the
@@ -357,6 +362,47 @@ public final class RadioBroadcaster: ObservableObject {
             let headerBytes = await Self.readUntilHeaderEnd(connection: connection)
             let path = Self.requestPath(from: headerBytes) ?? "/stream.aac"
             let wantsMetadata = Self.headerRequestsICYMetadata(headerBytes)
+
+            // Public status page. Served inline — single self-contained
+            // HTML blob with no external assets.
+            if path == "/" || path == "/index.html" {
+                let body = Data(StatusPage.html.utf8)
+                _ = await Self.send(
+                    data: Self.buildHTTPResponse(
+                        status: 200,
+                        headers: [
+                            "Content-Type": "text/html; charset=utf-8",
+                            "Cache-Control": "no-cache"
+                        ],
+                        body: body
+                    ),
+                    on: connection
+                )
+                connection.cancel()
+                return
+            }
+
+            // Public JSON status. Lists the CURRENTLY BROADCASTING stations
+            // plus their current track and listener counts. No auth —
+            // broadcaster only knows live stations, so idle library
+            // entries can't leak.
+            if path == "/now.json" {
+                let payload = await nowPayload()
+                _ = await Self.send(
+                    data: Self.buildHTTPResponse(
+                        status: 200,
+                        headers: [
+                            "Content-Type": "application/json",
+                            "Access-Control-Allow-Origin": "*",
+                            "Cache-Control": "no-cache"
+                        ],
+                        body: payload
+                    ),
+                    on: connection
+                )
+                connection.cancel()
+                return
+            }
 
             // Legacy endpoint: redirect to the first broadcasting station
             // so existing bookmarks keep working. 404 when nothing's live.
@@ -496,6 +542,87 @@ public final class RadioBroadcaster: ObservableObject {
         \r
         Not Found
         """
+    }
+
+    /// Build a generic HTTP/1.1 response with arbitrary headers + body.
+    /// Forces `Content-Length` and `Connection: close` so callers can't
+    /// forget either — both are load-bearing for our "one request per
+    /// connection" flow.
+    nonisolated static func buildHTTPResponse(
+        status: Int,
+        headers: [String: String],
+        body: Data
+    ) -> Data {
+        let statusText: String
+        switch status {
+        case 200: statusText = "OK"
+        case 302: statusText = "Found"
+        case 404: statusText = "Not Found"
+        default: statusText = "Unknown"
+        }
+        var response = "HTTP/1.1 \(status) \(statusText)\r\n"
+        var merged = headers
+        merged["Content-Length"] = "\(body.count)"
+        merged["Connection"] = "close"
+        // Sort for deterministic ordering — tests that grep the response
+        // are happier without map-hashing surprises.
+        for key in merged.keys.sorted() {
+            response += "\(key): \(merged[key] ?? "")\r\n"
+        }
+        response += "\r\n"
+        var data = Data(response.utf8)
+        data.append(body)
+        return data
+    }
+
+    // MARK: - Status payload
+
+    /// Snapshot the current broadcast state as JSON. Only broadcasting
+    /// stations are included — the broadcaster doesn't know about the
+    /// user's wider library, and that's deliberate (no library leakage
+    /// over the public endpoint).
+    private func buildNowPayload() -> Data {
+        struct NowStation: Encodable {
+            let id: String
+            let name: String
+            let slug: String
+            let broadcasting: Bool
+            let streamURL: String?
+            let listeners: Int
+            let currentTrack: NowTrack?
+        }
+        struct NowTrack: Encodable {
+            let title: String
+            let artist: String
+            let album: String
+        }
+        struct NowResponse: Encodable {
+            let stations: [NowStation]
+        }
+
+        // Stable ordering by station name so UI doesn't jitter between
+        // polls. Dictionary iteration isn't deterministic in Swift.
+        let ordered = pipelines.values.sorted { $0.station.name < $1.station.name }
+        let stations: [NowStation] = ordered.map { pipeline in
+            let track = currentTrackByStation[pipeline.station.id]
+            let listeners = listenerCount[pipeline.station.id] ?? 0
+            return NowStation(
+                id: pipeline.station.id.uuidString,
+                name: pipeline.station.name,
+                slug: pipeline.station.slug,
+                broadcasting: true,
+                streamURL: "/stream/\(pipeline.station.slug).aac",
+                listeners: listeners,
+                currentTrack: track.map {
+                    NowTrack(title: $0.title, artist: $0.artist, album: $0.album)
+                }
+            )
+        }
+
+        let response = NowResponse(stations: stations)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return (try? encoder.encode(response)) ?? Data("{\"stations\":[]}".utf8)
     }
 
     // MARK: - Client serving (detached)
