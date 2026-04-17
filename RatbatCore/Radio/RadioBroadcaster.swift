@@ -86,6 +86,10 @@ public final class RadioBroadcaster: ObservableObject {
     private let downloadService: DownloadService?
     private let nts: NTSClient?
     private let history: HistoryStore?
+    /// Read-side handle on the user's music folder. Used by the ♥ save
+    /// flow to know where to copy cached files. `nil` in test configs;
+    /// `handleLike` returns a 500 when it's missing.
+    private let libraryConfig: LibraryConfig?
     #endif
 
     // MARK: - Internals
@@ -101,6 +105,11 @@ public final class RadioBroadcaster: ObservableObject {
         /// so a live pipeline keeps its original setting until stopped.
         let bitrate: Int
         let sampleRate: Double
+        /// Station name snapshot frozen at broadcast-start time. The ♥
+        /// save flow needs a human-readable folder name per station
+        /// without having to reach into the (separately-owned)
+        /// StationManager.
+        let stationName: String
         var encodeTask: Task<Void, Never>?
 
         init(station: Station, buffer: AACRingBuffer, bitrate: Int, sampleRate: Double) {
@@ -108,6 +117,7 @@ public final class RadioBroadcaster: ObservableObject {
             self.buffer = buffer
             self.bitrate = bitrate
             self.sampleRate = sampleRate
+            self.stationName = station.name
         }
     }
 
@@ -131,6 +141,7 @@ public final class RadioBroadcaster: ObservableObject {
         self.downloadService = nil
         self.nts = nil
         self.history = nil
+        self.libraryConfig = nil
         #endif
         subscribeToPreferences()
     }
@@ -147,7 +158,8 @@ public final class RadioBroadcaster: ObservableObject {
         preferences: BroadcastPreferences,
         downloadService: DownloadService? = nil,
         nts: NTSClient? = nil,
-        history: HistoryStore? = nil
+        history: HistoryStore? = nil,
+        libraryConfig: LibraryConfig? = nil
     ) {
         self.preferences = preferences
         let raw = UInt16(clamping: preferences.port)
@@ -155,6 +167,7 @@ public final class RadioBroadcaster: ObservableObject {
         self.downloadService = downloadService
         self.nts = nts
         self.history = history
+        self.libraryConfig = libraryConfig
         subscribeToPreferences()
     }
     #else
@@ -491,6 +504,13 @@ public final class RadioBroadcaster: ObservableObject {
                 self?.buildNowPayload() ?? Data("{\"stations\":[]}".utf8)
             }
         }
+        let likeHandler: @Sendable (UUID) async -> (Int, Data) = { [weak self] stationID in
+            // Hop to the main actor to resolve the pipeline snapshot,
+            // then do the copy + history mark off-main without pinning
+            // the UI thread. `performLikeAsync` is the async bridge.
+            await self?.performLikeAsync(stationID: stationID)
+                ?? (500, Data("{\"status\":\"error\",\"message\":\"no broadcaster\"}".utf8))
+        }
 
         let task = Task.detached { [weak self] in
             // Read headers to learn both the request path and whether the
@@ -498,7 +518,60 @@ public final class RadioBroadcaster: ObservableObject {
             // the same read.
             let headerBytes = await Self.readUntilHeaderEnd(connection: connection)
             let path = Self.requestPath(from: headerBytes) ?? "/stream.aac"
+            let method = Self.requestMethod(from: headerBytes) ?? "GET"
             let wantsMetadata = Self.headerRequestsICYMetadata(headerBytes)
+
+            // CORS preflight for /like — browsers send OPTIONS before the
+            // real POST because we use Content-Type: application/json.
+            if method == "OPTIONS" && path == "/like" {
+                _ = await Self.send(
+                    data: Self.buildHTTPResponse(
+                        status: 204,
+                        headers: Self.corsHeaders(),
+                        body: Data()
+                    ),
+                    on: connection
+                )
+                connection.cancel()
+                return
+            }
+
+            // ♥ save — move the currently-playing cached file into the
+            // user's library. Only meaningful on macOS (broadcaster is
+            // macOS-only), but the request surface is cross-platform.
+            if method == "POST" && path == "/like" {
+                let contentLength = Self.contentLength(from: headerBytes) ?? 0
+                let body = await Self.readBody(
+                    connection: connection,
+                    alreadyRead: Self.bodyBytes(after: headerBytes),
+                    expected: contentLength
+                )
+                guard let req = try? JSONDecoder().decode(LikeRequest.self, from: body),
+                      let stationID = UUID(uuidString: req.station) else {
+                    var headers = Self.corsHeaders()
+                    headers["Content-Type"] = "application/json"
+                    _ = await Self.send(
+                        data: Self.buildHTTPResponse(
+                            status: 400,
+                            headers: headers,
+                            body: Data("{\"status\":\"error\",\"message\":\"bad request\"}".utf8)
+                        ),
+                        on: connection
+                    )
+                    connection.cancel()
+                    return
+                }
+
+                let (status, payload) = await likeHandler(stationID)
+                var headers = Self.corsHeaders()
+                headers["Content-Type"] = "application/json"
+                _ = await Self.send(
+                    data: Self.buildHTTPResponse(status: status, headers: headers, body: payload),
+                    on: connection
+                )
+                connection.cancel()
+                return
+            }
 
             // Public JSON status. Lists the CURRENTLY BROADCASTING stations
             // plus their current track and listener counts. No auth —
@@ -625,6 +698,91 @@ public final class RadioBroadcaster: ObservableObject {
         return String(parts[1])
     }
 
+    /// Pull the request method (GET / POST / OPTIONS / …) out of the
+    /// header byte blob. Uppercased to match the HTTP spec.
+    nonisolated static func requestMethod(from bytes: Data) -> String? {
+        guard let text = String(data: bytes, encoding: .utf8) else { return nil }
+        let firstLine = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .split(separator: "\n", maxSplits: 1)
+            .first
+            .map(String.init) ?? ""
+        let parts = firstLine.split(separator: " ", maxSplits: 2)
+        guard let first = parts.first else { return nil }
+        return String(first).uppercased()
+    }
+
+    /// Extract `Content-Length:` value (integer bytes) from a header blob.
+    /// Returns nil when the header is missing or unparseable — callers
+    /// should treat that as zero-length body.
+    nonisolated static func contentLength(from bytes: Data) -> Int? {
+        guard let text = String(data: bytes, encoding: .utf8) else { return nil }
+        let normalised = text.replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        for line in normalised.split(separator: "\n") {
+            let lower = line.lowercased()
+            if lower.hasPrefix("content-length:") {
+                let value = lower.dropFirst("content-length:".count)
+                    .trimmingCharacters(in: .whitespaces)
+                return Int(value)
+            }
+        }
+        return nil
+    }
+
+    /// Any body bytes that came along in the same packet as the headers.
+    /// `readUntilHeaderEnd` returns the header block including the
+    /// terminating `\r\n\r\n`, but if the client bundled the body into the
+    /// same read it's also sitting in the buffer — this peels that off.
+    nonisolated static func bodyBytes(after headerBytes: Data) -> Data {
+        // Technically the helper stops at the end of the header block, so
+        // this is always empty. Kept for symmetry with `readBody` if we
+        // ever switch to a more lenient reader.
+        guard let range = headerBytes.range(of: Data("\r\n\r\n".utf8)) else {
+            return Data()
+        }
+        return headerBytes.subdata(in: range.upperBound..<headerBytes.endIndex)
+    }
+
+    /// Read the remainder of a request body up to `expected` bytes. If
+    /// nothing was pre-buffered and nothing else is coming, returns what
+    /// we have. Safe against clients that claim a large body and never
+    /// send it (bounded by `expected`, with a timeout).
+    nonisolated static func readBody(
+        connection: NWConnection,
+        alreadyRead: Data,
+        expected: Int
+    ) async -> Data {
+        var acc = alreadyRead
+        let deadline = Date().addingTimeInterval(3)
+        while acc.count < expected, Date() < deadline {
+            let needed = expected - acc.count
+            let chunk: Data? = await withCheckedContinuation { cont in
+                connection.receive(
+                    minimumIncompleteLength: 1,
+                    maximumLength: min(needed, 4_096)
+                ) { data, _, _, _ in
+                    cont.resume(returning: data)
+                }
+            }
+            guard let chunk, !chunk.isEmpty else { break }
+            acc.append(chunk)
+        }
+        return acc
+    }
+
+    /// Standard CORS headers for cross-origin POSTs from the GitHub-Pages
+    /// web player. The broadcaster is internet-exposed via Cloudflare
+    /// Tunnel, so browsers fetch `radio.jonasjohansson.se` directly from
+    /// `ratbat.jonasjohansson.se` and the preflight is required.
+    nonisolated static func corsHeaders() -> [String: String] {
+        [
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type"
+        ]
+    }
+
     /// Parse `/stream/{slug}.aac` → `slug`. Returns nil for any other
     /// shape so callers 404 instead of guessing.
     nonisolated static func extractSlug(from path: String) -> String? {
@@ -674,8 +832,12 @@ public final class RadioBroadcaster: ObservableObject {
         let statusText: String
         switch status {
         case 200: statusText = "OK"
+        case 204: statusText = "No Content"
         case 302: statusText = "Found"
+        case 400: statusText = "Bad Request"
         case 404: statusText = "Not Found"
+        case 409: statusText = "Conflict"
+        case 500: statusText = "Internal Server Error"
         default: statusText = "Unknown"
         }
         var response = "HTTP/1.1 \(status) \(statusText)\r\n"
@@ -692,6 +854,205 @@ public final class RadioBroadcaster: ObservableObject {
         data.append(body)
         return data
     }
+
+    // MARK: - ♥ Save flow
+
+    /// JSON body accepted by `POST /like`. Kept internal to the broadcaster
+    /// since no caller outside this file assembles one manually.
+    struct LikeRequest: Decodable {
+        let station: String
+    }
+
+    /// JSON body emitted by `POST /like` (and surfaced from
+    /// ``likeCurrent(stationID:)``). `path` is populated on success;
+    /// `message` on error.
+    public struct LikeResponse: Codable, Sendable {
+        public let status: String
+        public let path: String?
+        public let message: String?
+    }
+
+    /// Snapshot of the state `performLikeAsync` needs. Pulled on the main
+    /// actor in a single hop so the off-main file copy can run with a
+    /// Sendable value and no further main-actor dependencies.
+    private struct LikeSnapshot: Sendable {
+        let historyID: Int64
+        let cachedURL: URL
+        let artist: String
+        let title: String
+        let stationName: String
+        let musicFolder: URL
+    }
+
+    /// Outcome of the main-actor preflight: either a ready-to-execute
+    /// snapshot, or an early-exit HTTP status + JSON payload.
+    private enum LikePreflight {
+        case ready(LikeSnapshot)
+        case early(Int, Data)
+    }
+
+    /// Main-actor pre-flight: resolve everything the save needs into a
+    /// Sendable snapshot, or return an early-exit status + payload.
+    #if os(macOS)
+    private func likePreflight(stationID: UUID) -> LikePreflight {
+        guard let pipeline = pipelines[stationID] else {
+            return .early(404, Self.encodeLikeResponse(LikeResponse(
+                status: "error", path: nil, message: "no current track"
+            )))
+        }
+        guard let item = currentItemByStation[stationID] else {
+            return .early(404, Self.encodeLikeResponse(LikeResponse(
+                status: "error", path: nil, message: "no current track"
+            )))
+        }
+        guard let historyID = item.historyID else {
+            return .early(409, Self.encodeLikeResponse(LikeResponse(
+                status: "error", path: nil, message: "track already in library"
+            )))
+        }
+        guard history != nil else {
+            return .early(500, Self.encodeLikeResponse(LikeResponse(
+                status: "error", path: nil, message: "history unavailable"
+            )))
+        }
+        guard let musicFolder = libraryConfig?.musicFolder else {
+            return .early(500, Self.encodeLikeResponse(LikeResponse(
+                status: "error", path: nil, message: "music folder not set"
+            )))
+        }
+        return .ready(LikeSnapshot(
+            historyID: historyID,
+            cachedURL: item.url,
+            artist: item.artist ?? "Unknown",
+            title: item.title ?? "Unknown",
+            stationName: pipeline.stationName,
+            musicFolder: musicFolder
+        ))
+    }
+
+    /// Async save flow used by both the HTTP `/like` handler and the
+    /// in-app ♥ button. Resolves state on the main actor, copies off-main,
+    /// then updates history and returns the wire-shaped response.
+    ///
+    /// Steps:
+    /// 1. Find the pipeline + current item for `stationID`.
+    /// 2. Bail 409 if the item has no `historyID` (playlist tracks are
+    ///    already in the user's library, not in the transient cache).
+    /// 3. File copy + `history.markSaved` off the main actor.
+    func performLikeAsync(stationID: UUID) async -> (Int, Data) {
+        let snapshot: LikeSnapshot
+        switch likePreflight(stationID: stationID) {
+        case .early(let status, let data):
+            return (status, data)
+        case .ready(let ok):
+            snapshot = ok
+        }
+        // history must be non-nil here (preflight would have returned).
+        guard let history else {
+            return (500, Self.encodeLikeResponse(LikeResponse(
+                status: "error", path: nil, message: "history unavailable"
+            )))
+        }
+
+        do {
+            let destinationPath = try await Task.detached(priority: .userInitiated) {
+                try Self.saveCached(
+                    cachedURL: snapshot.cachedURL,
+                    artist: snapshot.artist,
+                    title: snapshot.title,
+                    stationName: snapshot.stationName,
+                    musicFolder: snapshot.musicFolder
+                )
+            }.value
+            try await history.markSaved(id: snapshot.historyID, cachedPath: destinationPath)
+            logger.info("♥ saved \(snapshot.artist, privacy: .public) — \(snapshot.title, privacy: .public) to \(destinationPath, privacy: .public)")
+            return (200, Self.encodeLikeResponse(LikeResponse(
+                status: "saved", path: destinationPath, message: nil
+            )))
+        } catch {
+            logger.error("♥ save failed: \(String(describing: error), privacy: .public)")
+            return (500, Self.encodeLikeResponse(LikeResponse(
+                status: "error", path: nil, message: String(describing: error)
+            )))
+        }
+    }
+
+    /// Public in-app entry point for the Mac UI's ♥ button. Thin async
+    /// wrapper over ``performLikeAsync(stationID:)`` that hands back the
+    /// decoded response so callers can render state directly.
+    @discardableResult
+    public func likeCurrent(stationID: Station.ID) async -> LikeResponse {
+        let (_, data) = await performLikeAsync(stationID: stationID)
+        if let decoded = try? JSONDecoder().decode(LikeResponse.self, from: data) {
+            return decoded
+        }
+        return LikeResponse(status: "error", path: nil, message: "decode failed")
+    }
+
+    /// Copy the cached file into `~/<musicFolder>/Saved from <station>/<artist> — <title>.m4a`.
+    /// Idempotent: if the destination already exists we return its path
+    /// rather than throwing. This keeps the UI behaviour for double-clicks
+    /// ("yes, still saved") consistent without extra round-trips.
+    nonisolated private static func saveCached(
+        cachedURL: URL,
+        artist: String,
+        title: String,
+        stationName: String,
+        musicFolder: URL
+    ) throws -> String {
+        let folder = musicFolder.appendingPathComponent(
+            "Saved from \(sanitize(stationName))",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: folder,
+            withIntermediateDirectories: true
+        )
+
+        let filename = "\(sanitize(artist)) — \(sanitize(title)).m4a"
+        let destination = folder.appendingPathComponent(filename)
+        if FileManager.default.fileExists(atPath: destination.path) {
+            return destination.path
+        }
+        try FileManager.default.copyItem(at: cachedURL, to: destination)
+        return destination.path
+    }
+
+    /// Replace characters that trip macOS or URL handling (slashes,
+    /// control chars, `:` which confuses classic Finder, Windows-reserved
+    /// glyphs) with underscores. We keep em-dashes and Unicode letters
+    /// so "Björk" / "Rödhåret" survive intact.
+    nonisolated private static func sanitize(_ s: String) -> String {
+        let forbidden = CharacterSet(charactersIn: "/:*?\"<>|\\\n\r\t")
+        let replaced = s.unicodeScalars.map { scalar -> String in
+            if forbidden.contains(scalar) { return "_" }
+            return String(scalar)
+        }.joined()
+        let trimmed = replaced.trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty ? "_" : trimmed
+    }
+
+    /// Serialise a LikeResponse to JSON for the wire. Used by both the
+    /// HTTP handler and the in-app UI path, so shape is consistent.
+    nonisolated private static func encodeLikeResponse(_ response: LikeResponse) -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return (try? encoder.encode(response)) ?? Data("{\"status\":\"error\"}".utf8)
+    }
+    #else
+    /// iOS stub — broadcaster isn't wired for NTS / library on iOS, so a
+    /// like always reports "unavailable". Kept so cross-platform code
+    /// compiles without `#if` at every call site.
+    func performLikeAsync(stationID: UUID) async -> (Int, Data) {
+        let payload = Data("{\"message\":\"unavailable\",\"path\":null,\"status\":\"error\"}".utf8)
+        return (500, payload)
+    }
+
+    @discardableResult
+    public func likeCurrent(stationID: Station.ID) async -> LikeResponse {
+        LikeResponse(status: "error", path: nil, message: "unavailable")
+    }
+    #endif
 
     // MARK: - Status payload
 

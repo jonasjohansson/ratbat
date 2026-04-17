@@ -58,7 +58,8 @@ public struct RootView: View {
             preferences: .shared,
             downloadService: ds,
             nts: NTSClient(),
-            history: try? HistoryStore()
+            history: try? HistoryStore(),
+            libraryConfig: config
         )
         self._downloadService = StateObject(wrappedValue: ds)
         self._radio = StateObject(wrappedValue: broadcaster)
@@ -346,6 +347,24 @@ public struct RootView: View {
             }
             .padding()
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if let ntsStation = resolvedNTSStation {
+            // NTS stations have no fixed queue — render their dedicated
+            // detail pane (config + status + now playing) instead of the
+            // track-list LibraryView.
+            NTSStationDetailView(
+                station: ntsStation.0,
+                config: ntsStation.1,
+                radio: radio,
+                onBroadcastToggle: {
+                    Task {
+                        if radio.isBroadcasting(stationID: ntsStation.0.id) {
+                            radio.stopBroadcast(stationID: ntsStation.0.id)
+                        } else {
+                            await radio.startBroadcast(station: ntsStation.0)
+                        }
+                    }
+                }
+            )
         } else if let playlist = resolvedDetailPlaylist {
             LibraryView(playlist: playlist) { tracks, startIndex in
                 // Queue the whole playlist and start from the picked
@@ -374,6 +393,18 @@ public struct RootView: View {
     /// Falls back to the library VM's selected playlist when there's no
     /// explicit sidebar selection yet (first-launch state, before the
     /// load-triggered mirroring kicks in).
+    /// When the sidebar selection resolves to an NTS-backed station,
+    /// return it + its config so the detail pane can render its
+    /// dedicated view. Returns nil for playlist selections or when the
+    /// selected station is a playlist-backed one.
+    private var resolvedNTSStation: (Station, NTSStationConfig)? {
+        guard case let .some(.station(id)) = sidebarSelection,
+              let station = stations.stations.first(where: { $0.id == id }),
+              let config = station.ntsConfig
+        else { return nil }
+        return (station, config)
+    }
+
     private var resolvedDetailPlaylist: Playlist? {
         switch sidebarSelection {
         case .some(.station(let id)):

@@ -44,6 +44,78 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertNil(radio.streamURL(for: station))
     }
 
+    // MARK: - ♥ like endpoint
+
+    /// Preflight bails 404 when the broadcaster has no pipeline for the
+    /// requested station — the most common error path (user hits ♥ on a
+    /// station that just stopped).
+    @MainActor
+    func testLikeOnIdleStationReturns404() async throws {
+        let radio = RadioBroadcaster(port: 18_030)
+        defer { radio.stopAll() }
+        let (status, _) = await radio.performLikeAsync(stationID: UUID())
+        XCTAssertEqual(status, 404)
+    }
+
+    /// Playlist stations produce items with `historyID == nil` — those
+    /// live in the user's library already, so ♥ should 409 with a
+    /// "already saved" message rather than copying anything.
+    @MainActor
+    func testLikeOnPlaylistStationReturns409() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let port: UInt16 = 18_031
+        let radio = RadioBroadcaster(port: port)
+        let station = Station(name: "Like Test", kind: .playlist(queue: tracks))
+        await radio.startBroadcast(station: station)
+        defer { radio.stopAll() }
+
+        // Wait long enough for the encoder to open its first track so
+        // `currentItemByStation` is populated — otherwise we'd hit the
+        // 404 "no current track" path.
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+
+        let (status, body) = await radio.performLikeAsync(stationID: station.id)
+        XCTAssertEqual(status, 409, "Expected 409, got \(status): \(String(data: body, encoding: .utf8) ?? "")")
+
+        struct Response: Decodable { let status: String; let message: String? }
+        let decoded = try JSONDecoder().decode(Response.self, from: body)
+        XCTAssertEqual(decoded.status, "error")
+        XCTAssertEqual(decoded.message, "track already in library")
+    }
+
+    /// CORS preflight: OPTIONS /like returns 204 with the standard
+    /// Access-Control-* headers so the GitHub-Pages web player can POST
+    /// without a browser flagging it as an unapproved cross-origin call.
+    @MainActor
+    func testOptionsLikeReturnsCORSHeaders() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let port: UInt16 = 18_032
+        let radio = RadioBroadcaster(port: port)
+        // Need at least one live broadcast to bring the listener up.
+        let filler = Station(name: "CORS Filler", kind: .playlist(queue: tracks))
+        await radio.startBroadcast(station: filler)
+        defer { radio.stopAll() }
+
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        let response = try await Self.fetchRawResponse(
+            port: port,
+            path: "/like",
+            requestHeaders: ["Access-Control-Request-Method: POST"],
+            maxBytes: 1_024,
+            method: "OPTIONS"
+        )
+        XCTAssertTrue(response.contains("HTTP/1.1 204"), "Expected 204: \(response)")
+        let lower = response.lowercased()
+        XCTAssertTrue(lower.contains("access-control-allow-origin: *"), "Missing allow-origin: \(response)")
+        XCTAssertTrue(lower.contains("access-control-allow-methods: post, options"), "Missing allow-methods: \(response)")
+        XCTAssertTrue(lower.contains("access-control-allow-headers: content-type"), "Missing allow-headers: \(response)")
+    }
+
     func testRequestPathParsesCommonShapes() {
         let raw = Data("GET /stream/my-fm.aac HTTP/1.1\r\nHost: x\r\n\r\n".utf8)
         XCTAssertEqual(RadioBroadcaster.requestPath(from: raw), "/stream/my-fm.aac")
@@ -408,7 +480,8 @@ final class RadioBroadcasterTests: XCTestCase {
         port: UInt16,
         path: String,
         requestHeaders: [String],
-        maxBytes: Int = 2_048
+        maxBytes: Int = 2_048,
+        method: String = "GET"
     ) async throws -> String {
         let connection = NWConnection(
             host: NWEndpoint.Host("127.0.0.1"),
@@ -433,7 +506,7 @@ final class RadioBroadcasterTests: XCTestCase {
         }
         guard ready else { return "<<<connection not ready>>>" }
 
-        var request = "GET \(path) HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        var request = "\(method) \(path) HTTP/1.1\r\nHost: 127.0.0.1\r\n"
         for header in requestHeaders { request += "\(header)\r\n" }
         request += "\r\n"
 
