@@ -1,6 +1,6 @@
-name: Johanssound
+name: Ratbat
 options:
-  bundleIdPrefix: se.jonasjohansson.johanssound
+  bundleIdPrefix: se.jonasjohansson.ratbat
   deploymentTarget:
     macOS: "14.0"
     iOS: "17.0"
@@ -12,30 +12,30 @@ settings:
     CODE_SIGNING_REQUIRED: NO
     CODE_SIGNING_ALLOWED: NO
 targets:
-  JohanssoundCore:
+  RatbatCore:
     type: framework
     platform: [macOS, iOS]
     sources:
-      - path: JohanssoundCore
+      - path: RatbatCore
         excludes:
           - Tests
     info:
-      path: JohanssoundCore/Info.plist
+      path: RatbatCore/Info.plist
       properties:
-        CFBundleName: JohanssoundCore
-        CFBundleDisplayName: JohanssoundCore
-        CFBundleIdentifier: se.jonasjohansson.johanssound.core
+        CFBundleName: RatbatCore
+        CFBundleDisplayName: RatbatCore
+        CFBundleIdentifier: se.jonasjohansson.ratbat.core
     settings:
       base:
         DEFINES_MODULE: YES
-        PRODUCT_NAME: JohanssoundCore
+        PRODUCT_NAME: RatbatCore
         CURRENT_PROJECT_VERSION: "1"
         MARKETING_VERSION: "1.0"
-  JohanssoundMac:
+  RatbatMac:
     type: application
     platform: macOS
     sources:
-      - path: JohanssoundMac
+      - path: RatbatMac
       - path: Vendor/cloudflared/cloudflared
         type: file
         buildPhase: resources
@@ -43,38 +43,38 @@ targets:
         type: folder
         buildPhase: resources
     dependencies:
-      - target: JohanssoundCore_macOS
+      - target: RatbatCore_macOS
         link: true
         embed: true
     info:
-      path: JohanssoundMac/Info.plist
+      path: RatbatMac/Info.plist
       properties:
-        CFBundleName: Johanssound
-        CFBundleDisplayName: Johanssound
+        CFBundleName: Ratbat
+        CFBundleDisplayName: Ratbat
         LSMinimumSystemVersion: "14.0"
         NSHumanReadableCopyright: "Copyright (c) 2026 Jonas Johansson"
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: se.jonasjohansson.johanssound.mac
+        PRODUCT_BUNDLE_IDENTIFIER: se.jonasjohansson.ratbat.mac
         MACOSX_DEPLOYMENT_TARGET: "14.0"
         # Hardened runtime blocks spawning unsigned child processes; we
         # bundle cloudflared and spawn it via Process, so keep it off
         # until we sign the full chain.
         ENABLE_HARDENED_RUNTIME: NO
-  JohanssoundIOS:
+  RatbatIOS:
     type: application
     platform: iOS
     sources:
-      - JohanssoundIOS
+      - RatbatIOS
     dependencies:
-      - target: JohanssoundCore_iOS
+      - target: RatbatCore_iOS
         link: true
         embed: true
     info:
-      path: JohanssoundIOS/Info.plist
+      path: RatbatIOS/Info.plist
       properties:
-        CFBundleName: Johanssound
-        CFBundleDisplayName: Johanssound
+        CFBundleName: Ratbat
+        CFBundleDisplayName: Ratbat
         UILaunchScreen:
           UIColorName: ""
         UISupportedInterfaceOrientations:
@@ -83,30 +83,30 @@ targets:
           - UIInterfaceOrientationLandscapeRight
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: se.jonasjohansson.johanssound.ios
+        PRODUCT_BUNDLE_IDENTIFIER: se.jonasjohansson.ratbat.ios
         IPHONEOS_DEPLOYMENT_TARGET: "17.0"
         TARGETED_DEVICE_FAMILY: "1,2"
-  JohanssoundCoreTests:
+  RatbatCoreTests:
     type: bundle.unit-test
     platform: macOS
     sources:
-      - path: JohanssoundCore/Tests
+      - path: RatbatCore/Tests
         excludes:
           - Fixtures
-      - path: JohanssoundCore/Tests/Fixtures
+      - path: RatbatCore/Tests/Fixtures
         type: folder
         buildPhase: resources
       - path: web
         type: folder
         buildPhase: resources
     dependencies:
-      - target: JohanssoundCore_macOS
+      - target: RatbatCore_macOS
 schemes:
-  JohanssoundCore:
+  RatbatCore:
     build:
       targets:
-        JohanssoundCore_macOS: all
-        JohanssoundCoreTests: [test]
+        RatbatCore_macOS: all
+        RatbatCoreTests: [test]
     test:
       targets:
-        - JohanssoundCoreTests
+        - RatbatCoreTests

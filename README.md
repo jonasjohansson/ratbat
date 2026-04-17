@@ -1,4 +1,4 @@
-# Johanssound
+# Ratbat
 
 Personal music app for the Apple ecosystem. Downloads Spotify playlists as local files, plays them in a Winamp-style UI, and broadcasts what you're listening to as a personal HTTP radio station.
 
@@ -17,7 +17,7 @@ Personal music app for the Apple ecosystem. Downloads Spotify playlists as local
 
 ## Design
 
-See `../skynet/wiki/projects/johanssound.md` for the full design doc.
+See `../skynet/wiki/projects/ratbat.md` for the full design doc.
 
 ## Implementation
 

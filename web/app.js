@@ -1,4 +1,4 @@
-// Johanssound web player.
+// Ratbat web player.
 //
 // Polls /now.json every few seconds, lets the user pick a station, and
 // streams its AAC feed via a plain <audio> element. The stream URL itself

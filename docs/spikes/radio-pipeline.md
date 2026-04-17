@@ -104,7 +104,7 @@ buffering on top, which is standard for HTTP audio streams.
 Not run as part of the spike (no audio library loaded in this session).
 To repro:
 
-1. Build and run `JohanssoundMac`.
+1. Build and run `RatbatMac`.
 2. Point it at a folder of audio files.
 3. Right-click a playlist, "Create Station from this".
 4. Click the antenna icon in the window toolbar.
@@ -161,12 +161,12 @@ Expected: `Input #0, aac, from 'http://...'` with a stream listed as
 
 ## Files touched
 
-- `JohanssoundCore/Radio/RadioBroadcaster.swift` (new, ~280 LoC)
-- `JohanssoundCore/Radio/AudioDecoder.swift` (new)
-- `JohanssoundCore/Radio/AACEncoder.swift` (new)
-- `JohanssoundCore/Radio/AACRingBuffer.swift` (new)
-- `JohanssoundCore/Radio/ADTSHeader.swift` (new)
-- `JohanssoundCore/Tests/RadioBroadcasterTests.swift` (new, 8 tests)
-- `JohanssoundCore/Views/RootView.swift` (toolbar button wiring)
-- `JohanssoundCore/Views/PlaylistsSidebarView.swift` (URL caption when
+- `RatbatCore/Radio/RadioBroadcaster.swift` (new, ~280 LoC)
+- `RatbatCore/Radio/AudioDecoder.swift` (new)
+- `RatbatCore/Radio/AACEncoder.swift` (new)
+- `RatbatCore/Radio/AACRingBuffer.swift` (new)
+- `RatbatCore/Radio/ADTSHeader.swift` (new)
+- `RatbatCore/Tests/RadioBroadcasterTests.swift` (new, 8 tests)
+- `RatbatCore/Views/RootView.swift` (toolbar button wiring)
+- `RatbatCore/Views/PlaylistsSidebarView.swift` (URL caption when
   broadcasting)
