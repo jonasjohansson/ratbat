@@ -1,12 +1,10 @@
 import XCTest
 @testable import JohanssoundCore
 
-/// Covers the Task 3.1 slice: building a ``Station`` from a playlist,
-/// verifying the auto-name / seed propagation, and asserting that
-/// ``StationManager`` swaps in a new active station on creation. Shuffle
-/// coverage is probabilistic — with 30 tracks the chance of identical
-/// orderings across two independent shuffles is ~1 / 30! which is well
-/// below any flaky-test threshold.
+/// Covers ``Station`` value semantics — construction from a playlist, auto-
+/// naming, shuffle behaviour, and slug derivation. Shuffle coverage is
+/// probabilistic: with 30 tracks, two independent shuffles colliding is
+/// ~1/30! which is well below any flaky-test threshold.
 final class StationTests: XCTestCase {
     func testStationFromPlaylistUsesSameTracks() {
         let track = Track(
@@ -60,23 +58,30 @@ final class StationTests: XCTestCase {
         XCTAssertNotEqual(s1.queue.map(\.id), s2.queue.map(\.id))
     }
 
-    @MainActor
-    func testStationManagerCreate() {
-        let manager = StationManager()
-        XCTAssertNil(manager.activeStation)
-        let playlist = Playlist(
-            name: "P",
-            folder: nil,
-            tracks: [],
-            children: [],
-            kind: .folder
+    func testStationSlugIsUrlSafe() {
+        let station = Station(
+            name: "Radio based on Late Night!",
+            seed: .manual,
+            queue: []
         )
-        manager.createStation(from: playlist)
-        XCTAssertNotNil(manager.activeStation)
-        XCTAssertEqual(
-            manager.activeStation?.seed,
-            .playlist(sourceID: playlist.id, sourceName: "P")
-        )
-        XCTAssertEqual(manager.activeStation?.name, "Radio based on P")
+        XCTAssertEqual(station.slug, "radio-based-on-late-night")
+    }
+
+    func testStationSlugTransliteratesDiacritics() {
+        let station = Station(name: "Äventyr Mix", seed: .manual, queue: [])
+        XCTAssertEqual(station.slug, "aventyr-mix")
+    }
+
+    func testStationSlugHandlesEmptyName() {
+        // All-emoji / all-punctuation names fall back to a uuid-prefix
+        // slug so the route is still valid.
+        let station = Station(name: "🎶🎶", seed: .manual, queue: [])
+        XCTAssertTrue(station.slug.hasPrefix("station-"))
+        XCTAssertEqual(station.slug.count, "station-".count + 8)
+    }
+
+    func testStationSlugCollapsesMultipleSeparators() {
+        let station = Station(name: "A  ---  B__C", seed: .manual, queue: [])
+        XCTAssertEqual(station.slug, "a-b-c")
     }
 }

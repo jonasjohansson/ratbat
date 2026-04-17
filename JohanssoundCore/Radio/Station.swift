@@ -47,4 +47,33 @@ public struct Station: Identifiable, Hashable, Sendable, Codable {
             queue: shuffled
         )
     }
+
+    /// URL-safe kebab-case identifier derived from ``name``. Used to route
+    /// per-station stream URLs (`http://host:port/stream/{slug}.aac`) so
+    /// multiple stations can broadcast concurrently on the same port.
+    ///
+    /// Derivation steps:
+    /// 1. Strip diacritics via `folding(options:)` so "Äventyr" → "Aventyr".
+    /// 2. Split on anything that isn't `[A-Za-z0-9]` — that collapses
+    ///    whitespace, punctuation, and emoji all at once.
+    /// 3. Rejoin with `-`, lowercase.
+    /// 4. Fallback to `station-{uuid8}` when the name is all-non-alphanumeric
+    ///    (empty / emoji-only) so the route is still valid.
+    ///
+    /// Collision handling is the ``StationManager``'s responsibility — this
+    /// property only sees one station's name and can't know about siblings.
+    public var slug: String {
+        let transliterated = name.folding(
+            options: [.diacriticInsensitive, .caseInsensitive],
+            locale: .current
+        )
+        let pieces = transliterated
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+        let kebab = pieces.joined(separator: "-").lowercased()
+        if kebab.isEmpty {
+            return "station-\(id.uuidString.prefix(8).lowercased())"
+        }
+        return kebab
+    }
 }

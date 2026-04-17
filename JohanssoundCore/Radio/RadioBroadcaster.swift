@@ -4,56 +4,58 @@ import AudioToolbox
 import Network
 import OSLog
 
-/// End-to-end HTTP AAC broadcaster for a station's track queue.
+/// Multi-station HTTP AAC broadcaster.
 ///
-/// Spike (Task 3.2): proves the pipeline
-/// `[Track] → AVAudioFile → PCM → AAC/ADTS → NWListener → HTTP client`
-/// can hang together before we productionise any piece of it. Explicitly
-/// independent of ``AudioPlayer`` — the broadcaster opens its own handle
-/// on the same file AudioPlayer might be playing, decodes in parallel,
-/// and streams. That keeps AVPlayer untouched and means the station can
-/// broadcast while the user listens to something else on the local
-/// speaker bus.
+/// Task 3.2 started as a single-pipeline spike (one station, one encoder,
+/// one `/stream.aac` endpoint). Task 3.5 generalises it: each started
+/// station gets its own ``BroadcastPipeline`` (encoder loop + ring buffer
+/// + per-pipeline ICY state) and HTTP requests are routed by URL path:
 ///
-/// Runs on the main actor so published UI state (`isBroadcasting`,
-/// `listenerCount`, `currentURL`) is safe for SwiftUI to observe directly.
-/// The broadcast task itself offloads CPU work (file read + encode) to
-/// a detached task and posts progress back via `Task { @MainActor }`.
+/// ```
+/// GET /stream/{slug}.aac   → that station's pipeline
+/// GET /stream.aac          → legacy, 302-redirects to first live station
+/// ```
 ///
-/// macOS-only because `Network.framework` listeners aren't something
-/// we've tested on iOS (and the iOS app doesn't have a broadcast flow
-/// wired up anyway — that's a later phase).
+/// A single shared ``NWListener`` parses the request line, extracts the
+/// slug, and hands the connection off to the matching pipeline. The
+/// Cloudflare tunnel is still global (one port, one forwarder) because
+/// cloudflared forwards the whole TCP port — station-awareness lives
+/// entirely in our HTTP layer.
+///
+/// Runs on the main actor so published UI state is safe for SwiftUI to
+/// observe. The encode + serve loops offload CPU to detached tasks and
+/// post progress back via `Task { @MainActor }`.
+///
+/// `NWListener`-based HTTP is macOS-only in practice — the iOS app doesn't
+/// wire up a broadcast flow today, though the code compiles on both so
+/// we're not boxed into macOS forever.
 @MainActor
 public final class RadioBroadcaster: ObservableObject {
     // MARK: - Published state
 
-    @Published public private(set) var isBroadcasting = false
-    @Published public private(set) var listenerCount = 0
-    /// URL a client should point VLC / a browser at. `nil` when idle.
-    @Published public private(set) var currentURL: URL?
+    /// Station IDs whose pipelines are currently running. `Set` because
+    /// the UI only asks "is this one live?" — order doesn't matter.
+    @Published public private(set) var broadcasting: Set<Station.ID> = []
+    /// Per-station listener counts. Absent key = zero.
+    @Published public private(set) var listenerCount: [Station.ID: Int] = [:]
+    /// Per-station currently-encoding track. Drives ICY `StreamTitle`
+    /// updates and the "Now: Artist — Title" UI snippet.
+    @Published public private(set) var currentTrackByStation: [Station.ID: Track] = [:]
+    /// Last error surfaced by the listener or any encode/decode loop.
+    /// String-typed so the UI can just render it; OSLog has the details.
+    @Published public private(set) var error: String?
+
     #if os(macOS)
-    /// Public tunnel that exposes the LAN-only `currentURL` out to the
-    /// internet via cloudflared. Owned by the broadcaster so its lifecycle
-    /// matches `start`/`stop` — the UI just observes `tunnel.publicURL`.
-    /// macOS-only because `Process.run()` is unavailable on iOS; iOS
-    /// doesn't have a broadcast flow wired up anyway.
+    /// Public tunnel that exposes the whole port out to the internet via
+    /// cloudflared. Started lazily the first time any station begins
+    /// broadcasting, stopped when the last station stops. Single tunnel
+    /// for all stations since cloudflared is port-scoped.
     public let tunnel: CloudflareTunnel = CloudflareTunnel()
     #endif
-    /// Last error surfaced by the listener or the decode/encode loop.
-    /// String-typed so the UI can just render it; callers who want
-    /// structured errors should read OSLog.
-    @Published public private(set) var error: String?
-    /// Track the encode loop is currently feeding into the stream, or
-    /// `nil` when idle / between tracks. Published so UI can show
-    /// "Broadcasting: Artist — Title" without poking the encoder.
-    @Published public private(set) var currentlyBroadcastingTrack: Track?
 
     // MARK: - Config
 
     private let port: NWEndpoint.Port
-    /// Hardcoded for v1 — later we can derive this from the `Station` the
-    /// broadcaster is attached to so each station gets its own label.
-    private let stationName: String = "Johanssound"
     private let logger = Logger(
         subsystem: "se.jonasjohansson.johanssound",
         category: "broadcaster"
@@ -61,14 +63,27 @@ public final class RadioBroadcaster: ObservableObject {
 
     // MARK: - Internals
 
+    /// Per-station encode/serve state. Non-Sendable because it's always
+    /// accessed from the main actor; the detached tasks inside only hold
+    /// weak refs to the broadcaster and reach back through `MainActor.run`.
+    private final class BroadcastPipeline {
+        let station: Station
+        let buffer: AACRingBuffer
+        var encodeTask: Task<Void, Never>?
+
+        init(station: Station, buffer: AACRingBuffer) {
+            self.station = station
+            self.buffer = buffer
+        }
+    }
+
+    private var pipelines: [Station.ID: BroadcastPipeline] = [:]
     private var listener: NWListener?
-    private var clients: [ObjectIdentifier: NWConnection] = [:]
+    /// Connected clients keyed by connection identity. We store the
+    /// station each client is bound to so disconnects decrement the
+    /// right listener count.
+    private var clients: [ObjectIdentifier: (connection: NWConnection, stationID: Station.ID)] = [:]
     private var clientTasks: [ObjectIdentifier: Task<Void, Never>] = [:]
-    private var broadcastTask: Task<Void, Never>?
-    /// Shared ring buffer between the encode loop (writer) and every
-    /// client task (reader). Outlives a single broadcast so clients can
-    /// hold references without a circular ownership hassle.
-    private var ringBuffer: AACRingBuffer?
 
     public init(port: UInt16 = 18000) {
         // Force-unwrap: NWEndpoint.Port(rawValue:) only returns nil for 0.
@@ -77,102 +92,146 @@ public final class RadioBroadcaster: ObservableObject {
 
     // MARK: - Public API
 
-    /// Start broadcasting ``queue``. v1 plays the queue sequentially and
-    /// loops back to the start when it runs out. No-op if already
-    /// broadcasting or if the queue is empty.
-    public func start(queue: [Track]) async {
-        guard !isBroadcasting else { return }
-        guard !queue.isEmpty else {
+    /// Start broadcasting `station`. Spins up its encode loop and (if not
+    /// already running) the shared HTTP listener + Cloudflare tunnel.
+    /// No-op if the station is already live or its queue is empty.
+    public func startBroadcast(station: Station) async {
+        guard !broadcasting.contains(station.id) else { return }
+        guard !station.queue.isEmpty else {
             error = "Cannot broadcast an empty queue"
             return
         }
         error = nil
 
-        let buffer = AACRingBuffer()
-        ringBuffer = buffer
-
-        do {
-            try startHTTPServer(buffer: buffer)
-        } catch {
-            self.error = "Listener failed to start: \(error.localizedDescription)"
-            logger.error("listener start failed: \(String(describing: error))")
-            ringBuffer = nil
-            return
+        // Bring up the shared listener the first time anyone broadcasts.
+        if listener == nil {
+            do {
+                try startHTTPServer()
+            } catch {
+                self.error = "Listener failed to start: \(error.localizedDescription)"
+                logger.error("listener start failed: \(String(describing: error))")
+                return
+            }
         }
 
-        isBroadcasting = true
-        currentURL = URL(string: "http://localhost:\(port.rawValue)/stream.aac")
+        let pipeline = BroadcastPipeline(station: station, buffer: AACRingBuffer())
+        pipelines[station.id] = pipeline
+        broadcasting.insert(station.id)
+        listenerCount[station.id] = 0
 
-        broadcastTask = Task.detached { [weak self, buffer] in
-            await Self.runEncodeLoop(queue: queue, buffer: buffer, owner: self)
+        let buffer = pipeline.buffer
+        pipeline.encodeTask = Task.detached { [weak self, buffer] in
+            await Self.runEncodeLoop(
+                queue: station.queue,
+                stationID: station.id,
+                buffer: buffer,
+                owner: self
+            )
         }
 
         #if os(macOS)
-        // Kick off the public tunnel in parallel. Don't await it here —
-        // the broadcast is already live on localhost, and the tunnel URL
-        // appearing is a nice-to-have that can take a few seconds.
-        let tunnelPort = port.rawValue
-        Task { [weak self] in
-            await self?.tunnel.start(forwardingTo: tunnelPort)
+        // First-station bootstrap for the tunnel. `CloudflareTunnel.start`
+        // is idempotent, but gating on count avoids spurious log churn.
+        if broadcasting.count == 1 {
+            let tunnelPort = port.rawValue
+            Task { [weak self] in
+                await self?.tunnel.start(forwardingTo: tunnelPort)
+            }
         }
         #endif
 
-        logger.info("broadcast started on port \(self.port.rawValue, privacy: .public)")
+        logger.info(
+            "station broadcast started: \(station.slug, privacy: .public) on port \(self.port.rawValue, privacy: .public)"
+        )
     }
 
-    /// Stop the broadcast. Tears down the listener, closes clients,
-    /// cancels the encode task, and clears published state. Idempotent.
-    public func stop() {
-        guard isBroadcasting || listener != nil else { return }
+    /// Stop a single station's broadcast. Tears down its encode loop,
+    /// disconnects clients bound to it, and drops the pipeline. If it was
+    /// the last live station, the shared listener and tunnel come down too.
+    public func stopBroadcast(stationID: Station.ID) {
+        guard let pipeline = pipelines[stationID] else { return }
 
+        pipeline.encodeTask?.cancel()
+        pipelines.removeValue(forKey: stationID)
+        broadcasting.remove(stationID)
+        listenerCount.removeValue(forKey: stationID)
+        currentTrackByStation.removeValue(forKey: stationID)
+
+        // Boot any clients still attached to this station.
+        let toRemove = clients.filter { $0.value.stationID == stationID }
+        for (id, entry) in toRemove {
+            clientTasks[id]?.cancel()
+            clientTasks.removeValue(forKey: id)
+            entry.connection.cancel()
+            clients.removeValue(forKey: id)
+        }
+
+        if broadcasting.isEmpty {
+            tearDownListener()
+        }
+
+        logger.info("station broadcast stopped: \(pipeline.station.slug, privacy: .public)")
+    }
+
+    /// Stop every running broadcast and tear the listener down. Idempotent.
+    public func stopAll() {
+        for id in Array(pipelines.keys) {
+            stopBroadcast(stationID: id)
+        }
+    }
+
+    /// Whether `stationID` is currently broadcasting.
+    public func isBroadcasting(stationID: Station.ID) -> Bool {
+        broadcasting.contains(stationID)
+    }
+
+    /// Local stream URL for `station`, or `nil` if it isn't broadcasting.
+    /// Shape: `http://localhost:{port}/stream/{slug}.aac` — aligned with
+    /// the path-based routing the shared listener implements.
+    public func streamURL(for station: Station) -> URL? {
+        guard broadcasting.contains(station.id) else { return nil }
+        return URL(string: "http://localhost:\(port.rawValue)/stream/\(station.slug).aac")
+    }
+
+    /// Tear the shared listener down and drop all client tracking. Called
+    /// when the last broadcast stops — keeping the listener up with no
+    /// pipelines would serve 404s to all comers, which is accurate but
+    /// wasteful.
+    private func tearDownListener() {
         #if os(macOS)
-        // Tear the public tunnel down first so listeners get a clean
-        // connection close rather than a dangling proxy to a dead port.
         tunnel.stop()
         #endif
 
-        broadcastTask?.cancel()
-        broadcastTask = nil
-
-        for (_, task) in clientTasks {
-            task.cancel()
-        }
+        for (_, task) in clientTasks { task.cancel() }
         clientTasks.removeAll()
-
-        for (_, conn) in clients {
-            conn.cancel()
-        }
+        for (_, entry) in clients { entry.connection.cancel() }
         clients.removeAll()
 
         listener?.cancel()
         listener = nil
-        ringBuffer = nil
-
-        isBroadcasting = false
-        listenerCount = 0
-        currentURL = nil
-        currentlyBroadcastingTrack = nil
-
-        logger.info("broadcast stopped")
     }
 
-    /// Called from the detached encode loop (via `MainActor.run`) each time
-    /// the decoder opens a new track. Drives the ICY metadata we publish
-    /// to connected clients on their next metadata block boundary.
-    fileprivate func updateCurrentTrack(_ track: Track?) {
-        currentlyBroadcastingTrack = track
+    /// Called from the detached encode loop each time the decoder opens a
+    /// new track. Drives the ICY metadata surfaced to clients at the next
+    /// block boundary.
+    fileprivate func updateCurrentTrack(_ track: Track?, stationID: Station.ID) {
+        if let track {
+            currentTrackByStation[stationID] = track
+        } else {
+            currentTrackByStation.removeValue(forKey: stationID)
+        }
     }
 
-    /// Snapshot of the current track for detached serve loops. Lets a
-    /// client task ask "what's playing right now?" without needing an
-    /// unsafe reference back to the broadcaster.
-    fileprivate func snapshotCurrentTrack() -> Track? {
-        currentlyBroadcastingTrack
+    /// Snapshot of the current track for a detached serve loop. Lets a
+    /// client task ask "what's playing for MY station?" without grabbing
+    /// the whole actor state.
+    fileprivate func snapshotCurrentTrack(stationID: Station.ID) -> Track? {
+        currentTrackByStation[stationID]
     }
 
     // MARK: - HTTP server
 
-    private func startHTTPServer(buffer: AACRingBuffer) throws {
+    private func startHTTPServer() throws {
         let params = NWParameters.tcp
         // Allow re-binding immediately on restart instead of waiting for
         // the OS's TIME_WAIT timeout.
@@ -186,7 +245,7 @@ public final class RadioBroadcaster: ObservableObject {
                 case .failed(let err):
                     self.error = "Listener failed: \(err.localizedDescription)"
                     self.logger.error("listener failed: \(String(describing: err))")
-                    self.stop()
+                    self.stopAll()
                 case .cancelled:
                     self.logger.info("listener cancelled")
                 default:
@@ -198,7 +257,7 @@ public final class RadioBroadcaster: ObservableObject {
         listener.newConnectionHandler = { [weak self] connection in
             guard let self else { connection.cancel(); return }
             Task { @MainActor in
-                self.handleClient(connection, buffer: buffer)
+                self.routeIncoming(connection)
             }
         }
 
@@ -206,11 +265,95 @@ public final class RadioBroadcaster: ObservableObject {
         self.listener = listener
     }
 
-    private func handleClient(_ connection: NWConnection, buffer: AACRingBuffer) {
+    /// Read the request line, dispatch on path. Everything after the
+    /// handshake is pipeline-specific — we just do the path→pipeline lookup
+    /// here and hand off.
+    private func routeIncoming(_ connection: NWConnection) {
+        connection.start(queue: .global(qos: .userInitiated))
+
+        let port = self.port.rawValue
+        let pipelineLookup: @Sendable (String) async -> (Station.ID, AACRingBuffer, String)? = { [weak self] slug in
+            await MainActor.run { [weak self] in
+                guard let self, let pipeline = self.pipelines.first(where: { $0.value.station.slug == slug })?.value else {
+                    return nil
+                }
+                return (pipeline.station.id, pipeline.buffer, pipeline.station.name)
+            }
+        }
+        let legacyRedirectSlug: @Sendable () async -> String? = { [weak self] in
+            await MainActor.run { [weak self] in
+                self?.pipelines.values.first?.station.slug
+            }
+        }
+
+        let task = Task.detached { [weak self] in
+            // Read headers to learn both the request path and whether the
+            // client wants ICY metadata — two pieces of information from
+            // the same read.
+            let headerBytes = await Self.readUntilHeaderEnd(connection: connection)
+            let path = Self.requestPath(from: headerBytes) ?? "/stream.aac"
+            let wantsMetadata = Self.headerRequestsICYMetadata(headerBytes)
+
+            // Legacy endpoint: redirect to the first broadcasting station
+            // so existing bookmarks keep working. 404 when nothing's live.
+            if path == "/stream.aac" || path == "/stream" {
+                if let slug = await legacyRedirectSlug() {
+                    _ = await Self.send(
+                        data: Data(Self.redirectResponse(slug: slug, port: port).utf8),
+                        on: connection
+                    )
+                } else {
+                    _ = await Self.send(
+                        data: Data(Self.notFoundResponse().utf8),
+                        on: connection
+                    )
+                }
+                connection.cancel()
+                return
+            }
+
+            guard let slug = Self.extractSlug(from: path),
+                  let (stationID, buffer, stationName) = await pipelineLookup(slug) else {
+                _ = await Self.send(
+                    data: Data(Self.notFoundResponse().utf8),
+                    on: connection
+                )
+                connection.cancel()
+                return
+            }
+
+            await MainActor.run { [weak self] in
+                self?.registerClient(connection, stationID: stationID)
+            }
+
+            await Self.serveClient(
+                connection: connection,
+                buffer: buffer,
+                stationID: stationID,
+                stationName: stationName,
+                wantsMetadata: wantsMetadata,
+                ownerRef: { [weak self] in self }
+            )
+
+            connection.cancel()
+            await MainActor.run { [weak self] in
+                self?.removeClient(ObjectIdentifier(connection))
+            }
+        }
+        // We key the task under the connection identity so stopBroadcast
+        // can cancel in-flight client loops cleanly. The connection isn't
+        // registered as a client yet (that happens once we've identified
+        // its station), so only keep the task in a transient slot.
+        clientTasks[ObjectIdentifier(connection)] = task
+    }
+
+    private func registerClient(_ connection: NWConnection, stationID: Station.ID) {
         let id = ObjectIdentifier(connection)
-        clients[id] = connection
-        listenerCount = clients.count
-        logger.info("client connected, total \(self.listenerCount, privacy: .public)")
+        clients[id] = (connection, stationID)
+        listenerCount[stationID, default: 0] += 1
+        logger.info(
+            "client connected to \(stationID.uuidString.prefix(8), privacy: .public), total \(self.listenerCount[stationID] ?? 0, privacy: .public)"
+        )
 
         connection.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
@@ -223,54 +366,88 @@ public final class RadioBroadcaster: ObservableObject {
                 break
             }
         }
-
-        connection.start(queue: .global(qos: .userInitiated))
-
-        let stationName = self.stationName
-        let task = Task.detached { [weak self] in
-            await Self.serveClient(
-                connection: connection,
-                buffer: buffer,
-                stationName: stationName,
-                ownerRef: { [weak self] in self }
-            )
-            // When serving exits (client gone, task cancelled), make sure
-            // the connection is torn down and we drop our reference.
-            connection.cancel()
-            await MainActor.run { [weak self] in
-                self?.removeClient(id)
-            }
-        }
-        clientTasks[id] = task
     }
 
     private func removeClient(_ id: ObjectIdentifier) {
-        if clients.removeValue(forKey: id) != nil {
-            listenerCount = clients.count
-            logger.info("client disconnected, remaining \(self.listenerCount, privacy: .public)")
+        if let entry = clients.removeValue(forKey: id) {
+            if let count = listenerCount[entry.stationID], count > 0 {
+                listenerCount[entry.stationID] = count - 1
+            }
+            logger.info(
+                "client disconnected, remaining \(self.listenerCount[entry.stationID] ?? 0, privacy: .public)"
+            )
         }
         clientTasks.removeValue(forKey: id)
     }
 
+    // MARK: - Request parsing
+
+    /// Pull the path out of a request-header byte blob. Returns the raw
+    /// path (no query string stripping needed — we don't use queries).
+    nonisolated static func requestPath(from bytes: Data) -> String? {
+        guard let text = String(data: bytes, encoding: .utf8) else { return nil }
+        let firstLine = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .split(separator: "\n", maxSplits: 1)
+            .first
+            .map(String.init) ?? ""
+        // Request line shape: `METHOD SP PATH SP VERSION`.
+        let parts = firstLine.split(separator: " ", maxSplits: 2)
+        guard parts.count >= 2 else { return nil }
+        return String(parts[1])
+    }
+
+    /// Parse `/stream/{slug}.aac` → `slug`. Returns nil for any other
+    /// shape so callers 404 instead of guessing.
+    nonisolated static func extractSlug(from path: String) -> String? {
+        let prefix = "/stream/"
+        let suffix = ".aac"
+        guard path.hasPrefix(prefix), path.hasSuffix(suffix) else { return nil }
+        let start = path.index(path.startIndex, offsetBy: prefix.count)
+        let end = path.index(path.endIndex, offsetBy: -suffix.count)
+        let slug = String(path[start..<end])
+        return slug.isEmpty ? nil : slug
+    }
+
+    // MARK: - Response builders
+
+    nonisolated static func redirectResponse(slug: String, port: UInt16) -> String {
+        let target = "http://localhost:\(port)/stream/\(slug).aac"
+        return """
+        HTTP/1.1 302 Found\r
+        Location: \(target)\r
+        Content-Length: 0\r
+        Connection: close\r
+        \r
+
+        """
+    }
+
+    nonisolated static func notFoundResponse() -> String {
+        """
+        HTTP/1.1 404 Not Found\r
+        Content-Type: text/plain\r
+        Content-Length: 9\r
+        Connection: close\r
+        \r
+        Not Found
+        """
+    }
+
     // MARK: - Client serving (detached)
 
-    /// Reads the HTTP request line(s), sends a minimal 200 response,
-    /// then pumps ring-buffer data until the connection goes away. If
-    /// the client requested ICY metadata (`Icy-MetaData: 1`), we
-    /// interleave a metadata block after every `blockInterval` audio
-    /// bytes written to THIS client — byte counters are per-client
-    /// because different clients connect at different moments.
+    /// Reads were already done in `routeIncoming`; this writes the 200
+    /// header and pumps the pipeline's ring buffer to the client. ICY
+    /// metadata (if requested) is injected every 16384 bytes using the
+    /// station's current track.
     private static func serveClient(
         connection: NWConnection,
         buffer: AACRingBuffer,
+        stationID: Station.ID,
         stationName: String,
+        wantsMetadata: Bool,
         ownerRef: @escaping @Sendable () -> RadioBroadcaster?
     ) async {
-        // Read + parse the HTTP request headers so we know whether the
-        // client opted in to ICY metadata.
-        let headerBytes = await readUntilHeaderEnd(connection: connection)
-        let wantsMetadata = headerRequestsICYMetadata(headerBytes)
-
         let responseHeader = buildResponseHeader(
             wantsMetadata: wantsMetadata,
             stationName: stationName
@@ -285,9 +462,6 @@ public final class RadioBroadcaster: ObservableObject {
         while !Task.isCancelled {
             let chunk = await buffer.read(from: &cursor)
             if chunk.isEmpty {
-                // Either cancelled or a spurious wake-up. Yield and
-                // re-check — the read(from:) contract says we'll get
-                // real data next time if more has been written.
                 if Task.isCancelled { return }
                 continue
             }
@@ -312,8 +486,6 @@ public final class RadioBroadcaster: ObservableObject {
                     bytesSinceMetaBlock += remaining.count
                     remaining = Data()
                 } else {
-                    // Fill the current interval, emit a meta block,
-                    // then carry the leftover forward.
                     let fill = remaining.prefix(room)
                     if !fill.isEmpty {
                         let ok = await send(data: Data(fill), on: connection)
@@ -321,7 +493,9 @@ public final class RadioBroadcaster: ObservableObject {
                     }
                     remaining = remaining.dropFirst(room)
 
-                    let track = await MainActor.run { ownerRef()?.snapshotCurrentTrack() }
+                    let track = await MainActor.run {
+                        ownerRef()?.snapshotCurrentTrack(stationID: stationID)
+                    }
                     let trackChanged = track?.id != lastAnnouncedTrackID
                     let meta = ICYMetadata.block(for: track, trackChanged: trackChanged)
                     let ok = await send(data: meta, on: connection)
@@ -338,11 +512,8 @@ public final class RadioBroadcaster: ObservableObject {
 
     /// Scans the request-header bytes for `Icy-MetaData: 1` (case-insensitive).
     /// We only care about a single boolean, so no full HTTP parser needed.
-    private static func headerRequestsICYMetadata(_ bytes: Data) -> Bool {
+    nonisolated static func headerRequestsICYMetadata(_ bytes: Data) -> Bool {
         guard let text = String(data: bytes, encoding: .utf8) else { return false }
-        // Normalise to `\n` then split — splitting on a Character set of
-        // `\r` and `\n` is tempting but Swift's split-on-closure has bitten
-        // us before, so we do it the dull explicit way.
         let normalised = text.replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
         for line in normalised.split(separator: "\n") {
@@ -357,9 +528,9 @@ public final class RadioBroadcaster: ObservableObject {
     }
 
     /// Build the HTTP response head. When ICY metadata is requested we
-    /// advertise `icy-metaint`, a station name, and a genre — VLC shows
-    /// `icy-name` in its "Current Media" panel as the station label.
-    private static func buildResponseHeader(
+    /// advertise `icy-metaint`, the station name, and a genre — VLC shows
+    /// `icy-name` in its "Current Media" panel.
+    nonisolated static func buildResponseHeader(
         wantsMetadata: Bool,
         stationName: String
     ) -> String {
@@ -389,7 +560,7 @@ public final class RadioBroadcaster: ObservableObject {
         }
     }
 
-    private static func readUntilHeaderEnd(
+    nonisolated static func readUntilHeaderEnd(
         connection: NWConnection,
         cap: Int = 4096
     ) async -> Data {
@@ -399,12 +570,8 @@ public final class RadioBroadcaster: ObservableObject {
                 connection.receive(
                     minimumIncompleteLength: 1,
                     maximumLength: 512
-                ) { data, _, isComplete, error in
-                    if error != nil || isComplete {
-                        cont.resume(returning: data)
-                    } else {
-                        cont.resume(returning: data)
-                    }
+                ) { data, _, _, _ in
+                    cont.resume(returning: data)
                 }
             }
             guard let chunk, !chunk.isEmpty else { return acc }
@@ -416,7 +583,7 @@ public final class RadioBroadcaster: ObservableObject {
         return acc
     }
 
-    private static func send(data: Data, on connection: NWConnection) async -> Bool {
+    nonisolated static func send(data: Data, on connection: NWConnection) async -> Bool {
         await withCheckedContinuation { cont in
             connection.send(
                 content: data,
@@ -431,6 +598,7 @@ public final class RadioBroadcaster: ObservableObject {
 
     private static func runEncodeLoop(
         queue: [Track],
+        stationID: Station.ID,
         buffer: AACRingBuffer,
         owner: RadioBroadcaster?
     ) async {
@@ -459,10 +627,8 @@ public final class RadioBroadcaster: ObservableObject {
             do {
                 try decoder.open(track)
                 log.info("decoding \(track.title, privacy: .public)")
-                // Publish the track so per-client serve loops pick it up
-                // in their next ICY metadata block.
                 if let owner {
-                    await MainActor.run { owner.updateCurrentTrack(track) }
+                    await MainActor.run { owner.updateCurrentTrack(track, stationID: stationID) }
                 }
             } catch {
                 log.error("open failed for \(track.title, privacy: .public): \(String(describing: error))")
@@ -496,7 +662,7 @@ public final class RadioBroadcaster: ObservableObject {
 
         decoder.close()
         if let owner {
-            await MainActor.run { owner.updateCurrentTrack(nil) }
+            await MainActor.run { owner.updateCurrentTrack(nil, stationID: stationID) }
         }
         log.info("encode loop exiting")
     }

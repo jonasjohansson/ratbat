@@ -1,17 +1,18 @@
 #if os(macOS)
+import AppKit
 import SwiftUI
 
 /// Sidebar list for the Spotify-style macOS layout.
 ///
 /// Two sections:
-/// 1. **Stations** — shown only when ``StationManager/activeStation`` is
-///    non-nil (v1 allows a single active station at a time). Selecting it
-///    swaps the detail pane to the station's shuffled queue.
+/// 1. **Stations** — every user-created ``Station`` in
+///    ``StationManager/stations``. Each row shows an antenna icon, the
+///    station name, track count, and (when live) its stream URLs. The
+///    context menu on a station row exposes broadcast toggle, URL copy,
+///    rename, and delete. Task 3.5 expanded this from single-active-station
+///    to a full list of persisted stations.
 /// 2. **Library** — every playlist published by ``LibraryViewModel``.
-///    Folder playlists whose ``Playlist/children`` is non-empty render as
-///    `DisclosureGroup`s so the user can drill into sub-folders — the label
-///    itself is still tagged for selection, so clicking the folder name
-///    (not just the triangle) selects that folder's union-playlist.
+///    Folder playlists with children render as `DisclosureGroup`s.
 ///
 /// Library root order, guaranteed by the indexer:
 /// 1. "All Songs" pinned to the top.
@@ -21,13 +22,10 @@ import SwiftUI
 ///
 /// Selection is a ``SidebarSelection`` sum type bound from the parent so
 /// the detail pane can branch on playlist-vs-station without the sidebar
-/// having to care about detail rendering. Each library row shows an SF
-/// Symbol reflecting the playlist `kind`, the name, and a right-aligned
-/// track count; the station row uses an antenna icon.
+/// having to care about detail rendering.
 ///
-/// Right-clicking a playlist row offers "Create Station from this" —
-/// builds a shuffled station seeded from that playlist (replacing the
-/// current one) and auto-selects it in the detail pane.
+/// Right-clicking a playlist row offers "Create Station from this" — now
+/// appends to the list instead of replacing the previous station.
 public struct PlaylistsSidebarView: View {
     @ObservedObject public var vm: LibraryViewModel
     @ObservedObject public var stations: StationManager
@@ -38,6 +36,12 @@ public struct PlaylistsSidebarView: View {
     /// `error` change mid-session.
     @ObservedObject public var tunnel: CloudflareTunnel
     @Binding public var selection: SidebarSelection?
+
+    /// Local UI state for the rename dialog. Nil when no dialog is up.
+    @State private var renameTarget: Station?
+    @State private var renameText: String = ""
+    /// Local UI state for the delete-confirmation alert. Nil when hidden.
+    @State private var deleteTarget: Station?
 
     public init(
         vm: LibraryViewModel,
@@ -54,10 +58,13 @@ public struct PlaylistsSidebarView: View {
 
     public var body: some View {
         List(selection: $selection) {
-            if let station = stations.activeStation {
+            if !stations.stations.isEmpty {
                 Section("Stations") {
-                    stationRow(station)
-                        .tag(SidebarSelection.station(station.id))
+                    ForEach(stations.stations) { station in
+                        stationRow(station)
+                            .tag(SidebarSelection.station(station.id))
+                            .contextMenu { stationContextMenu(station) }
+                    }
                 }
             }
 
@@ -69,6 +76,46 @@ public struct PlaylistsSidebarView: View {
         }
         .listStyle(.sidebar)
         .navigationTitle("Library")
+        .alert(
+            "Rename Station",
+            isPresented: Binding(
+                get: { renameTarget != nil },
+                set: { if !$0 { renameTarget = nil } }
+            )
+        ) {
+            TextField("Name", text: $renameText)
+            Button("Cancel", role: .cancel) { renameTarget = nil }
+            Button("Rename") {
+                if let target = renameTarget {
+                    stations.rename(target.id, to: renameText)
+                }
+                renameTarget = nil
+            }
+        }
+        .alert(
+            "Delete Station?",
+            isPresented: Binding(
+                get: { deleteTarget != nil },
+                set: { if !$0 { deleteTarget = nil } }
+            )
+        ) {
+            Button("Cancel", role: .cancel) { deleteTarget = nil }
+            Button("Delete", role: .destructive) {
+                if let target = deleteTarget {
+                    // Stop any live broadcast first so we don't leave a
+                    // dangling pipeline keyed by a now-deleted station.
+                    if radio.isBroadcasting(stationID: target.id) {
+                        radio.stopBroadcast(stationID: target.id)
+                    }
+                    stations.delete(target.id)
+                }
+                deleteTarget = nil
+            }
+        } message: {
+            if let target = deleteTarget {
+                Text("\"\(target.name)\" will be removed. This can't be undone.")
+            }
+        }
     }
 
     /// Renders one playlist node. Leaves show as a plain row; folders with
@@ -121,12 +168,13 @@ public struct PlaylistsSidebarView: View {
 
     @ViewBuilder
     private func stationRow(_ station: Station) -> some View {
+        let isLive = radio.isBroadcasting(stationID: station.id)
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 8) {
-                Image(systemName: radio.isBroadcasting
+                Image(systemName: isLive
                     ? "antenna.radiowaves.left.and.right.circle.fill"
                     : "antenna.radiowaves.left.and.right")
-                    .foregroundStyle(radio.isBroadcasting ? .red : .secondary)
+                    .foregroundStyle(isLive ? .red : .secondary)
                     .frame(width: 16)
                 Text(station.name)
                     .lineLimit(1)
@@ -135,18 +183,18 @@ public struct PlaylistsSidebarView: View {
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.tertiary)
             }
-            // Task 3.2: when broadcasting, surface the stream URL so the
-            // user can aim VLC at it without digging through logs.
-            // Task 3.6: also surface the Cloudflare tunnel URL so the
-            // user can share it with listeners outside the LAN.
-            if radio.isBroadcasting, let url = radio.currentURL {
-                Text("Local: \(url.absoluteString)")
+            // When broadcasting, surface this station's stream URL so the
+            // user can aim VLC at it without digging through logs. Each
+            // station has its own slug-based URL now; the tunnel URL is
+            // shared across all live stations (one cloudflared per port).
+            if isLive, let local = radio.streamURL(for: station) {
+                Text("Local: \(local.absoluteString)")
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
                     .textSelection(.enabled)
                     .padding(.leading, 24)
-                if let pub = tunnel.publicURL {
+                if let pub = publicURL(for: station) {
                     Text("Public: \(pub.absoluteString)")
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(.tertiary)
@@ -169,17 +217,57 @@ public struct PlaylistsSidebarView: View {
         }
     }
 
-    /// Right-click menu on any playlist row. v1 only offers station
-    /// creation; more actions (rescan a single folder, reveal in Finder,
-    /// etc.) can slot in here without affecting selection wiring.
+    /// Right-click menu on any playlist row.
     @ViewBuilder
     private func playlistContextMenu(_ playlist: Playlist) -> some View {
         Button("Create Station from this") {
-            stations.createStation(from: playlist)
-            if let id = stations.activeStation?.id {
-                selection = .station(id)
+            let station = stations.create(from: playlist)
+            selection = .station(station.id)
+        }
+    }
+
+    /// Right-click menu on a station row. Mirrors the toolbar controls so
+    /// a user can manage a station without first selecting it.
+    @ViewBuilder
+    private func stationContextMenu(_ station: Station) -> some View {
+        let isLive = radio.isBroadcasting(stationID: station.id)
+        Button(isLive ? "Stop Broadcast" : "Start Broadcast") {
+            Task {
+                if isLive {
+                    radio.stopBroadcast(stationID: station.id)
+                } else {
+                    await radio.startBroadcast(station: station)
+                }
             }
         }
+        Button("Copy Stream URL") {
+            let url = publicURL(for: station) ?? radio.streamURL(for: station)
+            if let url {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(url.absoluteString, forType: .string)
+            }
+        }
+        .disabled(!isLive)
+        Divider()
+        Button("Rename…") {
+            renameText = station.name
+            renameTarget = station
+        }
+        Button("Delete", role: .destructive) {
+            deleteTarget = station
+        }
+    }
+
+    /// Compose the public per-station URL by splicing the station slug
+    /// onto the tunnel base URL. Returns nil if the tunnel isn't up yet
+    /// or if we couldn't parse its URL.
+    private func publicURL(for station: Station) -> URL? {
+        guard let base = tunnel.publicURL,
+              var components = URLComponents(url: base, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+        components.path = "/stream/\(station.slug).aac"
+        return components.url
     }
 
     private func iconName(for kind: Playlist.Kind, hasChildren: Bool) -> String {
