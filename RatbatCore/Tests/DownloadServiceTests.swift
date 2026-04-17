@@ -40,5 +40,37 @@ final class DownloadServiceTests: XCTestCase {
         XCTAssertTrue(svc.batches.isEmpty)
         XCTAssertEqual(svc.setupState, .unknown)
     }
+
+    @MainActor
+    func testBatchIsActiveUntilFinishedAtSet() {
+        var batch = DownloadService.Batch(
+            id: UUID(),
+            url: URL(string: "https://example.com")!,
+            destination: URL(fileURLWithPath: "/tmp"),
+            jobs: [],
+            startedAt: Date()
+        )
+        XCTAssertTrue(batch.isActive)
+        batch.finishedAt = Date()
+        XCTAssertFalse(batch.isActive)
+    }
+
+    @MainActor
+    func testCompletedCountReflectsDoneJobs() {
+        let jobs: [DownloadService.Job] = [
+            .init(id: UUID(), title: "A", status: .done),
+            .init(id: UUID(), title: "B", status: .downloading),
+            .init(id: UUID(), title: "C", status: .done),
+            .init(id: UUID(), title: "D", status: .failed("x"))
+        ]
+        let batch = DownloadService.Batch(
+            id: UUID(),
+            url: URL(string: "https://example.com")!,
+            destination: URL(fileURLWithPath: "/tmp"),
+            jobs: jobs,
+            startedAt: Date()
+        )
+        XCTAssertEqual(batch.completedCount, 2)
+    }
 }
 #endif

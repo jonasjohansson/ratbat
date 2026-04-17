@@ -35,6 +35,10 @@ public struct PlaylistsSidebarView: View {
     /// tunnel directly to get re-renders when `publicURL` / `mode` /
     /// `error` change mid-session.
     @ObservedObject public var tunnel: CloudflareTunnel
+    /// Drives the "Downloads" section — surfaces in-flight and recently
+    /// finished batches. Passed through from RootView so the sidebar and
+    /// the add-download sheet share one instance.
+    @ObservedObject public var downloadService: DownloadService
     @Binding public var selection: SidebarSelection?
 
     /// Local UI state for the rename dialog. Nil when no dialog is up.
@@ -47,12 +51,14 @@ public struct PlaylistsSidebarView: View {
         vm: LibraryViewModel,
         stations: StationManager,
         radio: RadioBroadcaster,
+        downloadService: DownloadService,
         selection: Binding<SidebarSelection?>
     ) {
         self.vm = vm
         self.stations = stations
         self.radio = radio
         self.tunnel = radio.tunnel
+        self.downloadService = downloadService
         self._selection = selection
     }
 
@@ -67,6 +73,8 @@ public struct PlaylistsSidebarView: View {
                     }
                 }
             }
+
+            DownloadsSidebarSection(downloadService: downloadService)
 
             Section("Library") {
                 ForEach(vm.playlists) { playlist in

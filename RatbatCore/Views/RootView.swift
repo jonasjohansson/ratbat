@@ -58,6 +58,7 @@ public struct RootView: View {
                             vm: libraryVM,
                             stations: stations,
                             radio: radio,
+                            downloadService: downloadService,
                             selection: $sidebarSelection
                         )
                         .frame(minWidth: 180)
@@ -119,6 +120,16 @@ public struct RootView: View {
                         if sidebarSelection == nil, let id = newID {
                             sidebarSelection = .playlist(id)
                         }
+                    }
+                    // Re-scan the library whenever any batch's `finishedAt`
+                    // changes — that fires both when a batch completes
+                    // (nil → Date) and when a new one is appended (its
+                    // `finishedAt` is nil, which still changes the array).
+                    // Re-scanning an already-scanned folder is cheap and
+                    // cache-backed, so we don't need a more precise trigger.
+                    .onChange(of: downloadService.batches.map(\.finishedAt)) { _, _ in
+                        guard let folder = musicFolder else { return }
+                        Task { await libraryVM.load(from: folder) }
                     }
                 } else {
                     FolderPickerView { url in
