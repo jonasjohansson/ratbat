@@ -76,16 +76,39 @@ public final class DownloadService: ObservableObject {
     /// Path to venv's Python interpreter (exists once setup completes).
     private var venvPython: URL { venvRoot.appendingPathComponent("bin/python") }
 
+    /// Public accessor for the venv Python interpreter, for cooperating
+    /// actors (e.g. ``TrackResolver``) that run their own subprocess using
+    /// the same environment. `nil` until ``ensureReady()`` has actually
+    /// built the venv.
+    public var venvPythonURL: URL? {
+        FileManager.default.isExecutableFile(atPath: venvPython.path) ? venvPython : nil
+    }
+
+    /// Public accessor for the bundled NTS `resolve_track.py` script
+    /// (lives alongside `download.py` in the same bundle folder). Returns
+    /// nil if the script can't be located (neither in the app bundle nor
+    /// in the repo fallback).
+    public var ntsResolverScriptURL: URL? {
+        locateBundleScript(named: "resolve_track")
+    }
+
     /// Bundled wrapper script. Looks in app bundle first, then repo during dev.
     private func locateWrapperScript() -> URL? {
-        if let bundled = Bundle.main.url(forResource: "download", withExtension: "py",
+        locateBundleScript(named: "download")
+    }
+
+    /// Shared lookup for any `.py` script that ships in the
+    /// `spotify-downloader-bundle/` resource folder. Used by the download
+    /// wrapper (`download.py`) and the NTS resolver (`resolve_track.py`).
+    private func locateBundleScript(named name: String) -> URL? {
+        if let bundled = Bundle.main.url(forResource: name, withExtension: "py",
                                           subdirectory: "spotify-downloader-bundle") {
             return bundled
         }
         // Dev fallback: walk up from CWD to find the repo
         var cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         for _ in 0..<8 {
-            let candidate = cwd.appendingPathComponent("Vendor/spotify-downloader-bundle/download.py")
+            let candidate = cwd.appendingPathComponent("Vendor/spotify-downloader-bundle/\(name).py")
             if FileManager.default.fileExists(atPath: candidate.path) { return candidate }
             cwd = cwd.deletingLastPathComponent()
         }
@@ -122,11 +145,28 @@ public final class DownloadService: ObservableObject {
         try fm.createDirectory(at: venvRoot.deletingLastPathComponent(),
                                withIntermediateDirectories: true)
 
+        // spotapi requires Python 3.10+ (uses `X | None` union syntax).
+        // macOS ships /usr/bin/python3 as 3.9.x, so we prefer Homebrew's
+        // newer interpreters when available and fall back gracefully.
+        guard let hostPython = Self.locateHostPython() else {
+            let msg = "Python 3.10+ not found. Install via: brew install python@3.13"
+            setupState = .failed(msg)
+            throw SetupError.pythonTooOld
+        }
+
+        // If an existing venv was built against an older Python, scrap it
+        // so we don't silently keep shipping broken imports.
+        if fm.isExecutableFile(atPath: venvPython.path),
+           !Self.venvIsCompatible(venvRoot: venvRoot) {
+            setupState = .installing("Rebuilding Python environment…")
+            try? fm.removeItem(at: venvRoot)
+        }
+
         // Create venv if missing
         if !fm.isExecutableFile(atPath: venvPython.path) {
             setupState = .installing("Creating Python environment…")
             try await runBlocking(
-                executable: URL(fileURLWithPath: "/usr/bin/python3"),
+                executable: hostPython,
                 arguments: ["-m", "venv", venvRoot.path]
             )
         }
@@ -138,12 +178,19 @@ public final class DownloadService: ObservableObject {
             arguments: ["-m", "pip", "install", "--quiet", "--upgrade", "pip"]
         )
 
-        // Install download deps
-        setupState = .installing("Installing downloader dependencies (spotapi, yt-dlp, ytmusicapi)…")
+        // Install download deps. spotapi's top-level `__init__` eagerly
+        // imports modules that pull in session-store adapters (pymongo,
+        // redis, readerwriterlock) and the websockets client — none of
+        // which are declared as hard deps of the `spotapi` wheel. Pin
+        // them explicitly so `from spotapi import ...` actually works.
+        setupState = .installing("Installing downloader dependencies…")
         try await runBlocking(
             executable: venvPython,
             arguments: ["-m", "pip", "install", "--quiet",
-                        "spotapi", "yt-dlp", "ytmusicapi"]
+                        "spotapi", "yt-dlp", "ytmusicapi",
+                        "pymongo", "redis", "readerwriterlock",
+                        "pyotp", "requests", "beautifulsoup4",
+                        "mutagen", "websockets"]
         )
 
         setupState = .ready
@@ -338,6 +385,48 @@ public final class DownloadService: ObservableObject {
         FileManager.default.isExecutableFile(atPath: "/usr/local/bin/ffmpeg")
     }
 
+    /// Find the newest Python 3.10+ interpreter on the system. macOS's
+    /// `/usr/bin/python3` is pinned to 3.9.x which can't parse `X | None`
+    /// union syntax that `spotapi` uses at import time, so we skip it
+    /// unless nothing better exists (and then fail loudly in setup).
+    nonisolated static func locateHostPython() -> URL? {
+        let candidates = [
+            "/opt/homebrew/bin/python3.14",
+            "/opt/homebrew/bin/python3.13",
+            "/opt/homebrew/bin/python3.12",
+            "/opt/homebrew/bin/python3.11",
+            "/opt/homebrew/bin/python3.10",
+            "/opt/homebrew/bin/python3",
+            "/usr/local/bin/python3.14",
+            "/usr/local/bin/python3.13",
+            "/usr/local/bin/python3.12",
+            "/usr/local/bin/python3.11",
+            "/usr/local/bin/python3.10",
+            "/usr/local/bin/python3",
+        ]
+        for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
+            return URL(fileURLWithPath: path)
+        }
+        return nil
+    }
+
+    /// True if the venv's Python is 3.10 or newer. An incompatible venv
+    /// (built against the macOS-shipped 3.9) gets scrapped and rebuilt.
+    nonisolated static func venvIsCompatible(venvRoot: URL) -> Bool {
+        let libDir = venvRoot.appendingPathComponent("lib")
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: libDir.path) else {
+            return false
+        }
+        for name in entries where name.hasPrefix("python") {
+            let version = String(name.dropFirst("python".count))
+            if let major = version.split(separator: ".").first.flatMap({ Int($0) }),
+               let minor = version.split(separator: ".").dropFirst().first.flatMap({ Int($0) }) {
+                return major > 3 || (major == 3 && minor >= 10)
+            }
+        }
+        return false
+    }
+
     private nonisolated func runBlocking(executable: URL, arguments: [String]) async throws {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             let p = Process()
@@ -358,10 +447,12 @@ public final class DownloadService: ObservableObject {
 
     public enum SetupError: Error, LocalizedError {
         case ffmpegMissing
+        case pythonTooOld
         case commandFailed(String, Int32)
         public var errorDescription: String? {
             switch self {
             case .ffmpegMissing: return "ffmpeg not found"
+            case .pythonTooOld: return "Python 3.10+ not found (install: brew install python@3.13)"
             case .commandFailed(let cmd, let code): return "\(cmd) failed with code \(code)"
             }
         }

@@ -25,10 +25,12 @@ final class StationTests: XCTestCase {
         XCTAssertEqual(station.queue.count, 1)
         XCTAssertEqual(station.queue[0].id, track.id)
         XCTAssertEqual(station.name, "Radio based on My Playlist")
-        XCTAssertEqual(
-            station.seed,
-            .playlist(sourceID: playlist.id, sourceName: playlist.name)
-        )
+        // The Kind-based model: the playlist queue IS the kind's payload.
+        if case let .playlist(queue) = station.kind {
+            XCTAssertEqual(queue.count, 1)
+        } else {
+            XCTFail("Expected playlist kind, got \(station.kind)")
+        }
     }
 
     func testStationShufflesQueue() {
@@ -61,27 +63,26 @@ final class StationTests: XCTestCase {
     func testStationSlugIsUrlSafe() {
         let station = Station(
             name: "Radio based on Late Night!",
-            seed: .manual,
-            queue: []
+            kind: .playlist(queue: [])
         )
         XCTAssertEqual(station.slug, "radio-based-on-late-night")
     }
 
     func testStationSlugTransliteratesDiacritics() {
-        let station = Station(name: "Äventyr Mix", seed: .manual, queue: [])
+        let station = Station(name: "Äventyr Mix", kind: .playlist(queue: []))
         XCTAssertEqual(station.slug, "aventyr-mix")
     }
 
     func testStationSlugHandlesEmptyName() {
         // All-emoji / all-punctuation names fall back to a uuid-prefix
         // slug so the route is still valid.
-        let station = Station(name: "🎶🎶", seed: .manual, queue: [])
+        let station = Station(name: "🎶🎶", kind: .playlist(queue: []))
         XCTAssertTrue(station.slug.hasPrefix("station-"))
         XCTAssertEqual(station.slug.count, "station-".count + 8)
     }
 
     func testStationSlugCollapsesMultipleSeparators() {
-        let station = Station(name: "A  ---  B__C", seed: .manual, queue: [])
+        let station = Station(name: "A  ---  B__C", kind: .playlist(queue: []))
         XCTAssertEqual(station.slug, "a-b-c")
     }
 }

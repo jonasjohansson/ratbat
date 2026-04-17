@@ -31,7 +31,7 @@ final class RadioBroadcasterTests: XCTestCase {
     @MainActor
     func testStartWithEmptyQueueSurfacesError() async {
         let radio = RadioBroadcaster()
-        let empty = Station(name: "Empty", seed: .manual, queue: [])
+        let empty = Station(name: "Empty", kind: .playlist(queue: []))
         await radio.startBroadcast(station: empty)
         XCTAssertFalse(radio.isBroadcasting(stationID: empty.id))
         XCTAssertNotNil(radio.error)
@@ -40,7 +40,7 @@ final class RadioBroadcasterTests: XCTestCase {
     @MainActor
     func testStreamURLIsNilWhenStationNotBroadcasting() async {
         let radio = RadioBroadcaster()
-        let station = Station(name: "Idle", seed: .manual, queue: [])
+        let station = Station(name: "Idle", kind: .playlist(queue: []))
         XCTAssertNil(radio.streamURL(for: station))
     }
 
@@ -117,8 +117,8 @@ final class RadioBroadcasterTests: XCTestCase {
         let radio = RadioBroadcaster(port: port)
         defer { radio.stopAll() }
 
-        let a = Station(name: "Alpha FM", seed: .manual, queue: tracks)
-        let b = Station(name: "Beta FM", seed: .manual, queue: tracks)
+        let a = Station(name: "Alpha FM", kind: .playlist(queue: tracks))
+        let b = Station(name: "Beta FM", kind: .playlist(queue: tracks))
 
         await radio.startBroadcast(station: a)
         await radio.startBroadcast(station: b)
@@ -151,7 +151,7 @@ final class RadioBroadcasterTests: XCTestCase {
         let radio = RadioBroadcaster(port: port)
         defer { radio.stopAll() }
 
-        let station = Station(name: "My FM Station", seed: .manual, queue: tracks)
+        let station = Station(name: "My FM Station", kind: .playlist(queue: tracks))
         await radio.startBroadcast(station: station)
 
         let url = try XCTUnwrap(radio.streamURL(for: station))
@@ -171,7 +171,7 @@ final class RadioBroadcasterTests: XCTestCase {
 
         let port: UInt16 = 18_017
         let radio = RadioBroadcaster(port: port)
-        let station = Station(name: "Smoke", seed: .manual, queue: tracks)
+        let station = Station(name: "Smoke", kind: .playlist(queue: tracks))
         await radio.startBroadcast(station: station)
         defer { radio.stopAll() }
 
@@ -212,7 +212,7 @@ final class RadioBroadcasterTests: XCTestCase {
 
         let port: UInt16 = 18_022
         let radio = RadioBroadcaster(port: port)
-        let station = Station(name: "Legacy Test", seed: .manual, queue: tracks)
+        let station = Station(name: "Legacy Test", kind: .playlist(queue: tracks))
         await radio.startBroadcast(station: station)
         defer { radio.stopAll() }
 
@@ -257,7 +257,7 @@ final class RadioBroadcasterTests: XCTestCase {
         // slug, which exercises the same 404 branch.
         let port: UInt16 = 18_023
         let radio = RadioBroadcaster(port: port)
-        let filler = Station(name: "Filler Station", seed: .manual, queue: tracks)
+        let filler = Station(name: "Filler Station", kind: .playlist(queue: tracks))
         await radio.startBroadcast(station: filler)
         defer { radio.stopAll() }
 
@@ -284,7 +284,7 @@ final class RadioBroadcasterTests: XCTestCase {
 
         let port: UInt16 = 18_018
         let radio = RadioBroadcaster(port: port)
-        let station = Station(name: "ICY Test", seed: .manual, queue: tracks)
+        let station = Station(name: "ICY Test", kind: .playlist(queue: tracks))
         await radio.startBroadcast(station: station)
         defer { radio.stopAll() }
 
@@ -319,7 +319,7 @@ final class RadioBroadcasterTests: XCTestCase {
 
         let port: UInt16 = 18_019
         let radio = RadioBroadcaster(port: port)
-        let station = Station(name: "NoICY", seed: .manual, queue: tracks)
+        let station = Station(name: "NoICY", kind: .playlist(queue: tracks))
         await radio.startBroadcast(station: station)
         defer { radio.stopAll() }
 
@@ -499,7 +499,7 @@ final class RadioBroadcasterTests: XCTestCase {
         let port: UInt16 = 18_024
         let radio = RadioBroadcaster(port: port)
         // Need a live station so the listener is actually up.
-        let station = Station(name: "Root Test", seed: .manual, queue: tracks)
+        let station = Station(name: "Root Test", kind: .playlist(queue: tracks))
         await radio.startBroadcast(station: station)
         defer { radio.stopAll() }
 
@@ -530,7 +530,7 @@ final class RadioBroadcasterTests: XCTestCase {
 
         let port: UInt16 = 18_025
         let radio = RadioBroadcaster(port: port)
-        let station = Station(name: "Now JSON", seed: .manual, queue: tracks)
+        let station = Station(name: "Now JSON", kind: .playlist(queue: tracks))
         await radio.startBroadcast(station: station)
         defer { radio.stopAll() }
 
@@ -598,8 +598,8 @@ final class RadioBroadcasterTests: XCTestCase {
 
         let port: UInt16 = 18_026
         let radio = RadioBroadcaster(port: port)
-        let a = Station(name: "Alpha JSON", seed: .manual, queue: tracks)
-        let b = Station(name: "Beta JSON", seed: .manual, queue: tracks)
+        let a = Station(name: "Alpha JSON", kind: .playlist(queue: tracks))
+        let b = Station(name: "Beta JSON", kind: .playlist(queue: tracks))
         await radio.startBroadcast(station: a)
         await radio.startBroadcast(station: b)
         defer { radio.stopAll() }

@@ -1,52 +1,83 @@
 import Foundation
 
-/// A radio station — a shuffled pool of tracks that can be broadcast.
+/// A radio station the broadcaster can serve.
 ///
-/// v1 is UI + data-model only. A station is created from a source (currently
-/// only a ``Playlist``) and carries its pre-shuffled queue so the detail
-/// pane can render a stable order without reshuffling on every redraw.
-/// Audio capture / streaming lands in Tasks 3.2–3.4 — this type deliberately
-/// has no playback concept yet.
+/// Two concrete kinds ship today:
+/// - ``Kind/playlist(queue:)`` — a pre-shuffled queue derived from a
+///   user's library ``Playlist``.
+/// - ``Kind/nts(config:)`` — a generative, NTS-backed station driven by
+///   an ``NTSStationConfig`` (tags + optional year range).
 ///
-/// `Sendable` + `Hashable` + `Identifiable` + `Codable` matches ``Playlist``
-/// and ``Track``, so stations compose cleanly with the existing library
-/// types (selection tags, cache, cross-actor passing) as Phase 3 grows.
+/// The `Kind` enum is the source-of-truth for where tracks come from;
+/// the old `seed: Seed` marker field has been retired. Convenience
+/// accessors (``queue``, ``ntsConfig``) let existing call sites that
+/// only care about one variant keep working.
+///
+/// `Sendable` + `Hashable` + `Identifiable` + `Codable` so stations
+/// compose with the rest of the library types (selection tags, cache,
+/// cross-actor passing, on-disk persistence through ``StationStore``).
 public struct Station: Identifiable, Hashable, Sendable, Codable {
     public let id: UUID
     public var name: String
-    public var seed: Seed
-    /// Pre-shuffled order. Built once at creation time so the detail pane
-    /// stays stable across renders — reshuffling on each access would make
-    /// row selection jump around.
-    public var queue: [Track]
+    public var kind: Kind
 
-    /// Where a station's tracks came from. Kept as a sum type so future
-    /// seeds (a folder, a manually assembled set, a smart rule) slot in
-    /// without breaking existing stations on disk.
-    public enum Seed: Hashable, Sendable, Codable {
-        case playlist(sourceID: UUID, sourceName: String)
-        case folder(path: URL)
-        case manual
+    /// Source-of-truth for where this station's tracks come from.
+    /// Swift auto-synthesises Codable for enums with associated values
+    /// as long as every associated payload is Codable — both
+    /// ``playlist(queue:)`` and ``nts(config:)`` satisfy that.
+    public enum Kind: Hashable, Sendable, Codable {
+        /// Fixed, pre-shuffled queue. Replays the same tracks on every
+        /// start — matches the pre-refactor behaviour.
+        case playlist(queue: [Track])
+        /// Generative NTS-backed station. Controller state (pool, history
+        /// dedup, resolver) is reconstructed on each broadcast start from
+        /// the config; the config itself is the persisted seed.
+        case nts(config: NTSStationConfig)
     }
 
-    public init(id: UUID = UUID(), name: String, seed: Seed, queue: [Track]) {
+    public init(id: UUID = UUID(), name: String, kind: Kind) {
         self.id = id
         self.name = name
-        self.seed = seed
-        self.queue = queue
+        self.kind = kind
     }
+
+    // MARK: - Convenience accessors
+
+    /// Playlist queue, or `[]` for NTS stations. Lets existing code that
+    /// only knows how to think in "tracks" (the sidebar row's track count,
+    /// the detail pane's transient playlist view) keep compiling.
+    public var queue: [Track] {
+        if case let .playlist(q) = kind { return q }
+        return []
+    }
+
+    /// NTS config, or `nil` for playlist stations. Mirrors ``queue`` for
+    /// the other variant.
+    public var ntsConfig: NTSStationConfig? {
+        if case let .nts(c) = kind { return c }
+        return nil
+    }
+
+    // MARK: - Factories
 
     /// Build a station seeded from a playlist. Auto-names as
     /// "Radio based on {playlist name}" so the sidebar immediately reads
     /// as what the user just did.
     public static func from(playlist: Playlist) -> Station {
-        let shuffled = playlist.tracks.shuffled()
-        return Station(
+        Station(
             name: "Radio based on \(playlist.name)",
-            seed: .playlist(sourceID: playlist.id, sourceName: playlist.name),
-            queue: shuffled
+            kind: .playlist(queue: playlist.tracks.shuffled())
         )
     }
+
+    /// Build a station from an ``NTSStationConfig``. Reuses the config's
+    /// `id` as the station id so ``HistoryStore`` dedup keys stay stable
+    /// across broadcaster restarts.
+    public static func fromNTS(_ config: NTSStationConfig) -> Station {
+        Station(id: config.id, name: config.name, kind: .nts(config: config))
+    }
+
+    // MARK: - Slug
 
     /// URL-safe kebab-case identifier derived from ``name``. Used to route
     /// per-station stream URLs (`http://host:port/stream/{slug}.aac`) so

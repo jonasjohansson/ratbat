@@ -1,4 +1,3 @@
-#if os(macOS)
 import Foundation
 
 /// Blueprint for a generative NTS-backed station.
@@ -37,4 +36,3 @@ public struct NTSStationConfig: Identifiable, Hashable, Sendable, Codable {
         self.shufflePool = shufflePool
     }
 }
-#endif

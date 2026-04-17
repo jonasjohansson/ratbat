@@ -79,6 +79,15 @@ public final class RadioBroadcaster: ObservableObject {
         category: "broadcaster"
     )
 
+    #if os(macOS)
+    /// Optional NTS-stack dependencies. `nil` in test / minimal-init
+    /// configurations; an attempt to broadcast an NTS station without
+    /// these wired up logs an error and bails instead of crashing.
+    private let downloadService: DownloadService?
+    private let nts: NTSClient?
+    private let history: HistoryStore?
+    #endif
+
     // MARK: - Internals
 
     /// Per-station encode/serve state. Non-Sendable because it's always
@@ -113,25 +122,51 @@ public final class RadioBroadcaster: ObservableObject {
     /// Construct a broadcaster bound to a specific port. Primarily for
     /// tests that need deterministic ports without trampling the
     /// user-facing preferences — production callers should prefer
-    /// ``init(preferences:)``.
+    /// ``init(preferences:downloadService:nts:history:)``.
     public init(port: UInt16 = 18000) {
         // Force-unwrap: NWEndpoint.Port(rawValue:) only returns nil for 0.
         self.port = NWEndpoint.Port(rawValue: port) ?? .any
         self.preferences = BroadcastPreferences.shared
+        #if os(macOS)
+        self.downloadService = nil
+        self.nts = nil
+        self.history = nil
+        #endif
         subscribeToPreferences()
     }
 
-    /// Construct a broadcaster backed by a user preferences store. The
-    /// broadcaster snapshots `prefs.port` at init time — live port changes
-    /// require stopAll + re-init (flagged via ``needsRestart``). Quality
-    /// and sample-rate changes also flag a restart but can be picked up on
-    /// the next startBroadcast without recreating the broadcaster.
+    #if os(macOS)
+    /// Construct a broadcaster backed by a user preferences store and the
+    /// shared NTS stack dependencies (optional so existing tests can skip
+    /// them). The broadcaster snapshots `prefs.port` at init time — live
+    /// port changes require stopAll + re-init (flagged via
+    /// ``needsRestart``). Quality and sample-rate changes also flag a
+    /// restart but can be picked up on the next startBroadcast without
+    /// recreating the broadcaster.
+    public init(
+        preferences: BroadcastPreferences,
+        downloadService: DownloadService? = nil,
+        nts: NTSClient? = nil,
+        history: HistoryStore? = nil
+    ) {
+        self.preferences = preferences
+        let raw = UInt16(clamping: preferences.port)
+        self.port = NWEndpoint.Port(rawValue: raw) ?? .any
+        self.downloadService = downloadService
+        self.nts = nts
+        self.history = history
+        subscribeToPreferences()
+    }
+    #else
+    /// iOS flavour keeps the tighter surface area — no NTS / tunnel / venv
+    /// wiring on that platform today.
     public init(preferences: BroadcastPreferences) {
         self.preferences = preferences
         let raw = UInt16(clamping: preferences.port)
         self.port = NWEndpoint.Port(rawValue: raw) ?? .any
         subscribeToPreferences()
     }
+    #endif
 
     /// Wire up the "prefs changed → needsRestart while broadcasting" loop.
     /// ``BroadcastPreferences.revision`` ticks whenever any tracked value
@@ -150,21 +185,92 @@ public final class RadioBroadcaster: ObservableObject {
 
     // MARK: - Public API
 
-    /// Convenience entry point. Wraps the station's fixed ``Station/queue``
-    /// in a ``PlaylistSource`` and defers to ``startBroadcast(station:source:)``.
-    /// Preserves the pre-TrackSource-refactor behaviour so existing call
-    /// sites keep working unchanged.
+    /// Convenience entry point. Branches on the station's ``Station/Kind``:
+    /// playlist stations wrap their fixed queue in a ``PlaylistSource``;
+    /// NTS stations spin up an ``NTSStationController`` backed by the
+    /// broadcaster's injected NTS dependencies.
     public func startBroadcast(station: Station) async {
         // Match pre-refactor ordering: skip silently if already live, then
-        // surface the empty-queue error before spinning up a source.
+        // surface any variant-specific validation before spinning up a source.
         guard !broadcasting.contains(station.id) else { return }
-        guard !station.queue.isEmpty else {
-            error = "Cannot broadcast an empty queue"
-            return
+
+        switch station.kind {
+        case .playlist(let queue):
+            guard !queue.isEmpty else {
+                error = "Cannot broadcast an empty queue"
+                return
+            }
+            let source = PlaylistSource(tracks: queue)
+            await startBroadcast(station: station, source: source)
+
+        case .nts(let config):
+            #if os(macOS)
+            guard let source = await makeNTSSource(config: config) else {
+                return
+            }
+            await startBroadcast(station: station, source: source)
+            #else
+            error = "NTS stations are macOS-only"
+            #endif
         }
-        let source = PlaylistSource(tracks: station.queue)
-        await startBroadcast(station: station, source: source)
     }
+
+    #if os(macOS)
+    /// Resolve an ``NTSStationController`` + ``NTSSource`` from the injected
+    /// dependencies. Returns nil and surfaces an error if the broadcaster
+    /// wasn't constructed with an NTS stack, or if the Python venv fails
+    /// to bootstrap. First-call cost is high (venv install); subsequent
+    /// calls are cheap because ``DownloadService/ensureReady()`` is a no-op
+    /// once the venv is built.
+    private func makeNTSSource(config: NTSStationConfig) async -> NTSSource? {
+        guard let downloadService, let nts, let history else {
+            let msg = "NTS station requires broadcaster NTS dependencies (downloadService/nts/history) — none injected"
+            error = msg
+            logger.error("\(msg, privacy: .public)")
+            return nil
+        }
+
+        // Ensure the shared Python venv is ready. Cheap when already
+        // installed; otherwise this may take 10-30s on first run.
+        do {
+            try await downloadService.ensureReady()
+        } catch {
+            let msg = "NTS station setup failed: \(error.localizedDescription)"
+            self.error = msg
+            logger.error("\(msg, privacy: .public)")
+            return nil
+        }
+
+        guard let venvPython = downloadService.venvPythonURL,
+              let resolverScript = downloadService.ntsResolverScriptURL else {
+            let msg = "NTS station: venv python or resolver script path unavailable"
+            error = msg
+            logger.error("\(msg, privacy: .public)")
+            return nil
+        }
+
+        let resolver: TrackResolver
+        do {
+            resolver = try TrackResolver(
+                venvPython: venvPython,
+                wrapperScript: resolverScript
+            )
+        } catch {
+            let msg = "NTS station: resolver init failed: \(error.localizedDescription)"
+            self.error = msg
+            logger.error("\(msg, privacy: .public)")
+            return nil
+        }
+
+        let controller = NTSStationController(
+            config: config,
+            nts: nts,
+            history: history,
+            resolver: resolver
+        )
+        return NTSSource(controller: controller)
+    }
+    #endif
 
     /// Start broadcasting `station`, pulling successive tracks from an
     /// arbitrary ``TrackSource``. Spins up the encode loop and (if not

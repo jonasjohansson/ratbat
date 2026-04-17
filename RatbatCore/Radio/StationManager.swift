@@ -98,6 +98,21 @@ public final class StationManager: ObservableObject {
         persist()
     }
 
+    /// Create a new NTS-backed station from a config and persist immediately.
+    /// Collision-safe on `name`: the NTS creation UI doesn't build its name
+    /// from a sibling object (the way ``create(from:)`` leans on playlist
+    /// names), so a bare `(2)`-style suffix is appended if the user picks a
+    /// name that's already taken.
+    @discardableResult
+    public func createNTS(_ config: NTSStationConfig) -> Station {
+        var cfg = config
+        cfg.name = uniquifyName(cfg.name)
+        let station = Station.fromNTS(cfg)
+        stations.append(station)
+        persist()
+        return station
+    }
+
     /// Find a station whose ``Station/slug`` matches `slug`. Used by the
     /// HTTP router to map an incoming `/stream/{slug}.aac` request to a
     /// specific station's broadcast pipeline.
@@ -124,8 +139,9 @@ public final class StationManager: ObservableObject {
 
     private func slugIsTaken(for name: String, ignoring: Station.ID?) -> Bool {
         // Build a throwaway station just to compute the candidate slug —
-        // cheaper than duplicating the slug algorithm here.
-        let probe = Station(id: UUID(), name: name, seed: .manual, queue: [])
+        // cheaper than duplicating the slug algorithm here. Kind doesn't
+        // affect the slug derivation; an empty playlist queue is fine.
+        let probe = Station(id: UUID(), name: name, kind: .playlist(queue: []))
         let candidate = probe.slug
         return stations.contains { station in
             if station.id == ignoring { return false }

@@ -36,8 +36,7 @@ final class StationStoreTests: XCTestCase {
         )
         let station = Station(
             name: "Radio based on Jazz",
-            seed: .playlist(sourceID: UUID(), sourceName: "Jazz"),
-            queue: [track]
+            kind: .playlist(queue: [track])
         )
 
         try StationStore.save([station], to: tempRoot)

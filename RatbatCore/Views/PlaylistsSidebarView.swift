@@ -179,17 +179,21 @@ public struct PlaylistsSidebarView: View {
         let isLive = radio.isBroadcasting(stationID: station.id)
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 8) {
-                Image(systemName: isLive
-                    ? "antenna.radiowaves.left.and.right.circle.fill"
-                    : "antenna.radiowaves.left.and.right")
+                Image(systemName: iconName(for: station, isLive: isLive))
                     .foregroundStyle(isLive ? .red : .secondary)
                     .frame(width: 16)
                 Text(station.name)
                     .lineLimit(1)
                 Spacer(minLength: 4)
-                Text("\(station.queue.count)")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.tertiary)
+                // NTS stations have an unbounded generative pool — showing
+                // a track count there would be misleading (the queue is
+                // always empty until a track resolves). Playlist stations
+                // keep the familiar per-row count.
+                if case .playlist = station.kind {
+                    Text("\(station.queue.count)")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                }
             }
             // Live current-track surface so the sidebar tells you what's
             // actually going out on the wire right now — without having to
@@ -298,6 +302,20 @@ public struct PlaylistsSidebarView: View {
         case .allSongs:    return "music.note.list"
         case .looseTracks: return "music.note"
         case .folder:      return hasChildren ? "folder" : "music.note.list"
+        }
+    }
+
+    /// Per-station icon. Playlist stations keep the antenna (matches the
+    /// pre-refactor look); NTS stations get the waveform so the sidebar
+    /// visually distinguishes "fixed queue" from "generative feed".
+    private func iconName(for station: Station, isLive: Bool) -> String {
+        switch station.kind {
+        case .playlist:
+            return isLive
+                ? "antenna.radiowaves.left.and.right.circle.fill"
+                : "antenna.radiowaves.left.and.right"
+        case .nts:
+            return isLive ? "waveform.circle.fill" : "waveform.circle"
         }
     }
 }

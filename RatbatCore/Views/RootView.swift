@@ -33,10 +33,11 @@ public struct RootView: View {
     @StateObject private var libraryVM = LibraryViewModel()
     @StateObject private var stations = StationManager()
     @StateObject private var preferences = BroadcastPreferences.shared
-    @StateObject private var radio = RadioBroadcaster(preferences: .shared)
-    @StateObject private var downloadService = DownloadService()
+    @StateObject private var downloadService: DownloadService
+    @StateObject private var radio: RadioBroadcaster
     @State private var sidebarSelection: SidebarSelection?
     @State private var showingAddDownload: Bool = false
+    @State private var showingAddNTSStation: Bool = false
     /// Owned by the view so it lives as long as the window does. Held as
     /// optional `@State` because we can't `@StateObject` a non-
     /// `ObservableObject`, and we want to construct it *after* `player`
@@ -47,6 +48,20 @@ public struct RootView: View {
     public init(config: LibraryConfig = LibraryConfig()) {
         self.config = config
         self._musicFolder = State(initialValue: config.musicFolder)
+
+        // Wire up the broadcaster with the NTS stack dependencies so
+        // NTS-backed stations can actually resolve + cache tracks. The
+        // download service is shared between the broadcaster and the
+        // sidebar's Downloads section — one venv, one state publisher.
+        let ds = DownloadService()
+        let broadcaster = RadioBroadcaster(
+            preferences: .shared,
+            downloadService: ds,
+            nts: NTSClient(),
+            history: try? HistoryStore()
+        )
+        self._downloadService = StateObject(wrappedValue: ds)
+        self._radio = StateObject(wrappedValue: broadcaster)
     }
 
     public var body: some View {
@@ -80,6 +95,9 @@ public struct RootView: View {
                             addDownloadButton
                         }
                         ToolbarItem(placement: .primaryAction) {
+                            newStationMenu
+                        }
+                        ToolbarItem(placement: .primaryAction) {
                             qualityMenu
                         }
                         ToolbarItem(placement: .primaryAction) {
@@ -96,6 +114,9 @@ public struct RootView: View {
                                 libraryFolder: folder
                             )
                         }
+                    }
+                    .sheet(isPresented: $showingAddNTSStation) {
+                        AddNTSStationView(stations: stations)
                     }
                     .task(id: folder) {
                         // Point the station manager at the new folder
@@ -193,6 +214,20 @@ public struct RootView: View {
         .keyboardShortcut("d", modifiers: [.command, .shift])
         .help("Download from Spotify (⇧⌘D)")
         .disabled(musicFolder == nil)
+    }
+
+    /// Toolbar menu for creating new stations. Currently surfaces only the
+    /// NTS-backed flow — playlist stations are created via the sidebar's
+    /// right-click "Create Station from this" on any playlist row.
+    @ViewBuilder private var newStationMenu: some View {
+        Menu {
+            Button("New NTS Station…") {
+                showingAddNTSStation = true
+            }
+        } label: {
+            Image(systemName: "plus.circle.dashed")
+        }
+        .help("Create a new station")
     }
 
     /// Toolbar Picker surfacing the broadcast quality in the main window
