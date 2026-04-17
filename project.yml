@@ -39,9 +39,6 @@ targets:
       - path: Vendor/cloudflared/cloudflared
         type: file
         buildPhase: resources
-      - path: web
-        type: folder
-        buildPhase: resources
     dependencies:
       - target: RatbatCore_macOS
         link: true
@@ -94,9 +91,6 @@ targets:
         excludes:
           - Fixtures
       - path: RatbatCore/Tests/Fixtures
-        type: folder
-        buildPhase: resources
-      - path: web
         type: folder
         buildPhase: resources
     dependencies:

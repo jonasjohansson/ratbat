@@ -483,260 +483,40 @@ final class RadioBroadcasterTests: XCTestCase {
         }
     }
 
-    // MARK: - Status page / now.json
+    // MARK: - now.json + root routing
 
-    /// `GET /` serves the bundled `web/index.html`. We assert structural
-    /// markers rather than byte-exact content so future markup edits
-    /// don't break the test — the HTML lives in its own file now
-    /// (Task 3.7b) and may evolve independently of the Swift server.
-    /// Task 3.7c turns the page into a full HTML5 player + PWA, so the
-    /// asserted markers now reference the player UI and manifest.
+    /// The HTML player used to be served from `GET /`. After the
+    /// architecture split it lives on GitHub Pages at ratbat.jonasjohansson.se,
+    /// so this server should only speak the stream + JSON API. Root
+    /// requests now return 404 — any other non-allow-listed path behaves
+    /// the same way, exercised here via `/`, `/index.html` and `/style.css`.
     @MainActor
-    func testRootPathServesHTML() async throws {
+    func testRootAndStaticAssetPathsReturnNotFound() async throws {
         guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
             throw XCTSkip("Fixtures missing")
         }
 
         let port: UInt16 = 18_024
         let radio = RadioBroadcaster(port: port)
-        // We need a running listener — start a station so the server
-        // is actually listening, then hit `/`.
-        let station = Station(name: "Status Test", seed: .manual, queue: tracks)
+        // Need a live station so the listener is actually up.
+        let station = Station(name: "Root Test", seed: .manual, queue: tracks)
         await radio.startBroadcast(station: station)
         defer { radio.stopAll() }
 
         try await Task.sleep(nanoseconds: 400_000_000)
 
-        let response = try await Self.fetchRawResponse(
-            port: port,
-            path: "/",
-            requestHeaders: [],
-            maxBytes: 16_384
-        )
-        XCTAssertTrue(
-            response.contains("HTTP/1.1 200"),
-            "Expected 200 for /, got: \(response.prefix(200))"
-        )
-        XCTAssertTrue(
-            response.lowercased().contains("content-type: text/html"),
-            "Missing text/html Content-Type: \(response.prefix(400))"
-        )
-        XCTAssertTrue(
-            response.contains("Ratbat"),
-            "Body missing Ratbat marker"
-        )
-        // Structural markers from the new player page. The body should
-        // link the PWA manifest, embed an <audio> element for the
-        // streaming player, and reference the station list container.
-        XCTAssertTrue(
-            response.contains("<html"),
-            "Body missing <html> tag"
-        )
-        XCTAssertTrue(
-            response.contains("id=\"station-list\""),
-            "Body missing #station-list container"
-        )
-        XCTAssertTrue(
-            response.contains("<audio"),
-            "Body missing <audio> element"
-        )
-        XCTAssertTrue(
-            response.contains("/manifest.json"),
-            "Body missing PWA manifest link"
-        )
-        XCTAssertTrue(
-            response.contains("/style.css"),
-            "Body missing external stylesheet link"
-        )
-        XCTAssertTrue(
-            response.contains("/app.js"),
-            "Body missing external script link"
-        )
-    }
-
-    /// `GET /style.css` serves the bundled stylesheet with the right
-    /// MIME type. Checks the body contains one of our CSS selectors to
-    /// confirm we got the real file and not an error page.
-    @MainActor
-    func testStylesheetIsServed() async throws {
-        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
-            throw XCTSkip("Fixtures missing")
+        for path in ["/", "/index.html", "/style.css", "/app.js", "/manifest.json", "/favicon.png"] {
+            let response = try await Self.fetchRawResponse(
+                port: port,
+                path: path,
+                requestHeaders: [],
+                maxBytes: 2_048
+            )
+            XCTAssertTrue(
+                response.contains("HTTP/1.1 404"),
+                "Expected 404 for \(path), got: \(response.prefix(200))"
+            )
         }
-
-        let port: UInt16 = 18_027
-        let radio = RadioBroadcaster(port: port)
-        let station = Station(name: "CSS Test", seed: .manual, queue: tracks)
-        await radio.startBroadcast(station: station)
-        defer { radio.stopAll() }
-
-        try await Task.sleep(nanoseconds: 400_000_000)
-
-        let response = try await Self.fetchRawResponse(
-            port: port,
-            path: "/style.css",
-            requestHeaders: [],
-            maxBytes: 8_192
-        )
-        XCTAssertTrue(
-            response.contains("HTTP/1.1 200"),
-            "Expected 200 for /style.css, got: \(response.prefix(200))"
-        )
-        XCTAssertTrue(
-            response.lowercased().contains("content-type: text/css"),
-            "Missing text/css Content-Type: \(response.prefix(400))"
-        )
-        XCTAssertTrue(
-            response.contains(".station"),
-            "Body missing .station selector — probably not the real CSS"
-        )
-    }
-
-    /// `GET /app.js` serves the bundled JS with the right MIME type.
-    @MainActor
-    func testJavascriptIsServed() async throws {
-        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
-            throw XCTSkip("Fixtures missing")
-        }
-
-        let port: UInt16 = 18_028
-        let radio = RadioBroadcaster(port: port)
-        let station = Station(name: "JS Test", seed: .manual, queue: tracks)
-        await radio.startBroadcast(station: station)
-        defer { radio.stopAll() }
-
-        try await Task.sleep(nanoseconds: 400_000_000)
-
-        let response = try await Self.fetchRawResponse(
-            port: port,
-            path: "/app.js",
-            requestHeaders: [],
-            maxBytes: 8_192
-        )
-        XCTAssertTrue(
-            response.contains("HTTP/1.1 200"),
-            "Expected 200 for /app.js, got: \(response.prefix(200))"
-        )
-        XCTAssertTrue(
-            response.lowercased().contains("content-type: application/javascript"),
-            "Missing application/javascript Content-Type: \(response.prefix(400))"
-        )
-        XCTAssertTrue(
-            response.contains("refresh"),
-            "Body missing 'refresh' — probably not the real JS"
-        )
-    }
-
-    /// `GET /manifest.json` serves the PWA manifest with JSON MIME type
-    /// and the shape needed for "Add to Home Screen" on iOS/Mac.
-    @MainActor
-    func testManifestServed() async throws {
-        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
-            throw XCTSkip("Fixtures missing")
-        }
-
-        let port: UInt16 = 18_030
-        let radio = RadioBroadcaster(port: port)
-        let station = Station(name: "Manifest Test", seed: .manual, queue: tracks)
-        await radio.startBroadcast(station: station)
-        defer { radio.stopAll() }
-
-        try await Task.sleep(nanoseconds: 400_000_000)
-
-        let (data, response) = try await Self.fetchPayload(
-            port: port,
-            path: "/manifest.json"
-        )
-        guard let http = response as? HTTPURLResponse else {
-            XCTFail("Not HTTP response")
-            return
-        }
-        XCTAssertEqual(http.statusCode, 200)
-        XCTAssertEqual(
-            (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased(),
-            "application/json"
-        )
-
-        struct Manifest: Decodable {
-            let name: String
-            let short_name: String
-            let start_url: String
-            let display: String
-        }
-        let decoded = try JSONDecoder().decode(Manifest.self, from: data)
-        XCTAssertEqual(decoded.name, "Ratbat")
-        XCTAssertEqual(decoded.display, "standalone")
-        XCTAssertEqual(decoded.start_url, "/")
-    }
-
-    /// `GET /favicon.png` serves the 64px placeholder icon with a PNG
-    /// MIME type. If the icon isn't in the bundle (e.g. ImageMagick
-    /// wasn't available at generation time), the test is skipped rather
-    /// than failed — the rest of the PWA works without it.
-    @MainActor
-    func testFavIconServed() async throws {
-        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
-            throw XCTSkip("Fixtures missing")
-        }
-
-        // Skip cleanly when the icon isn't present in the bundle — e.g.
-        // on a dev machine without ImageMagick where the committed PNGs
-        // might have been regenerated at a different size.
-        guard StatusPage.asset("favicon.png") != nil else {
-            throw XCTSkip("favicon.png not bundled; skipping")
-        }
-
-        let port: UInt16 = 18_031
-        let radio = RadioBroadcaster(port: port)
-        let station = Station(name: "Favicon Test", seed: .manual, queue: tracks)
-        await radio.startBroadcast(station: station)
-        defer { radio.stopAll() }
-
-        try await Task.sleep(nanoseconds: 400_000_000)
-
-        let (data, response) = try await Self.fetchPayload(
-            port: port,
-            path: "/favicon.png"
-        )
-        guard let http = response as? HTTPURLResponse else {
-            XCTFail("Not HTTP response")
-            return
-        }
-        XCTAssertEqual(http.statusCode, 200)
-        XCTAssertEqual(
-            (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased(),
-            "image/png"
-        )
-        // PNG magic number: first 8 bytes are 89 50 4E 47 0D 0A 1A 0A.
-        XCTAssertGreaterThan(data.count, 8)
-        XCTAssertEqual(Array(data.prefix(4)), [0x89, 0x50, 0x4E, 0x47])
-    }
-
-    /// Paths outside the allow-list return 404. We don't want to expose
-    /// arbitrary bundle contents via path traversal or probing.
-    @MainActor
-    func testMissingAssetReturns404() async throws {
-        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
-            throw XCTSkip("Fixtures missing")
-        }
-
-        let port: UInt16 = 18_029
-        let radio = RadioBroadcaster(port: port)
-        let station = Station(name: "404 Test", seed: .manual, queue: tracks)
-        await radio.startBroadcast(station: station)
-        defer { radio.stopAll() }
-
-        try await Task.sleep(nanoseconds: 400_000_000)
-
-        let response = try await Self.fetchRawResponse(
-            port: port,
-            path: "/does-not-exist.png",
-            requestHeaders: [],
-            maxBytes: 2_048
-        )
-        XCTAssertTrue(
-            response.contains("HTTP/1.1 404"),
-            "Expected 404 for unknown asset, got: \(response.prefix(200))"
-        )
     }
 
     /// `GET /now.json` returns a JSON payload with one entry per

@@ -15,6 +15,8 @@ import OSLog
 /// ```
 /// GET /stream/{slug}.aac   → that station's pipeline
 /// GET /stream.aac          → legacy, 302-redirects to first live station
+/// GET /now.json            → JSON snapshot of live stations
+/// everything else          → 404
 /// ```
 ///
 /// A single shared ``NWListener`` parses the request line, extracts the
@@ -22,6 +24,12 @@ import OSLog
 /// Cloudflare tunnel is still global (one port, one forwarder) because
 /// cloudflared forwards the whole TCP port — station-awareness lives
 /// entirely in our HTTP layer.
+///
+/// The HTML/CSS/JS web player used to live here too (served from `GET /`
+/// plus static asset paths). As of the architecture split it's moved to
+/// the standalone `jonasjohansson/ratbat.fm` repo, hosted on GitHub Pages
+/// at ratbat.jonasjohansson.se. This server exposes only the stream + JSON
+/// API at radio.jonasjohansson.se.
 ///
 /// Runs on the main actor so published UI state is safe for SwiftUI to
 /// observe. The encode + serve loops offload CPU to detached tasks and
@@ -363,33 +371,6 @@ public final class RadioBroadcaster: ObservableObject {
             let path = Self.requestPath(from: headerBytes) ?? "/stream.aac"
             let wantsMetadata = Self.headerRequestsICYMetadata(headerBytes)
 
-            // Public status page + static assets. The HTML/CSS/JS live
-            // as real files in the bundled `web/` folder; the server
-            // just maps path → filename and streams the bytes back.
-            // `/` aliases to `/index.html`. Unknown static paths 404.
-            if let assetName = Self.webAssetFilename(for: path) {
-                if let data = StatusPage.asset(assetName) {
-                    _ = await Self.send(
-                        data: Self.buildHTTPResponse(
-                            status: 200,
-                            headers: [
-                                "Content-Type": StatusPage.mimeType(for: assetName),
-                                "Cache-Control": "no-cache"
-                            ],
-                            body: data
-                        ),
-                        on: connection
-                    )
-                } else {
-                    _ = await Self.send(
-                        data: Data(Self.notFoundResponse().utf8),
-                        on: connection
-                    )
-                }
-                connection.cancel()
-                return
-            }
-
             // Public JSON status. Lists the CURRENTLY BROADCASTING stations
             // plus their current track and listener counts. No auth —
             // broadcaster only knows live stations, so idle library
@@ -513,32 +494,6 @@ public final class RadioBroadcaster: ObservableObject {
         let parts = firstLine.split(separator: " ", maxSplits: 2)
         guard parts.count >= 2 else { return nil }
         return String(parts[1])
-    }
-
-    /// Map a request path to a filename under `web/`, or `nil` when the
-    /// path isn't one of the static asset routes we serve. `/` aliases
-    /// to `index.html`; other allow-listed names map to themselves.
-    /// Only an explicit allow-list is accepted — we don't want to
-    /// expose arbitrary bundle contents via path traversal. The list
-    /// includes PWA assets (manifest + icons) so `Add to Home Screen`
-    /// on iOS/Mac produces a proper standalone app icon.
-    nonisolated static func webAssetFilename(for path: String) -> String? {
-        switch path {
-        case "/", "/index.html":
-            return "index.html"
-        case "/style.css",
-             "/app.js",
-             "/favicon.ico",
-             "/favicon.png",
-             "/manifest.json",
-             "/icon-180.png",
-             "/icon-192.png",
-             "/icon-512.png":
-            // Drop the leading slash to get the filename.
-            return String(path.dropFirst())
-        default:
-            return nil
-        }
     }
 
     /// Parse `/stream/{slug}.aac` → `slug`. Returns nil for any other
