@@ -34,7 +34,9 @@ public struct RootView: View {
     @StateObject private var stations = StationManager()
     @StateObject private var preferences = BroadcastPreferences.shared
     @StateObject private var radio = RadioBroadcaster(preferences: .shared)
+    @StateObject private var downloadService = DownloadService()
     @State private var sidebarSelection: SidebarSelection?
+    @State private var showingAddDownload: Bool = false
     /// Owned by the view so it lives as long as the window does. Held as
     /// optional `@State` because we can't `@StateObject` a non-
     /// `ObservableObject`, and we want to construct it *after* `player`
@@ -74,6 +76,9 @@ public struct RootView: View {
                     }
                     .toolbar {
                         ToolbarItem(placement: .primaryAction) {
+                            addDownloadButton
+                        }
+                        ToolbarItem(placement: .primaryAction) {
                             qualityMenu
                         }
                         ToolbarItem(placement: .primaryAction) {
@@ -81,6 +86,14 @@ public struct RootView: View {
                         }
                         ToolbarItem(placement: .primaryAction) {
                             inspectorToggle
+                        }
+                    }
+                    .sheet(isPresented: $showingAddDownload) {
+                        if let folder = musicFolder {
+                            AddDownloadView(
+                                downloadService: downloadService,
+                                libraryFolder: folder
+                            )
                         }
                     }
                     .task(id: folder) {
@@ -155,6 +168,20 @@ public struct RootView: View {
                 nowPlaying = NowPlayingController(player: player)
             }
         }
+    }
+
+    /// Toolbar button that opens the "Download from Spotify" sheet. Disabled
+    /// until a library folder is selected — downloads need a root to land in.
+    /// ⇧⌘D matches the "add to library" feel used by other media apps.
+    @ViewBuilder private var addDownloadButton: some View {
+        Button {
+            showingAddDownload = true
+        } label: {
+            Image(systemName: "plus.circle")
+        }
+        .keyboardShortcut("d", modifiers: [.command, .shift])
+        .help("Download from Spotify (⇧⌘D)")
+        .disabled(musicFolder == nil)
     }
 
     /// Toolbar Picker surfacing the broadcast quality in the main window
