@@ -35,7 +35,10 @@ targets:
     type: application
     platform: macOS
     sources:
-      - JohanssoundMac
+      - path: JohanssoundMac
+      - path: Vendor/cloudflared/cloudflared
+        type: file
+        buildPhase: resources
     dependencies:
       - target: JohanssoundCore_macOS
         link: true
@@ -51,7 +54,10 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: se.jonasjohansson.johanssound.mac
         MACOSX_DEPLOYMENT_TARGET: "14.0"
-        ENABLE_HARDENED_RUNTIME: YES
+        # Hardened runtime blocks spawning unsigned child processes; we
+        # bundle cloudflared and spawn it via Process, so keep it off
+        # until we sign the full chain.
+        ENABLE_HARDENED_RUNTIME: NO
   JohanssoundIOS:
     type: application
     platform: iOS

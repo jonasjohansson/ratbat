@@ -32,6 +32,11 @@ public struct PlaylistsSidebarView: View {
     @ObservedObject public var vm: LibraryViewModel
     @ObservedObject public var stations: StationManager
     @ObservedObject public var radio: RadioBroadcaster
+    /// Nested ObservableObject on `radio`. SwiftUI doesn't automatically
+    /// observe children of an observed object, so we subscribe to the
+    /// tunnel directly to get re-renders when `publicURL` / `mode` /
+    /// `error` change mid-session.
+    @ObservedObject public var tunnel: CloudflareTunnel
     @Binding public var selection: SidebarSelection?
 
     public init(
@@ -43,6 +48,7 @@ public struct PlaylistsSidebarView: View {
         self.vm = vm
         self.stations = stations
         self.radio = radio
+        self.tunnel = radio.tunnel
         self._selection = selection
     }
 
@@ -131,13 +137,34 @@ public struct PlaylistsSidebarView: View {
             }
             // Task 3.2: when broadcasting, surface the stream URL so the
             // user can aim VLC at it without digging through logs.
+            // Task 3.6: also surface the Cloudflare tunnel URL so the
+            // user can share it with listeners outside the LAN.
             if radio.isBroadcasting, let url = radio.currentURL {
-                Text(url.absoluteString)
+                Text("Local: \(url.absoluteString)")
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
                     .textSelection(.enabled)
                     .padding(.leading, 24)
+                if let pub = tunnel.publicURL {
+                    Text("Public: \(pub.absoluteString)")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .textSelection(.enabled)
+                        .padding(.leading, 24)
+                } else if tunnel.mode == .starting {
+                    Text("Public: starting tunnel…")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .padding(.leading, 24)
+                } else if let err = tunnel.error {
+                    Text("Public: \(err)")
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                        .lineLimit(1)
+                        .padding(.leading, 24)
+                }
             }
         }
     }

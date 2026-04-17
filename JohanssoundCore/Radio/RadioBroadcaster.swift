@@ -31,6 +31,14 @@ public final class RadioBroadcaster: ObservableObject {
     @Published public private(set) var listenerCount = 0
     /// URL a client should point VLC / a browser at. `nil` when idle.
     @Published public private(set) var currentURL: URL?
+    #if os(macOS)
+    /// Public tunnel that exposes the LAN-only `currentURL` out to the
+    /// internet via cloudflared. Owned by the broadcaster so its lifecycle
+    /// matches `start`/`stop` — the UI just observes `tunnel.publicURL`.
+    /// macOS-only because `Process.run()` is unavailable on iOS; iOS
+    /// doesn't have a broadcast flow wired up anyway.
+    public let tunnel: CloudflareTunnel = CloudflareTunnel()
+    #endif
     /// Last error surfaced by the listener or the decode/encode loop.
     /// String-typed so the UI can just render it; callers who want
     /// structured errors should read OSLog.
@@ -99,6 +107,16 @@ public final class RadioBroadcaster: ObservableObject {
             await Self.runEncodeLoop(queue: queue, buffer: buffer, owner: self)
         }
 
+        #if os(macOS)
+        // Kick off the public tunnel in parallel. Don't await it here —
+        // the broadcast is already live on localhost, and the tunnel URL
+        // appearing is a nice-to-have that can take a few seconds.
+        let tunnelPort = port.rawValue
+        Task { [weak self] in
+            await self?.tunnel.start(forwardingTo: tunnelPort)
+        }
+        #endif
+
         logger.info("broadcast started on port \(self.port.rawValue, privacy: .public)")
     }
 
@@ -106,6 +124,12 @@ public final class RadioBroadcaster: ObservableObject {
     /// cancels the encode task, and clears published state. Idempotent.
     public func stop() {
         guard isBroadcasting || listener != nil else { return }
+
+        #if os(macOS)
+        // Tear the public tunnel down first so listeners get a clean
+        // connection close rather than a dangling proxy to a dead port.
+        tunnel.stop()
+        #endif
 
         broadcastTask?.cancel()
         broadcastTask = nil
