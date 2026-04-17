@@ -9,7 +9,9 @@ import XCTest
 final class ICYMetadataTests: XCTestCase {
 
     func testICYMetadataEmptyBlockIsSingleZeroByte() {
-        let data = ICYMetadata.block(for: nil, trackChanged: true)
+        // Explicit `Track?` cast — two `block(for:trackChanged:)` overloads
+        // exist now (Track, TrackSourceItem) and a bare `nil` is ambiguous.
+        let data = ICYMetadata.block(for: nil as Track?, trackChanged: true)
         XCTAssertEqual(data, Data([0x00]))
     }
 

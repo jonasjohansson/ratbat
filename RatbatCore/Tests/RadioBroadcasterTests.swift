@@ -24,7 +24,7 @@ final class RadioBroadcasterTests: XCTestCase {
         let radio = RadioBroadcaster()
         XCTAssertTrue(radio.broadcasting.isEmpty)
         XCTAssertTrue(radio.listenerCount.isEmpty)
-        XCTAssertTrue(radio.currentTrackByStation.isEmpty)
+        XCTAssertTrue(radio.currentItemByStation.isEmpty)
         XCTAssertNil(radio.error)
     }
 

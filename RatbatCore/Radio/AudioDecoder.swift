@@ -50,7 +50,16 @@ final class AudioDecoder: @unchecked Sendable {
     /// file missing, permissions, etc.). Caller decides whether to skip
     /// and move on or surface the error.
     func open(_ track: Track) throws {
-        let audioFile = try AVAudioFile(forReading: track.url)
+        try open(url: track.url)
+    }
+
+    /// Open an arbitrary file URL for reading. Same semantics as
+    /// ``open(_:)`` but without needing a full ``Track`` — the
+    /// ``TrackSource`` pipeline calls this with a ``TrackSourceItem``
+    /// URL since NTS-derived items don't carry a matching library
+    /// ``Track`` value.
+    func open(url: URL) throws {
+        let audioFile = try AVAudioFile(forReading: url)
         self.file = audioFile
         self.sourceFormat = audioFile.processingFormat
         // Build a converter only if the source differs from our canonical

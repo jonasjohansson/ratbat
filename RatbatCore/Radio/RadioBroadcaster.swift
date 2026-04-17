@@ -47,9 +47,11 @@ public final class RadioBroadcaster: ObservableObject {
     @Published public private(set) var broadcasting: Set<Station.ID> = []
     /// Per-station listener counts. Absent key = zero.
     @Published public private(set) var listenerCount: [Station.ID: Int] = [:]
-    /// Per-station currently-encoding track. Drives ICY `StreamTitle`
-    /// updates and the "Now: Artist — Title" UI snippet.
-    @Published public private(set) var currentTrackByStation: [Station.ID: Track] = [:]
+    /// Per-station currently-encoding item. Drives ICY `StreamTitle`
+    /// updates and the "Now: Artist — Title" UI snippet. `TrackSourceItem`
+    /// (not `Track`) so NTS-backed stations — which don't have a full
+    /// library ``Track`` — can publish the same way as playlist stations.
+    @Published public private(set) var currentItemByStation: [Station.ID: TrackSourceItem] = [:]
     /// Last error surfaced by the listener or any encode/decode loop.
     /// String-typed so the UI can just render it; OSLog has the details.
     @Published public private(set) var error: String?
@@ -148,15 +150,33 @@ public final class RadioBroadcaster: ObservableObject {
 
     // MARK: - Public API
 
-    /// Start broadcasting `station`. Spins up its encode loop and (if not
-    /// already running) the shared HTTP listener + Cloudflare tunnel.
-    /// No-op if the station is already live or its queue is empty.
+    /// Convenience entry point. Wraps the station's fixed ``Station/queue``
+    /// in a ``PlaylistSource`` and defers to ``startBroadcast(station:source:)``.
+    /// Preserves the pre-TrackSource-refactor behaviour so existing call
+    /// sites keep working unchanged.
     public func startBroadcast(station: Station) async {
+        // Match pre-refactor ordering: skip silently if already live, then
+        // surface the empty-queue error before spinning up a source.
         guard !broadcasting.contains(station.id) else { return }
         guard !station.queue.isEmpty else {
             error = "Cannot broadcast an empty queue"
             return
         }
+        let source = PlaylistSource(tracks: station.queue)
+        await startBroadcast(station: station, source: source)
+    }
+
+    /// Start broadcasting `station`, pulling successive tracks from an
+    /// arbitrary ``TrackSource``. Spins up the encode loop and (if not
+    /// already running) the shared HTTP listener + Cloudflare tunnel.
+    /// No-op if the station is already live.
+    ///
+    /// When `source.nextURL()` returns nil the encode loop logs it and
+    /// unwinds the pipeline cleanly (as if the user had called
+    /// ``stopBroadcast(stationID:)``). Live listeners drop; the caller
+    /// can start the station again with a fresh source.
+    public func startBroadcast(station: Station, source: TrackSource) async {
+        guard !broadcasting.contains(station.id) else { return }
         error = nil
 
         // Bring up the shared listener the first time anyone broadcasts.
@@ -187,10 +207,13 @@ public final class RadioBroadcaster: ObservableObject {
         listenerCount[station.id] = 0
 
         let buffer = pipeline.buffer
+        let stationID = station.id
+        let stationName = station.name
         pipeline.encodeTask = Task.detached { [weak self, buffer] in
             await Self.runEncodeLoop(
-                queue: station.queue,
-                stationID: station.id,
+                source: source,
+                stationID: stationID,
+                stationName: stationName,
                 buffer: buffer,
                 bitrate: bitrate,
                 sampleRate: sampleRate,
@@ -224,7 +247,7 @@ public final class RadioBroadcaster: ObservableObject {
         pipelines.removeValue(forKey: stationID)
         broadcasting.remove(stationID)
         listenerCount.removeValue(forKey: stationID)
-        currentTrackByStation.removeValue(forKey: stationID)
+        currentItemByStation.removeValue(forKey: stationID)
 
         // Boot any clients still attached to this station.
         let toRemove = clients.filter { $0.value.stationID == stationID }
@@ -286,19 +309,19 @@ public final class RadioBroadcaster: ObservableObject {
     /// Called from the detached encode loop each time the decoder opens a
     /// new track. Drives the ICY metadata surfaced to clients at the next
     /// block boundary.
-    fileprivate func updateCurrentTrack(_ track: Track?, stationID: Station.ID) {
-        if let track {
-            currentTrackByStation[stationID] = track
+    fileprivate func updateCurrentItem(_ item: TrackSourceItem?, stationID: Station.ID) {
+        if let item {
+            currentItemByStation[stationID] = item
         } else {
-            currentTrackByStation.removeValue(forKey: stationID)
+            currentItemByStation.removeValue(forKey: stationID)
         }
     }
 
-    /// Snapshot of the current track for a detached serve loop. Lets a
+    /// Snapshot of the current item for a detached serve loop. Lets a
     /// client task ask "what's playing for MY station?" without grabbing
     /// the whole actor state.
-    fileprivate func snapshotCurrentTrack(stationID: Station.ID) -> Track? {
-        currentTrackByStation[stationID]
+    fileprivate func snapshotCurrentItem(stationID: Station.ID) -> TrackSourceItem? {
+        currentItemByStation[stationID]
     }
 
     // MARK: - HTTP server
@@ -593,8 +616,10 @@ public final class RadioBroadcaster: ObservableObject {
         // polls. Dictionary iteration isn't deterministic in Swift.
         let ordered = pipelines.values.sorted { $0.station.name < $1.station.name }
         let stations: [NowStation] = ordered.map { pipeline in
-            let track = currentTrackByStation[pipeline.station.id]
+            let item = currentItemByStation[pipeline.station.id]
             let listeners = listenerCount[pipeline.station.id] ?? 0
+            // `NowTrack.album` kept for UI backwards compat, but TrackSource
+            // items don't carry album metadata — empty string is fine.
             return NowStation(
                 id: pipeline.station.id.uuidString,
                 name: pipeline.station.name,
@@ -602,8 +627,12 @@ public final class RadioBroadcaster: ObservableObject {
                 broadcasting: true,
                 streamURL: "/stream/\(pipeline.station.slug).aac",
                 listeners: listeners,
-                currentTrack: track.map {
-                    NowTrack(title: $0.title, artist: $0.artist, album: $0.album)
+                currentTrack: item.map {
+                    NowTrack(
+                        title: $0.title ?? "",
+                        artist: $0.artist ?? "",
+                        album: ""
+                    )
                 }
             )
         }
@@ -637,7 +666,10 @@ public final class RadioBroadcaster: ObservableObject {
 
         var cursor = buffer.readCursor()
         var bytesSinceMetaBlock = 0
-        var lastAnnouncedTrackID: UUID?
+        // Track-change detection: the underlying source may not have a UUID
+        // (NTS items don't carry a stable library ID), so key on the URL
+        // which is always present and unique per resolved file.
+        var lastAnnouncedURL: URL?
 
         while !Task.isCancelled {
             let chunk = await buffer.read(from: &cursor)
@@ -673,14 +705,14 @@ public final class RadioBroadcaster: ObservableObject {
                     }
                     remaining = remaining.dropFirst(room)
 
-                    let track = await MainActor.run {
-                        ownerRef()?.snapshotCurrentTrack(stationID: stationID)
+                    let item = await MainActor.run {
+                        ownerRef()?.snapshotCurrentItem(stationID: stationID)
                     }
-                    let trackChanged = track?.id != lastAnnouncedTrackID
-                    let meta = ICYMetadata.block(for: track, trackChanged: trackChanged)
+                    let trackChanged = item?.url != lastAnnouncedURL
+                    let meta = ICYMetadata.block(for: item, trackChanged: trackChanged)
                     let ok = await send(data: meta, on: connection)
                     if !ok { return }
-                    if trackChanged { lastAnnouncedTrackID = track?.id }
+                    if trackChanged { lastAnnouncedURL = item?.url }
 
                     bytesSinceMetaBlock = 0
                 }
@@ -777,8 +809,9 @@ public final class RadioBroadcaster: ObservableObject {
     // MARK: - Encode loop (detached)
 
     private static func runEncodeLoop(
-        queue: [Track],
+        source: TrackSource,
         stationID: Station.ID,
+        stationName: String,
         buffer: AACRingBuffer,
         bitrate: Int,
         sampleRate: Double,
@@ -807,24 +840,39 @@ public final class RadioBroadcaster: ObservableObject {
             return
         }
 
-        var trackIndex = 0
-        while !Task.isCancelled {
-            let track = queue[trackIndex % queue.count]
+        // Outer loop: pull items until the source is exhausted or the
+        // task is cancelled. Inner loop: pump PCM → AAC → ring buffer
+        // for the currently open item.
+        outer: while !Task.isCancelled {
+            let nextItem: TrackSourceItem?
             do {
-                try decoder.open(track)
-                log.info("decoding \(track.title, privacy: .public)")
+                nextItem = try await source.nextURL()
+            } catch {
+                log.error("source error: \(String(describing: error), privacy: .public)")
+                break
+            }
+
+            guard let item = nextItem else {
+                log.info("source exhausted for \(stationName, privacy: .public)")
+                break
+            }
+
+            do {
+                try decoder.open(url: item.url)
+                let label = item.title ?? item.url.lastPathComponent
+                log.info("decoding \(label, privacy: .public)")
                 if let owner {
-                    await MainActor.run { owner.updateCurrentTrack(track, stationID: stationID) }
+                    await MainActor.run { owner.updateCurrentItem(item, stationID: stationID) }
                 }
             } catch {
-                log.error("open failed for \(track.title, privacy: .public): \(String(describing: error))")
-                trackIndex += 1
-                continue
+                let label = item.title ?? item.url.lastPathComponent
+                log.error("open failed for \(label, privacy: .public): \(String(describing: error))")
+                continue outer
             }
 
             while !Task.isCancelled {
                 guard let pcm = decoder.readNextBuffer() else {
-                    break   // EOF — advance queue
+                    break   // EOF — advance to next item
                 }
                 do {
                     if let encoded = try encoder.encode(pcm) {
@@ -843,12 +891,21 @@ public final class RadioBroadcaster: ObservableObject {
             }
 
             decoder.close()
-            trackIndex += 1
         }
 
         decoder.close()
         if let owner {
-            await MainActor.run { owner.updateCurrentTrack(nil, stationID: stationID) }
+            await MainActor.run {
+                owner.updateCurrentItem(nil, stationID: stationID)
+                // When the source runs dry (or the loop exits for any
+                // non-cancellation reason), fold the pipeline down so the
+                // UI reflects reality and the listener can cycle. A
+                // cancellation-driven exit has already mutated the state
+                // from the main actor, so this is a no-op in that case.
+                if owner.broadcasting.contains(stationID) {
+                    owner.stopBroadcast(stationID: stationID)
+                }
+            }
         }
         log.info("encode loop exiting")
     }

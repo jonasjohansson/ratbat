@@ -34,8 +34,30 @@ enum ICYMetadata {
     /// there's nothing to announce even if we "changed".
     static func block(for track: Track?, trackChanged: Bool) -> Data {
         guard trackChanged, let track else { return Data([0x00]) }
-        let title = escape("\(track.artist) - \(track.title)")
-        let payload = "StreamTitle='\(title)';"
+        return block(artist: track.artist, title: track.title, trackChanged: true)
+    }
+
+    /// Variant that works straight off a ``TrackSourceItem``. NTS sources
+    /// hand the broadcaster items rather than full `Track` values, so the
+    /// ICY layer needs to speak both shapes. Missing artist/title fall
+    /// back to empty strings so the announce line is always well-formed.
+    static func block(for item: TrackSourceItem?, trackChanged: Bool) -> Data {
+        guard trackChanged, let item else { return Data([0x00]) }
+        return block(
+            artist: item.artist ?? "",
+            title: item.title ?? "",
+            trackChanged: true
+        )
+    }
+
+    private static func block(
+        artist: String,
+        title: String,
+        trackChanged: Bool
+    ) -> Data {
+        guard trackChanged else { return Data([0x00]) }
+        let joined = escape("\(artist) - \(title)")
+        let payload = "StreamTitle='\(joined)';"
         var bytes = Array(payload.utf8)
         // Clamp to 4080 bytes max (255 * 16) so the length byte fits in UInt8.
         if bytes.count > maxPayload { bytes = Array(bytes.prefix(maxPayload)) }

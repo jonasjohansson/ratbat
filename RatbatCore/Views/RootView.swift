@@ -266,8 +266,8 @@ public struct RootView: View {
         if radio.isBroadcasting(stationID: station.id) {
             let url = radio.streamURL(for: station)?.absoluteString ?? "?"
             var parts = ["Broadcasting at \(url)"]
-            if let track = radio.currentTrackByStation[station.id] {
-                parts.append("Now: \(track.artist) — \(track.title)")
+            if let item = radio.currentItemByStation[station.id] {
+                parts.append("Now: \(item.artist ?? "") — \(item.title ?? "")")
             }
             parts.append("Click to stop.")
             return parts.joined(separator: " · ")

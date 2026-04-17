@@ -191,6 +191,21 @@ public struct PlaylistsSidebarView: View {
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.tertiary)
             }
+            // Live current-track surface so the sidebar tells you what's
+            // actually going out on the wire right now — without having to
+            // open the Inspector or hover the toolbar antenna.
+            if isLive, let item = radio.currentItemByStation[station.id] {
+                HStack(spacing: 4) {
+                    Image(systemName: "music.note")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Text("\(item.artist ?? "") — \(item.title ?? "")")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                .padding(.leading, 20)
+            }
             // When broadcasting, surface this station's stream URL so the
             // user can aim VLC at it without digging through logs. Each
             // station has its own slug-based URL now; the tunnel URL is
