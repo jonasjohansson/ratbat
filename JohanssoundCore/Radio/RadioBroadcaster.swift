@@ -363,21 +363,29 @@ public final class RadioBroadcaster: ObservableObject {
             let path = Self.requestPath(from: headerBytes) ?? "/stream.aac"
             let wantsMetadata = Self.headerRequestsICYMetadata(headerBytes)
 
-            // Public status page. Served inline — single self-contained
-            // HTML blob with no external assets.
-            if path == "/" || path == "/index.html" {
-                let body = Data(StatusPage.html.utf8)
-                _ = await Self.send(
-                    data: Self.buildHTTPResponse(
-                        status: 200,
-                        headers: [
-                            "Content-Type": "text/html; charset=utf-8",
-                            "Cache-Control": "no-cache"
-                        ],
-                        body: body
-                    ),
-                    on: connection
-                )
+            // Public status page + static assets. The HTML/CSS/JS live
+            // as real files in the bundled `Web/` folder; the server
+            // just maps path → filename and streams the bytes back.
+            // `/` aliases to `/index.html`. Unknown static paths 404.
+            if let assetName = Self.webAssetFilename(for: path) {
+                if let data = StatusPage.asset(assetName) {
+                    _ = await Self.send(
+                        data: Self.buildHTTPResponse(
+                            status: 200,
+                            headers: [
+                                "Content-Type": StatusPage.mimeType(for: assetName),
+                                "Cache-Control": "no-cache"
+                            ],
+                            body: data
+                        ),
+                        on: connection
+                    )
+                } else {
+                    _ = await Self.send(
+                        data: Data(Self.notFoundResponse().utf8),
+                        on: connection
+                    )
+                }
                 connection.cancel()
                 return
             }
@@ -505,6 +513,23 @@ public final class RadioBroadcaster: ObservableObject {
         let parts = firstLine.split(separator: " ", maxSplits: 2)
         guard parts.count >= 2 else { return nil }
         return String(parts[1])
+    }
+
+    /// Map a request path to a filename under `Web/`, or `nil` when the
+    /// path isn't one of the static asset routes we serve. `/` aliases
+    /// to `index.html`; other allow-listed names map to themselves.
+    /// Only an explicit allow-list is accepted — we don't want to
+    /// expose arbitrary bundle contents via path traversal.
+    nonisolated static func webAssetFilename(for path: String) -> String? {
+        switch path {
+        case "/", "/index.html":
+            return "index.html"
+        case "/style.css", "/app.js", "/favicon.ico":
+            // Drop the leading slash to get the filename.
+            return String(path.dropFirst())
+        default:
+            return nil
+        }
     }
 
     /// Parse `/stream/{slug}.aac` → `slug`. Returns nil for any other

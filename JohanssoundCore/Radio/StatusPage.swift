@@ -1,139 +1,116 @@
 import Foundation
 
-/// Static HTML for the public status page served at `GET /`.
+/// Asset loader for the public status page served at `GET /`.
 ///
-/// The page polls `/now.json` every 2 seconds and renders the currently
-/// broadcasting stations with their now-playing track. It's intentionally
-/// a single self-contained HTML blob (inline CSS + JS, no external assets)
-/// so the broadcaster doesn't need to serve any additional resources — one
-/// string, one response.
+/// Task 3.7 started with a triple-quoted HTML blob inline in this file.
+/// Task 3.7b moves the markup, styling and JS into real files under the
+/// repo's top-level `Web/` directory which is bundled into the Mac app
+/// (and the test bundle) as a folder-reference resource. Swift reads
+/// bytes from the bundle at request time — one small `Data` per file,
+/// no templating, no caching surprise beyond what the filesystem does.
 ///
-/// Visual language leans dark-mode neutral with a warm amber accent to
-/// match the rest of the Johanssound Mac app.
+/// In DEBUG builds the loader also looks for the `Web/` folder on disk
+/// (via a `JOHANSSOUND_WEB_DIR` env var or by walking up from CWD) so
+/// front-end edits show up on browser refresh without rebuilding Swift.
 enum StatusPage {
-    static let html: String = """
-    <!doctype html>
-    <html lang="en">
-    <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Johanssound — Live Stations</title>
-        <style>
-            :root {
-                color-scheme: dark;
-                --bg: #0a0a0a;
-                --fg: #e8e8e8;
-                --dim: #888;
-                --accent: #f0b820;
-                --card: #161616;
-                --border: #2a2a2a;
+    /// Load a named asset from the bundled `Web/` folder.
+    /// Returns `nil` when the file is missing; callers should map that
+    /// to an HTTP 404 rather than substituting placeholder content.
+    static func asset(_ filename: String) -> Data? {
+        #if DEBUG
+        if let repoURL = repoWebFolder() {
+            let url = repoURL.appendingPathComponent(filename)
+            if let data = try? Data(contentsOf: url) {
+                return data
             }
-            * { box-sizing: border-box; }
-            body {
-                margin: 0; font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-                background: var(--bg); color: var(--fg); padding: 40px 20px; line-height: 1.5;
+        }
+        #endif
+
+        return Bundle.findWebAsset(filename)
+    }
+
+    /// MIME type lookup keyed on filename suffix. Kept small and local —
+    /// we only serve a handful of file types (html/css/js/json/png/ico).
+    /// Unknown extensions fall back to `application/octet-stream` so the
+    /// browser refuses to interpret them, which is the safest default.
+    static func mimeType(for filename: String) -> String {
+        let lower = filename.lowercased()
+        if lower.hasSuffix(".html") { return "text/html; charset=utf-8" }
+        if lower.hasSuffix(".css")  { return "text/css; charset=utf-8" }
+        if lower.hasSuffix(".js")   { return "application/javascript; charset=utf-8" }
+        if lower.hasSuffix(".json") { return "application/json" }
+        if lower.hasSuffix(".ico")  { return "image/x-icon" }
+        if lower.hasSuffix(".png")  { return "image/png" }
+        if lower.hasSuffix(".svg")  { return "image/svg+xml" }
+        return "application/octet-stream"
+    }
+
+    #if DEBUG
+    /// Locate the repo's `Web/` folder for dev hot-reload. We try two
+    /// sources, in order:
+    ///
+    /// 1. `JOHANSSOUND_WEB_DIR` env var — explicit override for unusual
+    ///    setups (running the built app from a custom launchctl job etc).
+    /// 2. Walking up from the current working directory looking for
+    ///    `Web/index.html`. Handles the common `xcodebuild` /
+    ///    `swift test` / direct-run cases without extra config.
+    ///
+    /// Returns `nil` if neither locates a `Web/` folder — bundle lookup
+    /// then takes over.
+    private static func repoWebFolder() -> URL? {
+        if let dir = ProcessInfo.processInfo.environment["JOHANSSOUND_WEB_DIR"] {
+            let url = URL(fileURLWithPath: dir)
+            if FileManager.default.fileExists(
+                atPath: url.appendingPathComponent("index.html").path
+            ) {
+                return url
             }
-            .container { max-width: 720px; margin: 0 auto; }
-            h1 {
-                font-size: 28px; margin: 0 0 8px; letter-spacing: -0.02em;
+        }
+
+        var cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        for _ in 0..<8 {
+            let candidate = cwd.appendingPathComponent("Web/index.html")
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                return cwd.appendingPathComponent("Web")
             }
-            .subtitle { color: var(--dim); margin-bottom: 32px; font-size: 14px; }
-            .station {
-                background: var(--card); border: 1px solid var(--border);
-                border-radius: 8px; padding: 20px; margin-bottom: 16px;
-                transition: border-color 0.2s;
-            }
-            .station.live { border-color: var(--accent); }
-            .station-header {
-                display: flex; align-items: center; gap: 10px;
-                margin-bottom: 12px;
-            }
-            .live-dot {
-                width: 8px; height: 8px; border-radius: 50%;
-                background: var(--accent); animation: pulse 2s infinite;
-            }
-            @keyframes pulse {
-                0%, 100% { opacity: 1; }
-                50% { opacity: 0.4; }
-            }
-            .station-name { font-size: 18px; font-weight: 600; flex: 1; }
-            .listener-count { color: var(--dim); font-size: 13px; }
-            .now-playing {
-                color: var(--fg); font-size: 15px;
-                padding: 10px 12px; background: rgba(255,255,255,0.03);
-                border-radius: 6px; margin: 8px 0;
-            }
-            .now-playing .label {
-                font-size: 11px; text-transform: uppercase;
-                color: var(--dim); letter-spacing: 0.1em; display: block;
-                margin-bottom: 4px;
-            }
-            .listen-btn {
-                display: inline-block; margin-top: 10px;
-                padding: 8px 14px; background: var(--accent); color: #000;
-                text-decoration: none; border-radius: 6px; font-weight: 600;
-                font-size: 14px;
-            }
-            .listen-btn:hover { opacity: 0.85; }
-            .no-stations { color: var(--dim); padding: 40px; text-align: center; }
-            footer {
-                margin-top: 40px; text-align: center; color: var(--dim);
-                font-size: 12px;
-            }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>Johanssound</h1>
-            <p class="subtitle">Personal radio. <span id="status">Loading…</span></p>
-            <div id="stations"></div>
-            <footer>Refreshes every 2 seconds.</footer>
-        </div>
-        <script>
-            async function refresh() {
-                try {
-                    const res = await fetch('/now.json', { cache: 'no-store' });
-                    const data = await res.json();
-                    render(data);
-                    document.getElementById('status').textContent =
-                        `${data.stations.length} station${data.stations.length === 1 ? '' : 's'} live.`;
-                } catch (e) {
-                    document.getElementById('status').textContent = 'Connection lost.';
+            let parent = cwd.deletingLastPathComponent()
+            if parent.path == cwd.path { break }
+            cwd = parent
+        }
+        return nil
+    }
+    #endif
+}
+
+extension Bundle {
+    /// Look up `filename` inside a bundled `Web/` subdirectory, across
+    /// every loaded bundle (main app, test bundle, frameworks). We check
+    /// `Bundle.main` first for the production path, then fall back to
+    /// `Bundle.allBundles` — which in the unit-test process contains the
+    /// `.xctest` bundle where the `Web/` folder is also copied.
+    static func findWebAsset(_ filename: String) -> Data? {
+        let candidates: [Bundle] = [.main] + Bundle.allBundles
+        for bundle in candidates {
+            if let url = bundle.url(
+                forResource: filename,
+                withExtension: nil,
+                subdirectory: "Web"
+            ) {
+                if let data = try? Data(contentsOf: url) {
+                    return data
                 }
             }
-            function render(data) {
-                const el = document.getElementById('stations');
-                if (!data.stations.length) {
-                    el.innerHTML = '<div class="no-stations">No stations currently broadcasting.</div>';
-                    return;
+            // Some folder-reference layouts don't index individual files
+            // via `url(forResource:...)` — fall back to resolving the
+            // subdirectory then appending the filename manually.
+            if let dirURL = bundle.resourceURL?.appendingPathComponent("Web"),
+               FileManager.default.fileExists(atPath: dirURL.path) {
+                let fileURL = dirURL.appendingPathComponent(filename)
+                if let data = try? Data(contentsOf: fileURL) {
+                    return data
                 }
-                el.innerHTML = data.stations.map(s => `
-                    <div class="station ${s.broadcasting ? 'live' : ''}">
-                        <div class="station-header">
-                            ${s.broadcasting ? '<div class="live-dot"></div>' : ''}
-                            <span class="station-name">${escapeHtml(s.name)}</span>
-                            <span class="listener-count">${s.listeners} listener${s.listeners === 1 ? '' : 's'}</span>
-                        </div>
-                        ${s.currentTrack ? `
-                            <div class="now-playing">
-                                <span class="label">Now Playing</span>
-                                <strong>${escapeHtml(s.currentTrack.title)}</strong>
-                                <br><span style="color: var(--dim);">${escapeHtml(s.currentTrack.artist)}</span>
-                            </div>
-                        ` : ''}
-                        <a class="listen-btn" href="${s.streamURL}">▶ Listen</a>
-                    </div>
-                `).join('');
             }
-            function escapeHtml(s) {
-                return String(s).replace(/[&<>"']/g, c => ({
-                    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-                }[c]));
-            }
-            refresh();
-            setInterval(refresh, 2000);
-        </script>
-    </body>
-    </html>
-    """
+        }
+        return nil
+    }
 }

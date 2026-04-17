@@ -485,11 +485,10 @@ final class RadioBroadcasterTests: XCTestCase {
 
     // MARK: - Status page / now.json
 
-    /// `GET /` returns the embedded status HTML with the right
-    /// Content-Type. We only check the structural bits (status line,
-    /// content type header, and one identifiable string from the body)
-    /// — the rest is just a literal, so tests pinning it too hard would
-    /// break every time we touch the markup.
+    /// `GET /` serves the bundled `Web/index.html`. We assert structural
+    /// markers rather than byte-exact content so future markup edits
+    /// don't break the test — the HTML lives in its own file now
+    /// (Task 3.7b) and may evolve independently of the Swift server.
     @MainActor
     func testRootPathServesHTML() async throws {
         guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
@@ -523,6 +522,126 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertTrue(
             response.contains("Johanssound"),
             "Body missing Johanssound marker"
+        )
+        // Structural markers from the split-out Web/index.html. The
+        // page now references external assets instead of inlining them,
+        // so the body should contain the stations container and the
+        // external stylesheet/script links.
+        XCTAssertTrue(
+            response.contains("<html"),
+            "Body missing <html> tag"
+        )
+        XCTAssertTrue(
+            response.contains("id=\"stations\""),
+            "Body missing #stations container"
+        )
+        XCTAssertTrue(
+            response.contains("/style.css"),
+            "Body missing external stylesheet link"
+        )
+        XCTAssertTrue(
+            response.contains("/app.js"),
+            "Body missing external script link"
+        )
+    }
+
+    /// `GET /style.css` serves the bundled stylesheet with the right
+    /// MIME type. Checks the body contains one of our CSS selectors to
+    /// confirm we got the real file and not an error page.
+    @MainActor
+    func testStylesheetIsServed() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+
+        let port: UInt16 = 18_027
+        let radio = RadioBroadcaster(port: port)
+        let station = Station(name: "CSS Test", seed: .manual, queue: tracks)
+        await radio.startBroadcast(station: station)
+        defer { radio.stopAll() }
+
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        let response = try await Self.fetchRawResponse(
+            port: port,
+            path: "/style.css",
+            requestHeaders: [],
+            maxBytes: 8_192
+        )
+        XCTAssertTrue(
+            response.contains("HTTP/1.1 200"),
+            "Expected 200 for /style.css, got: \(response.prefix(200))"
+        )
+        XCTAssertTrue(
+            response.lowercased().contains("content-type: text/css"),
+            "Missing text/css Content-Type: \(response.prefix(400))"
+        )
+        XCTAssertTrue(
+            response.contains(".station"),
+            "Body missing .station selector — probably not the real CSS"
+        )
+    }
+
+    /// `GET /app.js` serves the bundled JS with the right MIME type.
+    @MainActor
+    func testJavascriptIsServed() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+
+        let port: UInt16 = 18_028
+        let radio = RadioBroadcaster(port: port)
+        let station = Station(name: "JS Test", seed: .manual, queue: tracks)
+        await radio.startBroadcast(station: station)
+        defer { radio.stopAll() }
+
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        let response = try await Self.fetchRawResponse(
+            port: port,
+            path: "/app.js",
+            requestHeaders: [],
+            maxBytes: 8_192
+        )
+        XCTAssertTrue(
+            response.contains("HTTP/1.1 200"),
+            "Expected 200 for /app.js, got: \(response.prefix(200))"
+        )
+        XCTAssertTrue(
+            response.lowercased().contains("content-type: application/javascript"),
+            "Missing application/javascript Content-Type: \(response.prefix(400))"
+        )
+        XCTAssertTrue(
+            response.contains("refresh"),
+            "Body missing 'refresh' — probably not the real JS"
+        )
+    }
+
+    /// Paths outside the allow-list return 404. We don't want to expose
+    /// arbitrary bundle contents via path traversal or probing.
+    @MainActor
+    func testMissingAssetReturns404() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+
+        let port: UInt16 = 18_029
+        let radio = RadioBroadcaster(port: port)
+        let station = Station(name: "404 Test", seed: .manual, queue: tracks)
+        await radio.startBroadcast(station: station)
+        defer { radio.stopAll() }
+
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        let response = try await Self.fetchRawResponse(
+            port: port,
+            path: "/does-not-exist.png",
+            requestHeaders: [],
+            maxBytes: 2_048
+        )
+        XCTAssertTrue(
+            response.contains("HTTP/1.1 404"),
+            "Expected 404 for unknown asset, got: \(response.prefix(200))"
         )
     }
 

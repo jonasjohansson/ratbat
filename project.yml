@@ -39,6 +39,9 @@ targets:
       - path: Vendor/cloudflared/cloudflared
         type: file
         buildPhase: resources
+      - path: Web
+        type: folder
+        buildPhase: resources
     dependencies:
       - target: JohanssoundCore_macOS
         link: true
@@ -91,6 +94,9 @@ targets:
         excludes:
           - Fixtures
       - path: JohanssoundCore/Tests/Fixtures
+        type: folder
+        buildPhase: resources
+      - path: Web
         type: folder
         buildPhase: resources
     dependencies:
