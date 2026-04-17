@@ -1,0 +1,268 @@
+{
+  "metadata": {
+    "resultset": {
+      "count": 1706,
+      "offset": 400,
+      "limit": 12
+    }
+  },
+  "results": [
+    {
+      "status": "published",
+      "updated": "2025-11-12T10:13:55+00:00",
+      "name": "Don't Trip w/ Margarita",
+      "description": "Somewhere between banging your head against a brick wall and holding your breath under water.",
+      "description_html": "<h3>Somewhere between banging your head against a brick wall and holding your breath under water.</h3>",
+      "external_links": [],
+      "moods": [],
+      "genres": [
+        {
+          "id": "genres-altrockpunk-noiserock",
+          "value": "Noise Rock"
+        },
+        {
+          "id": "genres-avantgarde-experimental",
+          "value": "Experimental"
+        },
+        {
+          "id": "genres-avantgarde-darkambient",
+          "value": "Dark Ambient"
+        },
+        {
+          "id": "genres-avantgarde-drone",
+          "value": "Drone"
+        },
+        {
+          "id": "genres-avantgarde-musiqueconcrete",
+          "value": "Musique Concrete"
+        },
+        {
+          "id": "genres-avantgarde-noise",
+          "value": "Noise"
+        }
+      ],
+      "location_short": "LDN",
+      "location_long": "London",
+      "intensity": "80",
+      "media": {
+        "background_large": "https://media2.ntslive.co.uk/resize/1600x1600/66ba3550-6500-404e-b61f-cbe23d31cda6_1762905600.jpeg",
+        "background_medium_large": "https://media2.ntslive.co.uk/resize/800x800/66ba3550-6500-404e-b61f-cbe23d31cda6_1762905600.jpeg",
+        "background_medium": "https://media.ntslive.co.uk/resize/400x400/66ba3550-6500-404e-b61f-cbe23d31cda6_1762905600.jpeg",
+        "background_small": "https://media3.ntslive.co.uk/resize/200x200/66ba3550-6500-404e-b61f-cbe23d31cda6_1762905600.jpeg",
+        "background_thumb": "https://media3.ntslive.co.uk/resize/100x100/66ba3550-6500-404e-b61f-cbe23d31cda6_1762905600.jpeg",
+        "picture_large": "https://media2.ntslive.co.uk/resize/1600x1600/66ba3550-6500-404e-b61f-cbe23d31cda6_1762905600.jpeg",
+        "picture_medium_large": "https://media2.ntslive.co.uk/resize/800x800/66ba3550-6500-404e-b61f-cbe23d31cda6_1762905600.jpeg",
+        "picture_medium": "https://media.ntslive.co.uk/resize/400x400/66ba3550-6500-404e-b61f-cbe23d31cda6_1762905600.jpeg",
+        "picture_small": "https://media3.ntslive.co.uk/resize/200x200/66ba3550-6500-404e-b61f-cbe23d31cda6_1762905600.jpeg",
+        "picture_thumb": "https://media3.ntslive.co.uk/resize/100x100/66ba3550-6500-404e-b61f-cbe23d31cda6_1762905600.jpeg"
+      },
+      "show_alias": "dont-trip",
+      "timeslot": "Friday / MIDNIGHT - 2AM / MONTHLY",
+      "frequency": "MONTHLY",
+      "brand": {},
+      "type": "show",
+      "embeds": {},
+      "links": [
+        {
+          "rel": "self",
+          "href": "https://www.nts.live/api/v2/shows/dont-trip",
+          "type": "application/vnd.show+json;charset=utf-8"
+        },
+        {
+          "rel": "episodes",
+          "href": "https://www.nts.live/api/v2/shows/dont-trip/episodes",
+          "type": "application/vnd.episode-list+json;charset=utf-8"
+        }
+      ]
+    },
+    {
+      "status": "published",
+      "updated": "2024-07-15T17:02:31+00:00",
+      "name": "Dollar Country",
+      "description": "Local, regional, and unknown country singles shared from the dusty bins of America.\nhttps://dollarcountry.org/",
+      "description_html": "<h3>Local, regional, and unknown country singles shared from the dusty bins of America.\n<a href=\"https://dollarcountry.org/\" target=\"_blank\">https://dollarcountry.org/</a></h3>",
+      "external_links": [
+        "https://www.instagram.com/dollarcountry",
+        "http://facebook.com/dollarcountry",
+        "http://twitter.com/dollarcountry"
+      ],
+      "moods": [],
+      "genres": [],
+      "location_short": "OHIO",
+      "location_long": "OHIO",
+      "intensity": "50",
+      "media": {
+        "background_large": "https://media2.ntslive.co.uk/resize/1600x1600/2794c51f-aea8-48b5-bf88-68947d31a293_1710460800.jpeg",
+        "background_medium_large": "https://media2.ntslive.co.uk/resize/800x800/2794c51f-aea8-48b5-bf88-68947d31a293_1710460800.jpeg",
+        "background_medium": "https://media.ntslive.co.uk/resize/400x400/2794c51f-aea8-48b5-bf88-68947d31a293_1710460800.jpeg",
+        "background_small": "https://media3.ntslive.co.uk/resize/200x200/2794c51f-aea8-48b5-bf88-68947d31a293_1710460800.jpeg",
+        "background_thumb": "https://media3.ntslive.co.uk/resize/100x100/2794c51f-aea8-48b5-bf88-68947d31a293_1710460800.jpeg",
+        "picture_large": "https://media2.ntslive.co.uk/resize/1600x1600/2794c51f-aea8-48b5-bf88-68947d31a293_1710460800.jpeg",
+        "picture_medium_large": "https://media2.ntslive.co.uk/resize/800x800/2794c51f-aea8-48b5-bf88-68947d31a293_1710460800.jpeg",
+        "picture_medium": "https://media.ntslive.co.uk/resize/400x400/2794c51f-aea8-48b5-bf88-68947d31a293_1710460800.jpeg",
+        "picture_small": "https://media3.ntslive.co.uk/resize/200x200/2794c51f-aea8-48b5-bf88-68947d31a293_1710460800.jpeg",
+        "picture_thumb": "https://media3.ntslive.co.uk/resize/100x100/2794c51f-aea8-48b5-bf88-68947d31a293_1710460800.jpeg"
+      },
+      "show_alias": "dollar-country",
+      "timeslot": "",
+      "frequency": "",
+      "brand": {},
+      "type": "show",
+      "embeds": {},
+      "links": [
+        {
+          "rel": "self",
+          "href": "https://www.nts.live/api/v2/shows/dollar-country",
+          "type": "application/vnd.show+json;charset=utf-8"
+        },
+        {
+          "rel": "episodes",
+          "href": "https://www.nts.live/api/v2/shows/dollar-country/episodes",
+          "type": "application/vnd.episode-list+json;charset=utf-8"
+        }
+      ]
+    },
+    {
+      "status": "published",
+      "updated": "2025-06-10T11:35:15+00:00",
+      "name": "Donna Leake",
+      "description": "Dive into Donna Leake's ever developing taste, drawing sounds from all over the globe and all over the clock including jazz, reggae and psych. ",
+      "description_html": "<h3>Dive into Donna Leake's ever developing taste, drawing sounds from all over the globe and all over the clock including jazz, reggae and psych. </h3>",
+      "external_links": [],
+      "moods": [
+        {
+          "id": "moods-safe-for-work",
+          "value": "SAFE FOR WORK"
+        }
+      ],
+      "genres": [],
+      "location_short": "LDN",
+      "location_long": "London",
+      "intensity": "50",
+      "media": {
+        "background_large": "https://media2.ntslive.co.uk/resize/1600x1600/2aceb280-6d12-4efa-bc28-8cead4571b85_1529971200.jpeg",
+        "background_medium_large": "https://media2.ntslive.co.uk/resize/800x800/2aceb280-6d12-4efa-bc28-8cead4571b85_1529971200.jpeg",
+        "background_medium": "https://media.ntslive.co.uk/resize/400x400/2aceb280-6d12-4efa-bc28-8cead4571b85_1529971200.jpeg",
+        "background_small": "https://media3.ntslive.co.uk/resize/200x200/2aceb280-6d12-4efa-bc28-8cead4571b85_1529971200.jpeg",
+        "background_thumb": "https://media3.ntslive.co.uk/resize/100x100/2aceb280-6d12-4efa-bc28-8cead4571b85_1529971200.jpeg",
+        "picture_large": "https://media2.ntslive.co.uk/resize/1600x1600/2aceb280-6d12-4efa-bc28-8cead4571b85_1529971200.jpeg",
+        "picture_medium_large": "https://media2.ntslive.co.uk/resize/800x800/2aceb280-6d12-4efa-bc28-8cead4571b85_1529971200.jpeg",
+        "picture_medium": "https://media.ntslive.co.uk/resize/400x400/2aceb280-6d12-4efa-bc28-8cead4571b85_1529971200.jpeg",
+        "picture_small": "https://media3.ntslive.co.uk/resize/200x200/2aceb280-6d12-4efa-bc28-8cead4571b85_1529971200.jpeg",
+        "picture_thumb": "https://media3.ntslive.co.uk/resize/100x100/2aceb280-6d12-4efa-bc28-8cead4571b85_1529971200.jpeg"
+      },
+      "show_alias": "donna-leake",
+      "timeslot": "TUESDAY / MIDDAY-2PM / MONTHLY",
+      "frequency": "MONTHLY",
+      "brand": {},
+      "type": "show",
+      "embeds": {},
+      "links": [
+        {
+          "rel": "self",
+          "href": "https://www.nts.live/api/v2/shows/donna-leake",
+          "type": "application/vnd.show+json;charset=utf-8"
+        },
+        {
+          "rel": "episodes",
+          "href": "https://www.nts.live/api/v2/shows/donna-leake/episodes",
+          "type": "application/vnd.episode-list+json;charset=utf-8"
+        }
+      ]
+    },
+    {
+      "status": "published",
+      "updated": "2024-01-29T15:52:03+00:00",
+      "name": "Don Sinini ",
+      "description": "Neo dancehall crooner & producer brings his favourite music to the London studio, once a month. ",
+      "description_html": "<h3>Neo dancehall crooner & producer brings his favourite music to the London studio, once a month. </h3>",
+      "external_links": [
+        "https://twitter.com/sininiboy",
+        "https://www.instagram.com/sininiboy/"
+      ],
+      "moods": [
+        {
+          "id": "moods-maximum-effort",
+          "value": "MAXIMUM EFFORT"
+        }
+      ],
+      "genres": [],
+      "location_short": "LDN",
+      "location_long": "London",
+      "intensity": "50",
+      "media": {
+        "background_large": "https://media2.ntslive.co.uk/resize/1600x1600/45b04289-d416-4722-865d-b83a300fd877_1582761600.jpeg",
+        "background_medium_large": "https://media2.ntslive.co.uk/resize/800x800/45b04289-d416-4722-865d-b83a300fd877_1582761600.jpeg",
+        "background_medium": "https://media.ntslive.co.uk/resize/400x400/45b04289-d416-4722-865d-b83a300fd877_1582761600.jpeg",
+        "background_small": "https://media3.ntslive.co.uk/resize/200x200/45b04289-d416-4722-865d-b83a300fd877_1582761600.jpeg",
+        "background_thumb": "https://media3.ntslive.co.uk/resize/100x100/45b04289-d416-4722-865d-b83a300fd877_1582761600.jpeg",
+        "picture_large": "https://media2.ntslive.co.uk/resize/1600x1600/45b04289-d416-4722-865d-b83a300fd877_1582761600.jpeg",
+        "picture_medium_large": "https://media2.ntslive.co.uk/resize/800x800/45b04289-d416-4722-865d-b83a300fd877_1582761600.jpeg",
+        "picture_medium": "https://media.ntslive.co.uk/resize/400x400/45b04289-d416-4722-865d-b83a300fd877_1582761600.jpeg",
+        "picture_small": "https://media3.ntslive.co.uk/resize/200x200/45b04289-d416-4722-865d-b83a300fd877_1582761600.jpeg",
+        "picture_thumb": "https://media3.ntslive.co.uk/resize/100x100/45b04289-d416-4722-865d-b83a300fd877_1582761600.jpeg"
+      },
+      "show_alias": "don-sinini",
+      "timeslot": "Archive SHOW",
+      "frequency": "Archive SHOW",
+      "brand": {},
+      "type": "show",
+      "embeds": {},
+      "links": [
+        {
+          "rel": "self",
+          "href": "https://www.nts.live/api/v2/shows/don-sinini",
+          "type": "application/vnd.show+json;charset=utf-8"
+        },
+        {
+          "rel": "episodes",
+          "href": "https://www.nts.live/api/v2/shows/don-sinini/episodes",
+          "type": "application/vnd.episode-list+json;charset=utf-8"
+        }
+      ]
+    },
+    {
+      "status": "published",
+      "updated": "2026-03-25T15:32:31+00:00",
+      "name": "Don't Assume ",
+      "description": "Don't Assume is a long-form interview series: a free flowing conversation with a different musical pioneer, disruptor and innovator. Presented by Zakia Sewell. ",
+      "description_html": "<h3>Don't Assume is a long-form interview series: a free flowing conversation with a different musical pioneer, disruptor and innovator. Presented by Zakia Sewell. </h3>",
+      "external_links": [],
+      "moods": [],
+      "genres": [],
+      "location_short": null,
+      "location_long": null,
+      "intensity": "50",
+      "media": {
+        "background_large": "https://media2.ntslive.co.uk/resize/1600x1600/37c35be5-a01c-4719-8d33-99eafafd1fcd_1736726400.jpeg",
+        "background_medium_large": "https://media2.ntslive.co.uk/resize/800x800/37c35be5-a01c-4719-8d33-99eafafd1fcd_1736726400.jpeg",
+        "background_medium": "https://media.ntslive.co.uk/resize/400x400/37c35be5-a01c-4719-8d33-99eafafd1fcd_1736726400.jpeg",
+        "background_small": "https://media3.ntslive.co.uk/resize/200x200/37c35be5-a01c-4719-8d33-99eafafd1fcd_1736726400.jpeg",
+        "background_thumb": "https://media3.ntslive.co.uk/resize/100x100/37c35be5-a01c-4719-8d33-99eafafd1fcd_1736726400.jpeg",
+        "picture_large": "https://media2.ntslive.co.uk/resize/1600x1600/37c35be5-a01c-4719-8d33-99eafafd1fcd_1736726400.jpeg",
+        "picture_medium_large": "https://media2.ntslive.co.uk/resize/800x800/37c35be5-a01c-4719-8d33-99eafafd1fcd_1736726400.jpeg",
+        "picture_medium": "https://media.ntslive.co.uk/resize/400x400/37c35be5-a01c-4719-8d33-99eafafd1fcd_1736726400.jpeg",
+        "picture_small": "https://media3.ntslive.co.uk/resize/200x200/37c35be5-a01c-4719-8d33-99eafafd1fcd_1736726400.jpeg",
+        "picture_thumb": "https://media3.ntslive.co.uk/resize/100x100/37c35be5-a01c-4719-8d33-99eafafd1fcd_1736726400.jpeg"
+      },
+      "show_alias": "dont-assume-2024",
+      "timeslot": "",
+      "frequency": "",
+      "brand": {},
+      "type": "show",
+      "embeds": {},
+      "links": [
+        {
+          "rel": "self",
+          "href": "https://www.nts.live/api/v2/shows/dont-assume-2024",
+          "type": "application/vnd.show+json;charset=utf-8"
+        },
+        {
+          "rel": "episodes",
+          "href": "https://www.nts.live/api/v2/shows/dont-assume-2024/episodes",
+          "type": "application/vnd.episode-list+json;charset=utf-8"
+        }
+      ]
+    }
+  ]
+}
