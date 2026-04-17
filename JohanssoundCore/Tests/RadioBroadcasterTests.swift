@@ -485,10 +485,12 @@ final class RadioBroadcasterTests: XCTestCase {
 
     // MARK: - Status page / now.json
 
-    /// `GET /` serves the bundled `Web/index.html`. We assert structural
+    /// `GET /` serves the bundled `web/index.html`. We assert structural
     /// markers rather than byte-exact content so future markup edits
     /// don't break the test — the HTML lives in its own file now
     /// (Task 3.7b) and may evolve independently of the Swift server.
+    /// Task 3.7c turns the page into a full HTML5 player + PWA, so the
+    /// asserted markers now reference the player UI and manifest.
     @MainActor
     func testRootPathServesHTML() async throws {
         guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
@@ -523,17 +525,24 @@ final class RadioBroadcasterTests: XCTestCase {
             response.contains("Johanssound"),
             "Body missing Johanssound marker"
         )
-        // Structural markers from the split-out Web/index.html. The
-        // page now references external assets instead of inlining them,
-        // so the body should contain the stations container and the
-        // external stylesheet/script links.
+        // Structural markers from the new player page. The body should
+        // link the PWA manifest, embed an <audio> element for the
+        // streaming player, and reference the station list container.
         XCTAssertTrue(
             response.contains("<html"),
             "Body missing <html> tag"
         )
         XCTAssertTrue(
-            response.contains("id=\"stations\""),
-            "Body missing #stations container"
+            response.contains("id=\"station-list\""),
+            "Body missing #station-list container"
+        )
+        XCTAssertTrue(
+            response.contains("<audio"),
+            "Body missing <audio> element"
+        )
+        XCTAssertTrue(
+            response.contains("/manifest.json"),
+            "Body missing PWA manifest link"
         )
         XCTAssertTrue(
             response.contains("/style.css"),
@@ -615,6 +624,91 @@ final class RadioBroadcasterTests: XCTestCase {
             response.contains("refresh"),
             "Body missing 'refresh' — probably not the real JS"
         )
+    }
+
+    /// `GET /manifest.json` serves the PWA manifest with JSON MIME type
+    /// and the shape needed for "Add to Home Screen" on iOS/Mac.
+    @MainActor
+    func testManifestServed() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+
+        let port: UInt16 = 18_030
+        let radio = RadioBroadcaster(port: port)
+        let station = Station(name: "Manifest Test", seed: .manual, queue: tracks)
+        await radio.startBroadcast(station: station)
+        defer { radio.stopAll() }
+
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        let (data, response) = try await Self.fetchPayload(
+            port: port,
+            path: "/manifest.json"
+        )
+        guard let http = response as? HTTPURLResponse else {
+            XCTFail("Not HTTP response")
+            return
+        }
+        XCTAssertEqual(http.statusCode, 200)
+        XCTAssertEqual(
+            (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased(),
+            "application/json"
+        )
+
+        struct Manifest: Decodable {
+            let name: String
+            let short_name: String
+            let start_url: String
+            let display: String
+        }
+        let decoded = try JSONDecoder().decode(Manifest.self, from: data)
+        XCTAssertEqual(decoded.name, "Johanssound")
+        XCTAssertEqual(decoded.display, "standalone")
+        XCTAssertEqual(decoded.start_url, "/")
+    }
+
+    /// `GET /favicon.png` serves the 64px placeholder icon with a PNG
+    /// MIME type. If the icon isn't in the bundle (e.g. ImageMagick
+    /// wasn't available at generation time), the test is skipped rather
+    /// than failed — the rest of the PWA works without it.
+    @MainActor
+    func testFavIconServed() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+
+        // Skip cleanly when the icon isn't present in the bundle — e.g.
+        // on a dev machine without ImageMagick where the committed PNGs
+        // might have been regenerated at a different size.
+        guard StatusPage.asset("favicon.png") != nil else {
+            throw XCTSkip("favicon.png not bundled; skipping")
+        }
+
+        let port: UInt16 = 18_031
+        let radio = RadioBroadcaster(port: port)
+        let station = Station(name: "Favicon Test", seed: .manual, queue: tracks)
+        await radio.startBroadcast(station: station)
+        defer { radio.stopAll() }
+
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        let (data, response) = try await Self.fetchPayload(
+            port: port,
+            path: "/favicon.png"
+        )
+        guard let http = response as? HTTPURLResponse else {
+            XCTFail("Not HTTP response")
+            return
+        }
+        XCTAssertEqual(http.statusCode, 200)
+        XCTAssertEqual(
+            (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased(),
+            "image/png"
+        )
+        // PNG magic number: first 8 bytes are 89 50 4E 47 0D 0A 1A 0A.
+        XCTAssertGreaterThan(data.count, 8)
+        XCTAssertEqual(Array(data.prefix(4)), [0x89, 0x50, 0x4E, 0x47])
     }
 
     /// Paths outside the allow-list return 404. We don't want to expose

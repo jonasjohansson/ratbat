@@ -364,7 +364,7 @@ public final class RadioBroadcaster: ObservableObject {
             let wantsMetadata = Self.headerRequestsICYMetadata(headerBytes)
 
             // Public status page + static assets. The HTML/CSS/JS live
-            // as real files in the bundled `Web/` folder; the server
+            // as real files in the bundled `web/` folder; the server
             // just maps path → filename and streams the bytes back.
             // `/` aliases to `/index.html`. Unknown static paths 404.
             if let assetName = Self.webAssetFilename(for: path) {
@@ -515,16 +515,25 @@ public final class RadioBroadcaster: ObservableObject {
         return String(parts[1])
     }
 
-    /// Map a request path to a filename under `Web/`, or `nil` when the
+    /// Map a request path to a filename under `web/`, or `nil` when the
     /// path isn't one of the static asset routes we serve. `/` aliases
     /// to `index.html`; other allow-listed names map to themselves.
     /// Only an explicit allow-list is accepted — we don't want to
-    /// expose arbitrary bundle contents via path traversal.
+    /// expose arbitrary bundle contents via path traversal. The list
+    /// includes PWA assets (manifest + icons) so `Add to Home Screen`
+    /// on iOS/Mac produces a proper standalone app icon.
     nonisolated static func webAssetFilename(for path: String) -> String? {
         switch path {
         case "/", "/index.html":
             return "index.html"
-        case "/style.css", "/app.js", "/favicon.ico":
+        case "/style.css",
+             "/app.js",
+             "/favicon.ico",
+             "/favicon.png",
+             "/manifest.json",
+             "/icon-180.png",
+             "/icon-192.png",
+             "/icon-512.png":
             // Drop the leading slash to get the filename.
             return String(path.dropFirst())
         default:
