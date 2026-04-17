@@ -32,7 +32,8 @@ public struct RootView: View {
     @StateObject private var player = AudioPlayer()
     @StateObject private var libraryVM = LibraryViewModel()
     @StateObject private var stations = StationManager()
-    @StateObject private var radio = RadioBroadcaster()
+    @StateObject private var preferences = BroadcastPreferences.shared
+    @StateObject private var radio = RadioBroadcaster(preferences: .shared)
     @State private var sidebarSelection: SidebarSelection?
     /// Owned by the view so it lives as long as the window does. Held as
     /// optional `@State` because we can't `@StateObject` a non-
@@ -102,6 +103,33 @@ public struct RootView: View {
             // Only show the player bar once we're past folder-picking.
             // Sits outside the split so it spans the whole window.
             if musicFolder != nil {
+                if radio.needsRestart {
+                    // Surfaces here rather than in the Settings pane because
+                    // the user may have Settings closed when they change
+                    // something — the main window is always visible.
+                    HStack(spacing: 8) {
+                        Image(systemName: "arrow.clockwise.circle")
+                            .foregroundStyle(.orange)
+                        Text("Broadcast settings changed — restart broadcast to apply.")
+                            .font(.caption)
+                        Spacer()
+                        Button("Restart All") {
+                            let liveStations = stations.stations.filter {
+                                radio.isBroadcasting(stationID: $0.id)
+                            }
+                            radio.stopAll()
+                            Task {
+                                for station in liveStations {
+                                    await radio.startBroadcast(station: station)
+                                }
+                            }
+                        }
+                        .controlSize(.small)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(.orange.opacity(0.12))
+                }
                 Divider()
                 PlayerView(player: player)
             }

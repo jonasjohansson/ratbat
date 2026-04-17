@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import AudioToolbox
+import Combine
 import Network
 import OSLog
 
@@ -44,6 +45,11 @@ public final class RadioBroadcaster: ObservableObject {
     /// Last error surfaced by the listener or any encode/decode loop.
     /// String-typed so the UI can just render it; OSLog has the details.
     @Published public private(set) var error: String?
+    /// Flips to `true` when the user changes a broadcast-affecting setting
+    /// (quality, sample rate, port, ICY) while at least one station is
+    /// live. Clients display a banner asking the user to restart; stopAll()
+    /// clears it because the next start will pick up the new values.
+    @Published public private(set) var needsRestart: Bool = false
 
     #if os(macOS)
     /// Public tunnel that exposes the whole port out to the internet via
@@ -56,6 +62,8 @@ public final class RadioBroadcaster: ObservableObject {
     // MARK: - Config
 
     private let port: NWEndpoint.Port
+    private let preferences: BroadcastPreferences
+    private var preferencesSubscription: AnyCancellable?
     private let logger = Logger(
         subsystem: "se.jonasjohansson.johanssound",
         category: "broadcaster"
@@ -69,11 +77,18 @@ public final class RadioBroadcaster: ObservableObject {
     private final class BroadcastPipeline {
         let station: Station
         let buffer: AACRingBuffer
+        /// Encoder bitrate this pipeline was started with. Frozen at
+        /// construction — AACEncoder doesn't support live bitrate changes,
+        /// so a live pipeline keeps its original setting until stopped.
+        let bitrate: Int
+        let sampleRate: Double
         var encodeTask: Task<Void, Never>?
 
-        init(station: Station, buffer: AACRingBuffer) {
+        init(station: Station, buffer: AACRingBuffer, bitrate: Int, sampleRate: Double) {
             self.station = station
             self.buffer = buffer
+            self.bitrate = bitrate
+            self.sampleRate = sampleRate
         }
     }
 
@@ -85,9 +100,42 @@ public final class RadioBroadcaster: ObservableObject {
     private var clients: [ObjectIdentifier: (connection: NWConnection, stationID: Station.ID)] = [:]
     private var clientTasks: [ObjectIdentifier: Task<Void, Never>] = [:]
 
+    /// Construct a broadcaster bound to a specific port. Primarily for
+    /// tests that need deterministic ports without trampling the
+    /// user-facing preferences — production callers should prefer
+    /// ``init(preferences:)``.
     public init(port: UInt16 = 18000) {
         // Force-unwrap: NWEndpoint.Port(rawValue:) only returns nil for 0.
         self.port = NWEndpoint.Port(rawValue: port) ?? .any
+        self.preferences = BroadcastPreferences.shared
+        subscribeToPreferences()
+    }
+
+    /// Construct a broadcaster backed by a user preferences store. The
+    /// broadcaster snapshots `prefs.port` at init time — live port changes
+    /// require stopAll + re-init (flagged via ``needsRestart``). Quality
+    /// and sample-rate changes also flag a restart but can be picked up on
+    /// the next startBroadcast without recreating the broadcaster.
+    public init(preferences: BroadcastPreferences) {
+        self.preferences = preferences
+        let raw = UInt16(clamping: preferences.port)
+        self.port = NWEndpoint.Port(rawValue: raw) ?? .any
+        subscribeToPreferences()
+    }
+
+    /// Wire up the "prefs changed → needsRestart while broadcasting" loop.
+    /// ``BroadcastPreferences.revision`` ticks whenever any tracked value
+    /// mutates, so a single sink covers every field.
+    private func subscribeToPreferences() {
+        preferencesSubscription = preferences.$revision
+            .dropFirst()
+            .sink { [weak self] _ in
+                guard let self else { return }
+                // Only nag the user when something's actually live.
+                if !self.broadcasting.isEmpty {
+                    self.needsRestart = true
+                }
+            }
     }
 
     // MARK: - Public API
@@ -114,7 +162,18 @@ public final class RadioBroadcaster: ObservableObject {
             }
         }
 
-        let pipeline = BroadcastPipeline(station: station, buffer: AACRingBuffer())
+        // Snapshot prefs at start time so mid-stream changes don't
+        // silently corrupt a running encoder. The values ride along with
+        // the pipeline; a restart is required to pick up new settings.
+        let bitrate = preferences.quality.bitrate
+        let sampleRate = Double(preferences.sampleRate.rawValue)
+
+        let pipeline = BroadcastPipeline(
+            station: station,
+            buffer: AACRingBuffer(),
+            bitrate: bitrate,
+            sampleRate: sampleRate
+        )
         pipelines[station.id] = pipeline
         broadcasting.insert(station.id)
         listenerCount[station.id] = 0
@@ -125,6 +184,8 @@ public final class RadioBroadcaster: ObservableObject {
                 queue: station.queue,
                 stationID: station.id,
                 buffer: buffer,
+                bitrate: bitrate,
+                sampleRate: sampleRate,
                 owner: self
             )
         }
@@ -178,6 +239,9 @@ public final class RadioBroadcaster: ObservableObject {
         for id in Array(pipelines.keys) {
             stopBroadcast(stationID: id)
         }
+        // A full stop resets the "needs restart" banner — the next start
+        // will pick up current preferences as its fresh baseline.
+        needsRestart = false
     }
 
     /// Whether `stationID` is currently broadcasting.
@@ -600,6 +664,8 @@ public final class RadioBroadcaster: ObservableObject {
         queue: [Track],
         stationID: Station.ID,
         buffer: AACRingBuffer,
+        bitrate: Int,
+        sampleRate: Double,
         owner: RadioBroadcaster?
     ) async {
         let decoder = AudioDecoder()
@@ -610,7 +676,11 @@ public final class RadioBroadcaster: ObservableObject {
 
         let encoder: AACEncoder
         do {
-            encoder = try AACEncoder(inputFormat: AudioDecoder.outputFormat)
+            encoder = try AACEncoder(
+                inputFormat: AudioDecoder.outputFormat,
+                sampleRate: sampleRate,
+                bitrate: bitrate
+            )
         } catch {
             log.error("encoder init failed: \(String(describing: error))")
             if let owner {
