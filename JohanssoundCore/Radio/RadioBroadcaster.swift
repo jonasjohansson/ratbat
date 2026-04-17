@@ -35,10 +35,17 @@ public final class RadioBroadcaster: ObservableObject {
     /// String-typed so the UI can just render it; callers who want
     /// structured errors should read OSLog.
     @Published public private(set) var error: String?
+    /// Track the encode loop is currently feeding into the stream, or
+    /// `nil` when idle / between tracks. Published so UI can show
+    /// "Broadcasting: Artist — Title" without poking the encoder.
+    @Published public private(set) var currentlyBroadcastingTrack: Track?
 
     // MARK: - Config
 
     private let port: NWEndpoint.Port
+    /// Hardcoded for v1 — later we can derive this from the `Station` the
+    /// broadcaster is attached to so each station gets its own label.
+    private let stationName: String = "Johanssound"
     private let logger = Logger(
         subsystem: "se.jonasjohansson.johanssound",
         category: "broadcaster"
@@ -55,7 +62,7 @@ public final class RadioBroadcaster: ObservableObject {
     /// hold references without a circular ownership hassle.
     private var ringBuffer: AACRingBuffer?
 
-    public init(port: UInt16 = 8000) {
+    public init(port: UInt16 = 18000) {
         // Force-unwrap: NWEndpoint.Port(rawValue:) only returns nil for 0.
         self.port = NWEndpoint.Port(rawValue: port) ?? .any
     }
@@ -120,8 +127,23 @@ public final class RadioBroadcaster: ObservableObject {
         isBroadcasting = false
         listenerCount = 0
         currentURL = nil
+        currentlyBroadcastingTrack = nil
 
         logger.info("broadcast stopped")
+    }
+
+    /// Called from the detached encode loop (via `MainActor.run`) each time
+    /// the decoder opens a new track. Drives the ICY metadata we publish
+    /// to connected clients on their next metadata block boundary.
+    fileprivate func updateCurrentTrack(_ track: Track?) {
+        currentlyBroadcastingTrack = track
+    }
+
+    /// Snapshot of the current track for detached serve loops. Lets a
+    /// client task ask "what's playing right now?" without needing an
+    /// unsafe reference back to the broadcaster.
+    fileprivate func snapshotCurrentTrack() -> Track? {
+        currentlyBroadcastingTrack
     }
 
     // MARK: - HTTP server
@@ -180,10 +202,12 @@ public final class RadioBroadcaster: ObservableObject {
 
         connection.start(queue: .global(qos: .userInitiated))
 
+        let stationName = self.stationName
         let task = Task.detached { [weak self] in
             await Self.serveClient(
                 connection: connection,
                 buffer: buffer,
+                stationName: stationName,
                 ownerRef: { [weak self] in self }
             )
             // When serving exits (client gone, task cancelled), make sure
@@ -207,30 +231,33 @@ public final class RadioBroadcaster: ObservableObject {
     // MARK: - Client serving (detached)
 
     /// Reads the HTTP request line(s), sends a minimal 200 response,
-    /// then pumps ring-buffer data until the connection goes away.
+    /// then pumps ring-buffer data until the connection goes away. If
+    /// the client requested ICY metadata (`Icy-MetaData: 1`), we
+    /// interleave a metadata block after every `blockInterval` audio
+    /// bytes written to THIS client — byte counters are per-client
+    /// because different clients connect at different moments.
     private static func serveClient(
         connection: NWConnection,
         buffer: AACRingBuffer,
+        stationName: String,
         ownerRef: @escaping @Sendable () -> RadioBroadcaster?
     ) async {
-        // Eat the HTTP request. We don't actually parse it — any GET /*
-        // gets the same stream. We just need to consume until \r\n\r\n
-        // so the client knows we're listening.
-        _ = await readUntilHeaderEnd(connection: connection)
+        // Read + parse the HTTP request headers so we know whether the
+        // client opted in to ICY metadata.
+        let headerBytes = await readUntilHeaderEnd(connection: connection)
+        let wantsMetadata = headerRequestsICYMetadata(headerBytes)
 
-        let responseHeader = """
-        HTTP/1.1 200 OK\r
-        Content-Type: audio/aac\r
-        Cache-Control: no-cache\r
-        Connection: close\r
-        Pragma: no-cache\r
-        \r
-
-        """
+        let responseHeader = buildResponseHeader(
+            wantsMetadata: wantsMetadata,
+            stationName: stationName
+        )
         let sent = await send(data: Data(responseHeader.utf8), on: connection)
         guard sent else { return }
 
         var cursor = buffer.readCursor()
+        var bytesSinceMetaBlock = 0
+        var lastAnnouncedTrackID: UUID?
+
         while !Task.isCancelled {
             let chunk = await buffer.read(from: &cursor)
             if chunk.isEmpty {
@@ -240,11 +267,102 @@ public final class RadioBroadcaster: ObservableObject {
                 if Task.isCancelled { return }
                 continue
             }
-            let ok = await send(data: chunk, on: connection)
-            if !ok { return }
+
+            if !wantsMetadata {
+                // Fast path for dumb clients: pure AAC, no framing.
+                let ok = await send(data: chunk, on: connection)
+                if !ok { return }
+                continue
+            }
+
+            // ICY path: split the chunk on the 16384-byte boundary and
+            // inject metadata blocks between audio slices. The counter
+            // tracks AUDIO bytes only — the metadata itself must NOT
+            // shift the next boundary.
+            var remaining = chunk
+            while !remaining.isEmpty {
+                let room = ICYMetadata.blockInterval - bytesSinceMetaBlock
+                if remaining.count < room {
+                    let ok = await send(data: remaining, on: connection)
+                    if !ok { return }
+                    bytesSinceMetaBlock += remaining.count
+                    remaining = Data()
+                } else {
+                    // Fill the current interval, emit a meta block,
+                    // then carry the leftover forward.
+                    let fill = remaining.prefix(room)
+                    if !fill.isEmpty {
+                        let ok = await send(data: Data(fill), on: connection)
+                        if !ok { return }
+                    }
+                    remaining = remaining.dropFirst(room)
+
+                    let track = await MainActor.run { ownerRef()?.snapshotCurrentTrack() }
+                    let trackChanged = track?.id != lastAnnouncedTrackID
+                    let meta = ICYMetadata.block(for: track, trackChanged: trackChanged)
+                    let ok = await send(data: meta, on: connection)
+                    if !ok { return }
+                    if trackChanged { lastAnnouncedTrackID = track?.id }
+
+                    bytesSinceMetaBlock = 0
+                }
+            }
         }
 
         _ = ownerRef()   // keep the reference alive through the closure
+    }
+
+    /// Scans the request-header bytes for `Icy-MetaData: 1` (case-insensitive).
+    /// We only care about a single boolean, so no full HTTP parser needed.
+    private static func headerRequestsICYMetadata(_ bytes: Data) -> Bool {
+        guard let text = String(data: bytes, encoding: .utf8) else { return false }
+        // Normalise to `\n` then split — splitting on a Character set of
+        // `\r` and `\n` is tempting but Swift's split-on-closure has bitten
+        // us before, so we do it the dull explicit way.
+        let normalised = text.replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        for line in normalised.split(separator: "\n") {
+            let lower = line.lowercased()
+            if lower.hasPrefix("icy-metadata:") {
+                let value = lower.dropFirst("icy-metadata:".count)
+                    .trimmingCharacters(in: .whitespaces)
+                if value == "1" { return true }
+            }
+        }
+        return false
+    }
+
+    /// Build the HTTP response head. When ICY metadata is requested we
+    /// advertise `icy-metaint`, a station name, and a genre — VLC shows
+    /// `icy-name` in its "Current Media" panel as the station label.
+    private static func buildResponseHeader(
+        wantsMetadata: Bool,
+        stationName: String
+    ) -> String {
+        if wantsMetadata {
+            return """
+            HTTP/1.1 200 OK\r
+            Content-Type: audio/aac\r
+            icy-metaint: \(ICYMetadata.blockInterval)\r
+            icy-name: \(stationName)\r
+            icy-genre: Johanssound Radio\r
+            Cache-Control: no-cache\r
+            Connection: close\r
+            Pragma: no-cache\r
+            \r
+
+            """
+        } else {
+            return """
+            HTTP/1.1 200 OK\r
+            Content-Type: audio/aac\r
+            Cache-Control: no-cache\r
+            Connection: close\r
+            Pragma: no-cache\r
+            \r
+
+            """
+        }
     }
 
     private static func readUntilHeaderEnd(
@@ -317,6 +435,11 @@ public final class RadioBroadcaster: ObservableObject {
             do {
                 try decoder.open(track)
                 log.info("decoding \(track.title, privacy: .public)")
+                // Publish the track so per-client serve loops pick it up
+                // in their next ICY metadata block.
+                if let owner {
+                    await MainActor.run { owner.updateCurrentTrack(track) }
+                }
             } catch {
                 log.error("open failed for \(track.title, privacy: .public): \(String(describing: error))")
                 trackIndex += 1
@@ -348,6 +471,9 @@ public final class RadioBroadcaster: ObservableObject {
         }
 
         decoder.close()
+        if let owner {
+            await MainActor.run { owner.updateCurrentTrack(nil) }
+        }
         log.info("encode loop exiting")
     }
 }

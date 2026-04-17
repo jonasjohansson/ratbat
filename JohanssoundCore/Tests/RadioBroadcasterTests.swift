@@ -1,4 +1,5 @@
 import XCTest
+import Network
 @testable import JohanssoundCore
 
 /// Spike-level tests for the Task 3.2 broadcast pipeline.
@@ -174,6 +175,188 @@ final class RadioBroadcasterTests: XCTestCase {
             // what we got.
         }
         return (data, response)
+    }
+
+    /// ICY handshake: client sends `Icy-MetaData: 1` and the response
+    /// must advertise `icy-metaint` + `icy-name`. We use a raw
+    /// Network.framework TCP connection rather than URLSession because
+    /// URLSession silently strips custom request headers AND obscures
+    /// non-standard response headers — exactly the bytes we need to
+    /// assert on.
+    @MainActor
+    func testBroadcastWithICYSendsMetaintHeader() async throws {
+        let bundle = Bundle(for: RadioBroadcasterTests.self)
+        guard let fixtureRoot = bundle.url(
+            forResource: "library",
+            withExtension: nil,
+            subdirectory: "Fixtures"
+        ) ?? bundle.resourceURL?
+            .appendingPathComponent("Fixtures/library") else {
+            throw XCTSkip("Fixtures missing")
+        }
+
+        let playlists = try await LibraryIndexer().scan(folder: fixtureRoot)
+        guard let tracks = playlists.first?.tracks, !tracks.isEmpty else {
+            throw XCTSkip("No fixture tracks")
+        }
+
+        let port: UInt16 = 18_018
+        let radio = RadioBroadcaster(port: port)
+        await radio.start(queue: tracks)
+        defer { radio.stop() }
+
+        // Let the listener come up and the encoder produce a few bytes.
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+
+        let responseText = try await Self.fetchRawResponse(
+            port: port,
+            requestHeaders: ["Icy-MetaData: 1"]
+        )
+        XCTAssertTrue(
+            responseText.contains("HTTP/1.1 200 OK"),
+            "No 200 in response: \(responseText)"
+        )
+        XCTAssertTrue(
+            responseText.lowercased().contains("icy-metaint: 16384"),
+            "Missing icy-metaint header: \(responseText)"
+        )
+        XCTAssertTrue(
+            responseText.lowercased().contains("icy-name: johanssound"),
+            "Missing icy-name header: \(responseText)"
+        )
+    }
+
+    /// Without the `Icy-MetaData: 1` header, the response MUST NOT
+    /// advertise `icy-metaint`. Existing clients that don't know ICY
+    /// keep getting pure AAC. Regression guard against accidentally
+    /// breaking VLC/ffprobe/browser playback for non-ICY callers.
+    @MainActor
+    func testBroadcastWithoutICYOmitsMetaintHeader() async throws {
+        let bundle = Bundle(for: RadioBroadcasterTests.self)
+        guard let fixtureRoot = bundle.url(
+            forResource: "library",
+            withExtension: nil,
+            subdirectory: "Fixtures"
+        ) ?? bundle.resourceURL?
+            .appendingPathComponent("Fixtures/library") else {
+            throw XCTSkip("Fixtures missing")
+        }
+
+        let playlists = try await LibraryIndexer().scan(folder: fixtureRoot)
+        guard let tracks = playlists.first?.tracks, !tracks.isEmpty else {
+            throw XCTSkip("No fixture tracks")
+        }
+
+        let port: UInt16 = 18_019
+        let radio = RadioBroadcaster(port: port)
+        await radio.start(queue: tracks)
+        defer { radio.stop() }
+
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+
+        let responseText = try await Self.fetchRawResponse(
+            port: port,
+            requestHeaders: []
+        )
+        XCTAssertTrue(
+            responseText.contains("HTTP/1.1 200 OK"),
+            "No 200 in response: \(responseText)"
+        )
+        XCTAssertFalse(
+            responseText.lowercased().contains("icy-metaint"),
+            "icy-metaint leaked to non-ICY client: \(responseText)"
+        )
+    }
+
+    /// Opens a raw TCP connection via Network.framework, writes a
+    /// handcrafted GET with the given extra headers, and returns the
+    /// response bytes (up to the end of the header block) decoded as
+    /// UTF-8. We go raw rather than through URLSession because
+    /// URLSession drops custom `Icy-*` request headers and hides
+    /// non-standard response headers.
+    nonisolated private static func fetchRawResponse(
+        port: UInt16,
+        requestHeaders: [String],
+        maxBytes: Int = 2_048
+    ) async throws -> String {
+        let connection = NWConnection(
+            host: NWEndpoint.Host("127.0.0.1"),
+            port: NWEndpoint.Port(rawValue: port)!,
+            using: .tcp
+        )
+        defer { connection.cancel() }
+
+        let readyLatch = OnceLatch()
+        let ready: Bool = await withCheckedContinuation { cont in
+            connection.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    if readyLatch.fire() { cont.resume(returning: true) }
+                case .failed, .cancelled:
+                    if readyLatch.fire() { cont.resume(returning: false) }
+                default:
+                    break
+                }
+            }
+            connection.start(queue: .global(qos: .userInitiated))
+        }
+        guard ready else { return "<<<connection not ready>>>" }
+
+        var request = "GET /stream.aac HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        for header in requestHeaders { request += "\(header)\r\n" }
+        request += "\r\n"
+
+        let sendLatch = OnceLatch()
+        let sent: Bool = await withCheckedContinuation { cont in
+            connection.send(
+                content: Data(request.utf8),
+                completion: .contentProcessed { err in
+                    if sendLatch.fire() { cont.resume(returning: err == nil) }
+                }
+            )
+        }
+        guard sent else { return "<<<send failed>>>" }
+
+        var accumulated = Data()
+        let deadline = Date().addingTimeInterval(4)
+        while accumulated.count < maxBytes, Date() < deadline {
+            let chunk: Data? = await withCheckedContinuation { cont in
+                connection.receive(
+                    minimumIncompleteLength: 1,
+                    maximumLength: 4_096
+                ) { data, _, _, _ in
+                    cont.resume(returning: data)
+                }
+            }
+            if let chunk, !chunk.isEmpty {
+                accumulated.append(chunk)
+                // Header block ended? Still grab a bit more so the body
+                // start (ADTS sync or ICY meta byte) is available if we
+                // ever want to peek at it.
+                if accumulated.range(of: Data("\r\n\r\n".utf8)) != nil {
+                    break
+                }
+            } else {
+                // Spurious wake-up or peer closed — try once more with
+                // a tiny delay, then give up.
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+        }
+        return String(data: accumulated, encoding: .utf8) ?? ""
+    }
+
+    /// One-shot gate for Sendable closures that may fire more than once.
+    /// Swift 6 won't let us capture a mutable `var` flag in `@Sendable`
+    /// context, so we wrap `NSLock`-guarded state in a reference type.
+    private final class OnceLatch: @unchecked Sendable {
+        private let lock = NSLock()
+        private var fired = false
+        func fire() -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            if fired { return false }
+            fired = true
+            return true
+        }
     }
 
     func testAACRingBufferOverflowBumpsCursor() async {

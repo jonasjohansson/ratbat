@@ -129,7 +129,13 @@ public struct RootView: View {
     private var broadcastHelpText: String {
         if radio.isBroadcasting {
             let url = radio.currentURL?.absoluteString ?? "?"
-            return "Broadcasting at \(url) — listeners: \(radio.listenerCount). Click to stop."
+            var parts = ["Broadcasting at \(url)"]
+            if let track = radio.currentlyBroadcastingTrack {
+                parts.append("Now: \(track.artist) — \(track.title)")
+            }
+            parts.append("Listeners: \(radio.listenerCount)")
+            parts.append("Click to stop.")
+            return parts.joined(separator: " · ")
         } else if stations.activeStation != nil {
             return "Broadcast active station"
         } else {
