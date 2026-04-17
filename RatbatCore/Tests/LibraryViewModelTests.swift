@@ -67,6 +67,30 @@ final class LibraryViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testSelectedTrackPublishes() async {
+        // Guard the Inspector's data source: `selectedTrack` starts nil,
+        // assignment sticks, and the round-tripped id matches. The view
+        // layer (Inspector pane) is hard to unit-test, so we verify the
+        // contract at the VM boundary instead.
+        let vm = LibraryViewModel()
+        XCTAssertNil(vm.selectedTrack)
+        XCTAssertFalse(vm.isInspectorOpen)
+
+        let track = Track(
+            url: URL(fileURLWithPath: "/x.m4a"),
+            title: "T",
+            artist: "A",
+            album: "L",
+            duration: 100
+        )
+        vm.selectedTrack = track
+        XCTAssertEqual(vm.selectedTrack?.id, track.id)
+
+        vm.isInspectorOpen = true
+        XCTAssertTrue(vm.isInspectorOpen)
+    }
+
+    @MainActor
     func testSecondLoadHitsCache() async throws {
         // First load does a real scan and (best-effort) writes a cache.
         // If the bundle resources directory is read-only, the cache write

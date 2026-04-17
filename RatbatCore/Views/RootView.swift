@@ -62,9 +62,25 @@ public struct RootView: View {
                     } detail: {
                         detailView
                     }
+                    .inspector(isPresented: $libraryVM.isInspectorOpen) {
+                        TrackInspectorView(track: libraryVM.selectedTrack) { track in
+                            // Play just the inspected track — the Inspector
+                            // button is a scoped "play this one thing" action
+                            // rather than the full-playlist queue semantics
+                            // of LibraryView's own play path.
+                            player.play(queue: [track], startingAt: 0)
+                        }
+                        .inspectorColumnWidth(min: 240, ideal: 300, max: 500)
+                    }
                     .toolbar {
                         ToolbarItem(placement: .primaryAction) {
+                            qualityMenu
+                        }
+                        ToolbarItem(placement: .primaryAction) {
                             broadcastButton
+                        }
+                        ToolbarItem(placement: .primaryAction) {
+                            inspectorToggle
                         }
                     }
                     .task(id: folder) {
@@ -141,6 +157,34 @@ public struct RootView: View {
         }
     }
 
+    /// Toolbar Picker surfacing the broadcast quality in the main window
+    /// so users don't need to dig into Preferences (⌘,) to switch bitrate.
+    /// Changes still only take effect at next broadcast start — the
+    /// `needsRestart` banner handles that messaging.
+    @ViewBuilder private var qualityMenu: some View {
+        Picker("Quality", selection: $preferences.quality) {
+            ForEach(AudioQuality.allCases, id: \.self) { quality in
+                Text(quality.label).tag(quality)
+            }
+        }
+        .pickerStyle(.menu)
+        .help("Broadcast quality · Set in Preferences (⌘,) for more options")
+    }
+
+    /// Toolbar button that toggles the right-side Inspector pane. Bound to
+    /// `libraryVM.isInspectorOpen` so context-menu "Get Info" and the
+    /// toolbar share a single source of truth. ⌘I matches the Finder /
+    /// Music.app convention for opening an info panel.
+    @ViewBuilder private var inspectorToggle: some View {
+        Button {
+            libraryVM.isInspectorOpen.toggle()
+        } label: {
+            Image(systemName: "info.circle")
+        }
+        .keyboardShortcut("i", modifiers: .command)
+        .help(libraryVM.isInspectorOpen ? "Hide Info (⌘I)" : "Show Info (⌘I)")
+    }
+
     /// Toolbar button that broadcasts the currently-selected station.
     /// Task 3.5: the toolbar is now context-sensitive to the sidebar
     /// selection — pick a station, click the antenna, it goes live (or
@@ -187,7 +231,6 @@ public struct RootView: View {
             if let track = radio.currentTrackByStation[station.id] {
                 parts.append("Now: \(track.artist) — \(track.title)")
             }
-            parts.append("Listeners: \(radio.listenerCount[station.id] ?? 0)")
             parts.append("Click to stop.")
             return parts.joined(separator: " · ")
         } else {
@@ -237,6 +280,11 @@ public struct RootView: View {
                 // full list rather than bouncing on a one-track queue.
                 player.play(queue: tracks, startingAt: startIndex)
             }
+            // LibraryView reads the shared view model off the environment
+            // to mirror its row selection onto `selectedTrack` and to
+            // raise the Inspector from its context menu. We always inject
+            // the same VM instance the rest of RootView already drives.
+            .environmentObject(libraryVM)
         } else {
             Text("Select a playlist")
                 .foregroundStyle(.secondary)

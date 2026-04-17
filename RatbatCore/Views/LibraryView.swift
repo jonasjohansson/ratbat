@@ -129,6 +129,13 @@ public struct LibraryView: View {
     public let playlist: Playlist
     public let onPlay: ([Track], Int) -> Void
 
+    /// The LibraryView owns the List selection locally (arrow keys,
+    /// single-click highlight) but mirrors the picked track onto the
+    /// view model so the Inspector pane and any other sibling UI can
+    /// observe the same selection. See the `.onChange(of: selectedID)`
+    /// below.
+    @EnvironmentObject private var vm: LibraryViewModel
+
     @State private var selectedID: Track.ID?
     @State private var searchText: String = ""
     @State private var sortColumn: TrackColumn = .title
@@ -252,6 +259,17 @@ public struct LibraryView: View {
                                 .contextMenu {
                                     Button("Play") { play(track) }
                                     Button("Show in Finder") { showInFinder(track) }
+                                    Divider()
+                                    Button("Get Info") {
+                                        // Surfaces the Inspector pane on
+                                        // macOS. On iOS the VM property is
+                                        // still there but harmlessly unused
+                                        // (LibraryView also isn't used
+                                        // there today).
+                                        selectedID = track.id
+                                        vm.selectedTrack = track
+                                        vm.isInspectorOpen = true
+                                    }
                                 }
                                 .tag(track.id)
                         }
@@ -276,6 +294,19 @@ public struct LibraryView: View {
         }
         .navigationTitle(playlist.name)
         .searchable(text: $searchText, placement: .toolbar, prompt: "Filter tracks")
+        // Mirror row selection onto the view model so sibling UI — the
+        // macOS Inspector pane, or any future panel keyed on the current
+        // track — observes the same pick. We check both the visible
+        // (filtered + sorted) list and the full playlist so selection made
+        // via arrow keys or the context menu always resolves.
+        .onChange(of: selectedID) { _, newID in
+            guard let id = newID else {
+                vm.selectedTrack = nil
+                return
+            }
+            vm.selectedTrack = visibleTracks.first(where: { $0.id == id })
+                ?? playlist.tracks.first(where: { $0.id == id })
+        }
     }
 
     /// Builds a single clickable header cell. Widths come from

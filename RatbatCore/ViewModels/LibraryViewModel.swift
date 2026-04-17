@@ -29,6 +29,17 @@ public final class LibraryViewModel: ObservableObject {
     @Published public var selectedPlaylistID: Playlist.ID?
     @Published public private(set) var isLoading = false
     @Published public private(set) var error: String?
+    /// The track currently highlighted in the detail list. Lifted out of
+    /// ``LibraryView``'s private `@State` so sibling UI — notably the
+    /// Inspector pane on macOS — can render metadata for the same selection.
+    /// `LibraryView` still owns the mechanics (List selection, arrow keys,
+    /// double-click to play); it just mirrors the picked track here whenever
+    /// the row selection changes.
+    @Published public var selectedTrack: Track?
+    /// Whether the macOS Inspector pane is open. Published so both the
+    /// toolbar button (toggle) and the context-menu "Get Info" action can
+    /// drive the same `.inspector(isPresented:)` binding on `RootView`.
+    @Published public var isInspectorOpen: Bool = false
     /// Current scan phase, published during a scan. Nil at rest and while a
     /// cache hit short-circuits the scan — cache loads are instant, so
     /// there's nothing to report. The UI switches the caption based on the
