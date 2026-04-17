@@ -39,6 +39,9 @@ targets:
       - path: Vendor/cloudflared/cloudflared
         type: file
         buildPhase: resources
+      - path: Vendor/spotify-downloader-bundle
+        type: folder
+        buildPhase: resources
     dependencies:
       - target: RatbatCore_macOS
         link: true
