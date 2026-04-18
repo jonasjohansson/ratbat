@@ -6,10 +6,13 @@ import OSLog
 /// playable, cached tracks — the Last.fm counterpart to
 /// ``NTSStationController``.
 ///
-/// Glue between four actors:
+/// Glue between five actors:
 /// - ``LastFMClient`` supplies the raw candidate pool via
 ///   `tag.getTopTracks` and the per-artist top-tag list used by the
 ///   precision filter.
+/// - ``MusicBrainzClient`` supplies authoritative release-year + country
+///   metadata, used to enforce the era and region facets in the shared
+///   ``FacetedPipeline`` stages.
 /// - ``HistoryStore`` provides per-station dedup (don't replay a track
 ///   on the same station) + the skip blacklist.
 /// - ``TrackResolver`` turns `(artist, title)` into a cached audio file
@@ -22,12 +25,17 @@ import OSLog
 /// next unseen candidate, resolves it, records the play, and returns a
 /// ``ResolvedTrack`` the broadcaster can hand to its decoder.
 ///
-/// The pool is refilled from Last.fm with a five-stage pipeline: raw
-/// fetch → tag-mode union/intersection → popularity tier → library +
-/// blacklist exclusions → precision verification → taste scoring →
-/// wildcard reservation. Each stage logs the surviving candidate count
-/// so a suspicious drop (e.g. precision=strict knocking out the whole
-/// pool) is obvious in OSLog.
+/// The pool is refilled from Last.fm with a nine-stage pipeline: per-tag
+/// seed fetch → tag-mode union/intersection → popularity tier → library
+/// + blacklist exclusions → precision verification → MB era filter →
+/// MB region filter → taste scoring + skip blacklist → wildcard
+/// reservation. Post-fetch stages 2, 4, 6, 7 live in ``FacetedPipeline``
+/// (shared with Bandcamp); stages 3, 5, 8, 9 stay here because they rely
+/// on Last.fm-specific signals (listener counts, `artist.getTopTags`,
+/// taste scoring, wildcard shuffle).
+///
+/// Each stage logs surviving cardinality so a suspicious drop (e.g. MB
+/// era filter knocking the pool to zero) is obvious in OSLog.
 public actor LastFMStationController {
 
     public struct ResolvedTrack: Sendable {
@@ -46,12 +54,13 @@ public actor LastFMStationController {
 
     private let config: LastFMStationConfig
     private let client: LastFMClient
+    private let musicBrainz: MusicBrainzClient
     private let history: HistoryStore
     private let resolver: TrackResolver
     private let tasteProfile: TasteProfile
     private let logger = Logger(subsystem: "se.jonasjohansson.ratbat", category: "lastfm-station")
 
-    private var pool: [LastFMClient.TrackCandidate] = []
+    private var pool: [SourceCandidate] = []
     private var cursor: Int = 0
 
     /// Reservation ratio: what fraction of the pool is unscored wildcards
@@ -62,12 +71,14 @@ public actor LastFMStationController {
     public init(
         config: LastFMStationConfig,
         client: LastFMClient,
+        musicBrainz: MusicBrainzClient,
         history: HistoryStore,
         resolver: TrackResolver,
         tasteProfile: TasteProfile
     ) {
         self.config = config
         self.client = client
+        self.musicBrainz = musicBrainz
         self.history = history
         self.resolver = resolver
         self.tasteProfile = tasteProfile
@@ -149,42 +160,71 @@ public actor LastFMStationController {
     /// (20%) so the station doesn't converge to a predictable handful
     /// of "best scored" tracks.
     private func refillPool() async throws {
-        // Stage 1: raw fetch per configured tag. Aggregated into a
-        // `tagHits` map so tag-mode union/intersection is one scan.
-        var tagHits: [DedupKey: TagHitRecord] = [:]
+        // Stage 1: raw per-tag fetch. Collect `(SourceCandidate, matchedTags)`
+        // tuples directly so stage 2 can be a single call into the pipeline.
+        // The per-DedupKey merge folds multi-tag hits together before we
+        // hand them off — stage 2's `.all` mode needs a single candidate
+        // with the combined tag set, not N copies.
+        struct SeedRecord {
+            var candidate: SourceCandidate
+            var matchedTags: Set<String>
+        }
+        var seeds: [DedupKey: SeedRecord] = [:]
         for tag in config.query.genreTags {
             do {
                 let tracks = try await client.topTracks(forTag: tag, limit: 200)
                 for t in tracks {
                     let key = DedupKey(artist: t.artist.lowercased(), title: t.title.lowercased())
-                    var hit = tagHits[key] ?? TagHitRecord(candidate: t, matchedTags: [])
-                    hit.matchedTags.insert(tag.lowercased())
-                    tagHits[key] = hit
+                    let tagLower = tag.lowercased()
+                    if var existing = seeds[key] {
+                        existing.matchedTags.insert(tagLower)
+                        // Keep the already-stored candidate but layer the
+                        // freshly matched tag in.
+                        existing.candidate = SourceCandidate(
+                            artist: existing.candidate.artist,
+                            title: existing.candidate.title,
+                            resolvedURL: existing.candidate.resolvedURL,
+                            listenersHint: existing.candidate.listenersHint,
+                            matchedTags: existing.matchedTags
+                        )
+                        seeds[key] = existing
+                    } else {
+                        let matched: Set<String> = [tagLower]
+                        let cand = SourceCandidate(
+                            artist: t.artist,
+                            title: t.title,
+                            resolvedURL: nil,
+                            listenersHint: t.listeners,
+                            matchedTags: matched
+                        )
+                        seeds[key] = SeedRecord(candidate: cand, matchedTags: matched)
+                    }
                 }
             } catch {
                 logger.info("topTracks fetch failed for tag \(tag, privacy: .public): \(String(describing: error), privacy: .public)")
             }
         }
 
-        if tagHits.isEmpty {
+        if seeds.isEmpty {
             throw Error.noTracksForTags(config.query.genreTags)
         }
+        logger.info("stage1 fetch: \(seeds.count) seed candidates across \(self.config.query.genreTags.count) tag(s)")
 
-        // Stage 2: tag mode (union / intersection).
+        // Stage 2: tag mode (union / intersection) via the shared pipeline.
         let requiredTags = Set(config.query.genreTags.map { $0.lowercased() })
-        var candidates: [LastFMClient.TrackCandidate] = tagHits.values.compactMap { hit in
-            switch config.query.tagMatch {
-            case .any:
-                return hit.candidate
-            case .all:
-                return hit.matchedTags.isSuperset(of: requiredTags) ? hit.candidate : nil
-            }
-        }
+        let tagModeInput: [(SourceCandidate, Set<String>)] = seeds.values.map { ($0.candidate, $0.matchedTags) }
+        var candidates: [SourceCandidate] = FacetedPipeline.applyTagMode(
+            tagModeInput,
+            required: requiredTags,
+            mode: config.query.tagMatch
+        )
         logger.info("stage2 tag mode: \(candidates.count) candidates remain")
 
         // Stage 3: popularity tier split by listener count. Sort desc,
-        // then pick the slice that matches the configured tier.
-        candidates.sort { $0.listeners > $1.listeners }
+        // then pick the slice that matches the configured tier. Last.fm-
+        // specific — Bandcamp has no listener count so this stage doesn't
+        // live in the shared pipeline.
+        candidates.sort { ($0.listenersHint ?? 0) > ($1.listenersHint ?? 0) }
         let total = candidates.count
         if total > 0 {
             let topCut = max(1, total / 10)           // top 10%
@@ -200,32 +240,30 @@ public actor LastFMStationController {
         }
         logger.info("stage3 popularity \(String(describing: self.config.query.popularity), privacy: .public): \(candidates.count) candidates remain")
 
-        // Stage 4: library + artist exclusions.
-        if config.query.excludeOwnedLibrary {
-            var filtered: [LastFMClient.TrackCandidate] = []
-            for c in candidates {
-                let owned = await tasteProfile.libraryContainsArtist(c.artist)
-                if !owned { filtered.append(c) }
-            }
-            candidates = filtered
-        }
-        if !config.query.excludedArtists.isEmpty {
-            let excluded = Set(config.query.excludedArtists.map { $0.lowercased() })
-            candidates = candidates.filter { !excluded.contains($0.artist.lowercased()) }
-        }
+        // Stage 4: library + artist exclusions via the shared pipeline.
+        // Runs BEFORE the MB-expensive filters so we don't spend HTTP
+        // budget on candidates we're about to drop anyway.
+        candidates = await FacetedPipeline.applyExclusions(
+            candidates,
+            excludedArtists: config.query.excludedArtists,
+            excludeOwnedLibrary: config.query.excludeOwnedLibrary,
+            tasteProfile: tasteProfile
+        )
         logger.info("stage4 exclusions: \(candidates.count) candidates remain")
 
         // Stage 5: precision verification — artist's top-5 tags must
-        // include at least one of the query tags. One API call per
-        // unique artist; cached in `LastFMClient`. The old off/verified/
-        // strict knob was dropped in the faceted migration; Task 6 will
-        // formalize precision handling, but for now we always run the
-        // verified-equivalent check since it's cheap and catches the
-        // noisy-tag-contamination bug the feature was introduced for.
+        // include at least one of the QUERY tags (not a mixed bag that
+        // could include decades or regions — that's the Exaltasamba bug
+        // the facet split was designed to eliminate). One API call per
+        // unique artist; cached in `LastFMClient`. Always runs top-5
+        // verified now that the user-facing `.off` knob is gone.
+        //
+        // Stays in the controller because it's Last.fm-specific — the
+        // Bandcamp pipeline has no equivalent top-tags endpoint.
         if !candidates.isEmpty {
             let topN = 5
             let queryTagsLower = requiredTags
-            var verified: [LastFMClient.TrackCandidate] = []
+            var verified: [SourceCandidate] = []
             for c in candidates {
                 do {
                     let tags = try await client.artistTopTags(c.artist)
@@ -246,13 +284,35 @@ public actor LastFMStationController {
         }
         logger.info("stage5 precision: \(candidates.count) candidates remain")
 
-        // Stage 6: skip blacklist + taste scoring. Drop negative-scored
-        // (skipped) candidates and sort the rest high→low.
-        var scored: [(cand: LastFMClient.TrackCandidate, score: Double)] = []
+        // Stage 6: MB era filter — enforce `config.query.yearMin/yearMax`
+        // via the shared pipeline. Fail-open for unknown MB entries.
+        candidates = await FacetedPipeline.applyEraFilter(
+            candidates,
+            yearMin: config.query.yearMin,
+            yearMax: config.query.yearMax,
+            mb: musicBrainz
+        )
+        logger.info("stage6 era: \(candidates.count) candidates remain")
+
+        // Stage 7: MB region filter — enforce `config.query.regions` via
+        // the shared pipeline. Also fail-open; one MB call per unique
+        // artist courtesy of the pipeline's internal cache.
+        candidates = await FacetedPipeline.applyRegionFilter(
+            candidates,
+            regions: config.query.regions,
+            mb: musicBrainz
+        )
+        logger.info("stage7 region: \(candidates.count) candidates remain")
+
+        // Stage 8: skip blacklist + taste scoring. Drop negative-scored
+        // (skipped) candidates and sort the rest high→low. Reads matched
+        // tags directly from the candidate — no side-table lookup needed
+        // now that tags ride along with the SourceCandidate.
+        var scored: [(cand: SourceCandidate, score: Double)] = []
         for c in candidates {
             let s = await tasteProfile.score(
                 candidateArtist: c.artist,
-                candidateTags: Array(tagHits[DedupKey(artist: c.artist.lowercased(), title: c.title.lowercased())]?.matchedTags ?? []),
+                candidateTags: Array(c.matchedTags),
                 stationID: config.id,
                 history: history
             )
@@ -260,7 +320,7 @@ public actor LastFMStationController {
             scored.append((c, s))
         }
         scored.sort { $0.score > $1.score }
-        logger.info("stage6 scored: \(scored.count) candidates ranked")
+        logger.info("stage8 scored: \(scored.count) candidates ranked")
 
         if scored.isEmpty {
             pool = []
@@ -268,7 +328,7 @@ public actor LastFMStationController {
             throw Error.noTracksForTags(config.query.genreTags)
         }
 
-        // Stage 7: wildcard reservation. Split the survivors: top (1 -
+        // Stage 9: wildcard reservation. Split the survivors: top (1 -
         // wildcardFraction) by score, then (wildcardFraction) random
         // picks from the rest. Shuffle each half and interleave so the
         // encode loop sees rotating variety instead of a ranked block.
@@ -285,15 +345,10 @@ public actor LastFMStationController {
             pool = softShuffle(pool, window: 4)
         }
         cursor = 0
-        logger.info("pool ready: \(self.pool.count) candidates (wildcards: \(wildcardCount))")
+        logger.info("stage9 pool ready: \(self.pool.count) candidates (wildcards: \(wildcardCount))")
     }
 
     // MARK: - Helpers
-
-    private struct TagHitRecord {
-        let candidate: LastFMClient.TrackCandidate
-        var matchedTags: Set<String>   // lowercased tag names
-    }
 
     private struct DedupKey: Hashable {
         let artist: String

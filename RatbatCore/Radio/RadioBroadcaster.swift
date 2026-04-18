@@ -96,6 +96,12 @@ public final class RadioBroadcaster: ObservableObject {
     /// scores, which degrades to near-random selection rather than
     /// crashing.
     private let tasteProfile: TasteProfile?
+    /// Long-lived MusicBrainz client shared across every Last.fm /
+    /// Bandcamp station so the per-artist / per-recording caches
+    /// accumulate across pool refills and across stations. Constructed
+    /// lazily the first time a generative station spins up — tests that
+    /// never hit MB pay nothing.
+    private var musicBrainz: MusicBrainzClient?
     #endif
 
     // MARK: - Internals
@@ -155,6 +161,7 @@ public final class RadioBroadcaster: ObservableObject {
         self.history = nil
         self.libraryConfig = nil
         self.tasteProfile = nil
+        self.musicBrainz = nil
         #endif
         subscribeToPreferences()
     }
@@ -183,6 +190,7 @@ public final class RadioBroadcaster: ObservableObject {
         self.history = history
         self.libraryConfig = libraryConfig
         self.tasteProfile = tasteProfile
+        self.musicBrainz = nil
         subscribeToPreferences()
     }
     #else
@@ -367,9 +375,23 @@ public final class RadioBroadcaster: ObservableObject {
         // still narrows via filters, it just loses the "you'd probably
         // like this" boost.
         let profile = tasteProfile ?? TasteProfile()
+        // Lazily construct the MusicBrainz client the first time a
+        // generative station needs it, then keep it around — its
+        // in-memory caches matter and MB's 1 req/sec budget is
+        // per-process, not per-client. The UA string is hard-coded to
+        // the real app's identity so MB's abuse-tracking has one
+        // consistent actor to rate-limit, not one per user.
+        let mb: MusicBrainzClient
+        if let existing = musicBrainz {
+            mb = existing
+        } else {
+            mb = MusicBrainzClient(userAgent: "Ratbat/1.0 (jns.johansson@gmail.com)")
+            musicBrainz = mb
+        }
         let controller = LastFMStationController(
             config: config,
             client: client,
+            musicBrainz: mb,
             history: history,
             resolver: resolver,
             tasteProfile: profile
