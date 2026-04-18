@@ -5,16 +5,16 @@ import SwiftUI
 ///
 /// Mirrors ``AddNTSStationView`` in shape so the two sources feel like
 /// siblings in the UI: pick a name, pick at least one tag, optionally
-/// constrain year. The created station is persisted via
+/// constrain era/region. The created station is persisted via
 /// ``StationManager/createLastFM(_:)`` and appears in the sidebar.
 /// First-track resolution happens later, the first time the user clicks
 /// broadcast — creation itself makes no network calls.
 ///
-/// v1 scope: a curated popular-tag picker + optional year-range filter
-/// (range is stored but not enforced yet — Last.fm's `tag.getTopTracks`
-/// doesn't surface per-track year, and MusicBrainz cross-referencing is
-/// deferred). Tag entry is pick-from-list only; free-text tags are
-/// out-of-scope for the first pass.
+/// The genre / era / region facets are delegated to the shared
+/// ``FacetedQueryEditor`` subview so all source sheets expose the same
+/// vocabulary. Last.fm-specific controls (tag mode, popularity tier,
+/// "exclude my library" toggle) live in a collapsed `DisclosureGroup`
+/// below the editor.
 ///
 /// Also surfaces the Last.fm API key field when the user hasn't pasted
 /// one yet. Once saved in preferences, subsequent visits hide it.
@@ -24,23 +24,19 @@ public struct AddLastFMStationView: View {
     @ObservedObject public var preferences: BroadcastPreferences
 
     @State private var name: String = ""
-    @State private var selectedTags: Set<String> = []
-    @State private var yearMinString: String = ""
-    @State private var yearMaxString: String = ""
     @State private var apiKeyDraft: String = ""
 
-    // Filter suite — defaults mirror FacetedQuery's defaults so
-    // "just click Create" yields the same pool shape as pre-filter-UI.
-    // Precision UI was removed as part of the faceted migration;
-    // LastFMStationController hard-codes .verified behavior for now —
-    // Task 6 will formalize this.
-    @State private var tagMode: TagMatch = .any
-    @State private var popularity: PopularityTier = .middle
-    @State private var excludeOwnedLibrary: Bool = false
+    /// All facet state lives in a single ``FacetedQuery`` value. Nested
+    /// bindings (`$query.tagMatch` etc.) work because `@State` wraps a
+    /// struct — SwiftUI re-renders whenever any field mutates. Defaults
+    /// come from `FacetedQuery`'s own init: `.any` tagMatch, `.middle`
+    /// popularity, `excludeOwnedLibrary = false`.
+    @State private var query = FacetedQuery(genreTags: [])
 
     /// Curated list of popular Last.fm tags. Ordered by rough popularity
     /// and clustered loosely by vibe so the picker reads as a genre
-    /// palette rather than an alphabetical phone book.
+    /// palette rather than an alphabetical phone book. Passed into the
+    /// shared ``FacetedQueryEditor`` as its `palette`.
     private static let availableTags: [String] = [
         "techno", "house", "deep house", "minimal",
         "ambient", "drone", "downtempo", "trip hop",
@@ -88,64 +84,24 @@ public struct AddLastFMStationView: View {
                     .textFieldStyle(.roundedBorder)
             }
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Tags (pick at least one)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                LazyVGrid(
-                    columns: [GridItem(.adaptive(minimum: 120), spacing: 4)],
-                    spacing: 4
-                ) {
-                    ForEach(Self.availableTags, id: \.self) { tag in
-                        Toggle(tag, isOn: Binding(
-                            get: { selectedTags.contains(tag) },
-                            set: { isOn in
-                                if isOn {
-                                    selectedTags.insert(tag)
-                                } else {
-                                    selectedTags.remove(tag)
-                                }
-                            }
-                        ))
-                        .toggleStyle(.button)
-                        .controlSize(.small)
-                    }
-                }
-                .frame(maxHeight: 240)
-            }
+            FacetedQueryEditor(query: $query, palette: Self.availableTags)
 
-            DisclosureGroup("Filters") {
+            DisclosureGroup("Last.fm filters") {
                 VStack(alignment: .leading, spacing: 10) {
-                    Picker("Tag mode", selection: $tagMode) {
+                    Picker("Tag mode", selection: $query.tagMatch) {
                         Text("Any tag matches (broad)").tag(TagMatch.any)
                         Text("All tags must match (narrow)").tag(TagMatch.all)
                     }
                     .pickerStyle(.segmented)
 
-                    Picker("Popularity", selection: $popularity) {
+                    Picker("Popularity", selection: $query.popularity) {
                         Text("Hits — top 10%").tag(PopularityTier.hits)
                         Text("Middle — 10–50%").tag(PopularityTier.middle)
                         Text("Deep cuts — bottom 50%").tag(PopularityTier.deepCuts)
                     }
                     .pickerStyle(.menu)
 
-                    Toggle("Only surprise me — exclude my library", isOn: $excludeOwnedLibrary)
-
-                    HStack {
-                        Text("Year range (stored, not enforced):")
-                        TextField("1990", text: $yearMinString)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 70)
-                        Text("—")
-                        TextField("1994", text: $yearMaxString)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 70)
-                    }
-                    .font(.caption)
-
-                    Text("Tip: pair a genre tag with a decade tag like \"1990s\" — that's a cheap approximation of year filtering.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                    Toggle("Only surprise me — exclude my library", isOn: $query.excludeOwnedLibrary)
                 }
                 .padding(.top, 4)
             }
@@ -165,10 +121,10 @@ public struct AddLastFMStationView: View {
 
     /// Name + at least one tag required. If the user hasn't saved an API
     /// key yet, also require one in the draft field so the created
-    /// station can actually broadcast. Year fields remain optional.
+    /// station can actually broadcast. Era/region remain optional.
     private var canSubmit: Bool {
         let hasName = !name.trimmingCharacters(in: .whitespaces).isEmpty
-        let hasTag = !selectedTags.isEmpty
+        let hasTag = !query.genreTags.isEmpty
         let hasKey = !preferences.lastFMAPIKey.isEmpty
             || !apiKeyDraft.trimmingCharacters(in: .whitespaces).isEmpty
         return hasName && hasTag && hasKey
@@ -180,14 +136,6 @@ public struct AddLastFMStationView: View {
         if !trimmedKey.isEmpty {
             preferences.lastFMAPIKey = trimmedKey
         }
-        let query = FacetedQuery(
-            genreTags: Array(selectedTags),
-            yearMin: Int(yearMinString),
-            yearMax: Int(yearMaxString),
-            tagMatch: tagMode,
-            popularity: popularity,
-            excludeOwnedLibrary: excludeOwnedLibrary
-        )
         let config = LastFMStationConfig(name: trimmedName, query: query)
         stations.createLastFM(config)
         dismiss()
