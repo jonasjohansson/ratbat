@@ -272,7 +272,15 @@ public struct LibraryView: View {
                         ForEach(visibleTracks) { track in
                             TrackRow(track: track, columns: orderedVisibleColumns)
                                 .contentShape(Rectangle())
-                                .onTapGesture(count: 2) { play(track) }
+                                // `simultaneousGesture` — not `.onTapGesture` —
+                                // so the List's own single-click selection
+                                // handler still fires. A plain onTapGesture
+                                // here swallows some clicks depending on
+                                // where in the row you hit, leaving rows
+                                // that look selected-but-aren't.
+                                .simultaneousGesture(
+                                    TapGesture(count: 2).onEnded { play(track) }
+                                )
                                 .contextMenu {
                                     Button("Play") { play(track) }
                                     Button("Show in Finder") { showInFinder(track) }
