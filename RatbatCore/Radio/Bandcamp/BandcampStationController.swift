@@ -198,14 +198,22 @@ public actor BandcampStationController {
             var candidate: SourceCandidate
             var matchedTags: Set<String>
         }
-        var seeds: [DedupKey: SeedRecord] = [:]
+        // Use an array as source of truth + a companion dict for dedup
+        // lookups. `Dictionary.values` iteration order is non-deterministic
+        // (randomized hash seeding), which would reshuffle the temporal
+        // window on every refill when the user asked for `sort: .date,
+        // shufflePool: false` — the fix is to preserve first-insertion
+        // order so "newest first" stays deterministic.
+        var seeds: [SeedRecord] = []
+        var seedIndex: [DedupKey: Int] = [:]
         for tag in config.query.genreTags {
             do {
                 let releases = try await client.releases(forTag: tag, sort: config.sort)
+                let tagLower = tag.lowercased()
                 for r in releases {
                     let key = DedupKey(artist: r.artist.lowercased(), title: r.title.lowercased())
-                    let tagLower = tag.lowercased()
-                    if var existing = seeds[key] {
+                    if let idx = seedIndex[key] {
+                        var existing = seeds[idx]
                         existing.matchedTags.insert(tagLower)
                         existing.candidate = SourceCandidate(
                             artist: existing.candidate.artist,
@@ -214,7 +222,7 @@ public actor BandcampStationController {
                             listenersHint: existing.candidate.listenersHint,
                             matchedTags: existing.matchedTags
                         )
-                        seeds[key] = existing
+                        seeds[idx] = existing
                     } else {
                         let matched: Set<String> = [tagLower]
                         let cand = SourceCandidate(
@@ -224,7 +232,8 @@ public actor BandcampStationController {
                             listenersHint: nil,
                             matchedTags: matched
                         )
-                        seeds[key] = SeedRecord(candidate: cand, matchedTags: matched)
+                        seedIndex[key] = seeds.count
+                        seeds.append(SeedRecord(candidate: cand, matchedTags: matched))
                     }
                 }
             } catch {
@@ -239,7 +248,7 @@ public actor BandcampStationController {
 
         // Stage 2: tag mode (union / intersection) via the shared pipeline.
         let requiredTags = Set(config.query.genreTags.map { $0.lowercased() })
-        let tagModeInput: [(SourceCandidate, Set<String>)] = seeds.values.map { ($0.candidate, $0.matchedTags) }
+        let tagModeInput: [(SourceCandidate, Set<String>)] = seeds.map { ($0.candidate, $0.matchedTags) }
         var candidates: [SourceCandidate] = FacetedPipeline.applyTagMode(
             tagModeInput,
             required: requiredTags,

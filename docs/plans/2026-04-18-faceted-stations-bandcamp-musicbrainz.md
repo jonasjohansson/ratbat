@@ -1942,4 +1942,3 @@ When all tasks are done:
 - Label follow-list station kind (v2)
 - Unified "New Generative Station" sheet (revisit once UX settles)
 - Disk-persisted MusicBrainz cache (startup latency only)
-- Bandcamp taste-score integration (Task 9 skips taste scoring for v1)
