@@ -44,6 +44,7 @@ public struct RootView: View {
     @State private var showingAddDownload: Bool = false
     @State private var showingAddNTSStation: Bool = false
     @State private var showingAddLastFMStation: Bool = false
+    @State private var showingAddBandcampStation: Bool = false
     /// Owned by the view so it lives as long as the window does. Held as
     /// optional `@State` because we can't `@StateObject` a non-
     /// `ObservableObject`, and we want to construct it *after* `player`
@@ -121,6 +122,9 @@ public struct RootView: View {
                     }
                     .sheet(isPresented: $showingAddLastFMStation) {
                         AddLastFMStationView(stations: stations, preferences: preferences)
+                    }
+                    .sheet(isPresented: $showingAddBandcampStation) {
+                        AddBandcampStationView(stations: stations)
                     }
                     .task(id: folder) {
                         // Point the station manager at the new folder
@@ -236,7 +240,7 @@ public struct RootView: View {
     /// Toolbar menu for creating new stations. Playlist stations are
     /// created via the sidebar's right-click "Create Station from this"
     /// on any playlist row; this menu covers the generative kinds
-    /// (NTS / Last.fm) which need a config sheet.
+    /// (NTS / Last.fm / Bandcamp) which need a config sheet.
     @ViewBuilder private var newStationMenu: some View {
         Menu {
             Button("New NTS Station…") {
@@ -244,6 +248,9 @@ public struct RootView: View {
             }
             Button("New Last.fm Station…") {
                 showingAddLastFMStation = true
+            }
+            Button("New Bandcamp Station…") {
+                showingAddBandcampStation = true
             }
         } label: {
             Image(systemName: "plus.circle.dashed")

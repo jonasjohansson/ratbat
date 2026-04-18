@@ -125,6 +125,22 @@ public final class StationManager: ObservableObject {
         return station
     }
 
+    #if os(macOS)
+    /// Create a new Bandcamp-backed station from a config and persist
+    /// immediately. Same collision-handling as ``createNTS(_:)``.
+    /// macOS-only because ``BandcampStationConfig`` is gated behind the
+    /// same platform check.
+    @discardableResult
+    public func createBandcamp(_ config: BandcampStationConfig) -> Station {
+        var cfg = config
+        cfg.name = uniquifyName(cfg.name)
+        let station = Station.fromBandcamp(cfg)
+        stations.append(station)
+        persist()
+        return station
+    }
+    #endif
+
     /// Find a station whose ``Station/slug`` matches `slug`. Used by the
     /// HTTP router to map an incoming `/stream/{slug}.aac` request to a
     /// specific station's broadcast pipeline.
