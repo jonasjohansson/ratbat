@@ -72,7 +72,7 @@ public struct AddBandcampStationView: View {
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("Name").font(.caption).foregroundStyle(.secondary)
-                TextField("Dungeon Synth", text: $name)
+                TextField(query.suggestedName, text: $name)
                     .textFieldStyle(.roundedBorder)
             }
 
@@ -104,18 +104,18 @@ public struct AddBandcampStationView: View {
         .frame(width: 540)
     }
 
-    /// Name + at least one tag required. Era/region remain optional —
-    /// Bandcamp's tag feed is the mandatory seed; everything else
-    /// narrows an already-valid query.
+    /// At least one tag required — Bandcamp's tag feed is the mandatory
+    /// seed. Name is optional; when blank, `create()` falls back to
+    /// ``FacetedQuery/suggestedName``. Era/region remain optional
+    /// narrowing knobs.
     private var canSubmit: Bool {
-        let hasName = !name.trimmingCharacters(in: .whitespaces).isEmpty
-        let hasTag = !query.genreTags.isEmpty
-        return hasName && hasTag
+        !query.genreTags.isEmpty
     }
 
     private func create() {
         let trimmedName = name.trimmingCharacters(in: .whitespaces)
-        let config = BandcampStationConfig(name: trimmedName, query: query, sort: sort)
+        let finalName = trimmedName.isEmpty ? query.suggestedName : trimmedName
+        let config = BandcampStationConfig(name: finalName, query: query, sort: sort)
         stations.createBandcamp(config)
         dismiss()
     }

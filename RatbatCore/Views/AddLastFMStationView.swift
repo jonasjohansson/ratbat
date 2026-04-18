@@ -80,7 +80,7 @@ public struct AddLastFMStationView: View {
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("Name").font(.caption).foregroundStyle(.secondary)
-                TextField("90s Techno", text: $name)
+                TextField(query.suggestedName, text: $name)
                     .textFieldStyle(.roundedBorder)
             }
 
@@ -119,24 +119,26 @@ public struct AddLastFMStationView: View {
         .frame(width: 540)
     }
 
-    /// Name + at least one tag required. If the user hasn't saved an API
-    /// key yet, also require one in the draft field so the created
-    /// station can actually broadcast. Era/region remain optional.
+    /// At least one tag required. If the user hasn't saved an API key
+    /// yet, also require one in the draft field so the created station
+    /// can actually broadcast. Name is optional — when blank, `create()`
+    /// falls back to ``FacetedQuery/suggestedName``. Era/region remain
+    /// optional narrowing knobs.
     private var canSubmit: Bool {
-        let hasName = !name.trimmingCharacters(in: .whitespaces).isEmpty
         let hasTag = !query.genreTags.isEmpty
         let hasKey = !preferences.lastFMAPIKey.isEmpty
             || !apiKeyDraft.trimmingCharacters(in: .whitespaces).isEmpty
-        return hasName && hasTag && hasKey
+        return hasTag && hasKey
     }
 
     private func create() {
         let trimmedName = name.trimmingCharacters(in: .whitespaces)
+        let finalName = trimmedName.isEmpty ? query.suggestedName : trimmedName
         let trimmedKey = apiKeyDraft.trimmingCharacters(in: .whitespaces)
         if !trimmedKey.isEmpty {
             preferences.lastFMAPIKey = trimmedKey
         }
-        let config = LastFMStationConfig(name: trimmedName, query: query)
+        let config = LastFMStationConfig(name: finalName, query: query)
         stations.createLastFM(config)
         dismiss()
     }
