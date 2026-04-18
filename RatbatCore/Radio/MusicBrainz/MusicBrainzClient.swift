@@ -1,3 +1,4 @@
+#if os(macOS)
 import Foundation
 import OSLog
 
@@ -155,6 +156,11 @@ public actor MusicBrainzClient {
                 try await Task.sleep(nanoseconds: UInt64((minGap - elapsed) * 1_000_000_000))
             }
         }
+        // Reserve the slot BEFORE the await — pre-setting is deliberate, not a
+        // bug. Setting lastRequestAt after the response would let two concurrent
+        // tasks both read a stale gate and fire simultaneously, blowing the
+        // 1 req/sec cap. Response-relative pacing would be more precise but
+        // this is close enough at MB's <200ms typical response time.
         lastRequestAt = Date()
 
         var req = URLRequest(url: url)
@@ -167,3 +173,4 @@ public actor MusicBrainzClient {
         return data
     }
 }
+#endif
