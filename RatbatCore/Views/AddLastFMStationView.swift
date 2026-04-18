@@ -49,7 +49,7 @@ public struct AddLastFMStationView: View {
         "hip hop", "new wave", "post-punk",
         "indie", "shoegaze", "dream pop",
         "classical", "modern classical", "piano",
-        "1970s", "1980s", "1990s", "2000s"
+        "1970s", "1980s", "1990s", "2000s", "2010s", "2020s"
     ]
 
     public init(stations: StationManager, preferences: BroadcastPreferences) {
