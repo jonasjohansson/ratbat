@@ -1,0 +1,16 @@
+{
+  "created": "2026-04-18T00:00:00.000Z",
+  "count": 1,
+  "offset": 0,
+  "recordings": [
+    {
+      "id": "abc-123",
+      "score": 100,
+      "title": "Quero Sentir De Novo",
+      "first-release-date": "2003-05-14",
+      "artist-credit": [
+        { "artist": { "id": "artist-xyz", "name": "Exaltasamba" } }
+      ]
+    }
+  ]
+}

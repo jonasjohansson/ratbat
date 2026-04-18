@@ -1,0 +1,17 @@
+{
+  "created": "2026-04-18T00:00:00.000Z",
+  "count": 1,
+  "artists": [
+    {
+      "id": "artist-xyz",
+      "score": 100,
+      "name": "Exaltasamba",
+      "country": "BR",
+      "area": {
+        "id": "area-br",
+        "name": "Brazil",
+        "iso-3166-1-codes": ["BR"]
+      }
+    }
+  ]
+}
