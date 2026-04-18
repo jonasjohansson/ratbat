@@ -27,6 +27,33 @@ final class BandcampClientTests: XCTestCase {
         XCTAssertEqual(totalCount, 0)
     }
 
+    func testParseDiscoverPage_parsesReleaseDate() throws {
+        let data = try fixtureJSON("bandcamp-discover-techno")
+        let (releases, _) = BandcampClient.parseDiscoverPage(data: data)
+        XCTAssertNotNil(releases.first?.releaseDate, "releaseDate should parse from RFC 1123 format")
+        if let date = releases.first?.releaseDate {
+            let year = Calendar(identifier: .gregorian).component(.year, from: date)
+            XCTAssertGreaterThanOrEqual(year, 2020)
+            XCTAssertLessThanOrEqual(year, 2030)
+        }
+    }
+
+    func testParseDiscoverPage_trackItemUsesTrackPath() throws {
+        let data = try fixtureJSON("bandcamp-discover-synthetic")
+        let (releases, _) = BandcampClient.parseDiscoverPage(data: data)
+        let track = releases.first { $0.title == "Track Title" }
+        XCTAssertNotNil(track)
+        XCTAssertEqual(track?.releaseURL.absoluteString, "https://artistname.bandcamp.com/track/track-slug")
+    }
+
+    func testParseDiscoverPage_customDomainPreferredOverSubdomain() throws {
+        let data = try fixtureJSON("bandcamp-discover-synthetic")
+        let (releases, _) = BandcampClient.parseDiscoverPage(data: data)
+        let customDomain = releases.first { $0.title == "Custom Domain Album" }
+        XCTAssertNotNil(customDomain)
+        XCTAssertEqual(customDomain?.releaseURL.absoluteString, "https://records.example/album/custom-album")
+    }
+
     // MARK: - Helpers
 
     private func fixtureJSON(_ name: String) throws -> Data {

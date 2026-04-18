@@ -27,7 +27,6 @@ public actor BandcampClient {
 
     public enum Error: Swift.Error, Sendable {
         case badResponse(URL)
-        case parseFailed(URL)
     }
 
     /// User-facing sort. We deliberately avoid leaking the endpoint's
@@ -42,7 +41,7 @@ public actor BandcampClient {
     private static let apiBase = URL(string: "https://bandcamp.com/api/discover/3/get_web")!
     private let userAgent: String
     private let session: URLSession
-    private let logger = Logger(subsystem: "se.jonasjohansson.ratbat", category: "bandcamp")
+    private static let logger = Logger(subsystem: "se.jonasjohansson.ratbat", category: "bandcamp")
     private var lastRequestAt: Date?
 
     public init(userAgent: String, session: URLSession = .shared) {
@@ -80,11 +79,11 @@ public actor BandcampClient {
                 if pageReleases.count < 48 { break }
                 if (page + 1) * 48 >= totalCount { break }
             } catch {
-                logger.info("bandcamp tag \(tag, privacy: .public) page \(page): \(String(describing: error), privacy: .public)")
+                Self.logger.info("bandcamp tag \(tag, privacy: .public) page \(page): \(String(describing: error), privacy: .public)")
                 break
             }
         }
-        logger.info("bandcamp releases(tag: \(tag, privacy: .public)): \(all.count)")
+        Self.logger.info("bandcamp releases(tag: \(tag, privacy: .public)): \(all.count)")
         return all
     }
 
@@ -151,7 +150,7 @@ public actor BandcampClient {
                 let artist = item.secondaryText, !artist.isEmpty,
                 let hints = item.urlHints,
                 let slug = hints.slug, !slug.isEmpty,
-                let itemType = hints.itemType  // "a" (album) or "t" (track)
+                let itemType = hints.itemType, !itemType.isEmpty  // "a" (album) or "t" (track)
             else { return nil }
 
             // Build the release URL. Prefer custom domain; else subdomain.bandcamp.com.
@@ -168,6 +167,10 @@ public actor BandcampClient {
 
             let date: Date? = item.publishDate.flatMap { dateFormatter.date(from: $0) }
             return BandcampRelease(artist: artist, title: title, releaseURL: url, releaseDate: date)
+        }
+
+        if let rawCount = env.items?.count, releases.count < rawCount {
+            BandcampClient.logger.info("bandcamp parse: \(releases.count)/\(rawCount) items kept — possible partial schema drift")
         }
 
         return (releases, env.totalCount ?? 0)

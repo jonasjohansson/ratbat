@@ -1,0 +1,29 @@
+{
+  "items": [
+    {
+      "type": "t",
+      "primary_text": "Track Title",
+      "secondary_text": "Track Artist",
+      "publish_date": "1 Jan 2024 12:00:00 GMT",
+      "url_hints": {
+        "subdomain": "artistname",
+        "custom_domain": null,
+        "slug": "track-slug",
+        "item_type": "t"
+      }
+    },
+    {
+      "type": "a",
+      "primary_text": "Custom Domain Album",
+      "secondary_text": "Label Name",
+      "publish_date": "15 Mar 2025 08:30:00 GMT",
+      "url_hints": {
+        "subdomain": "labelname",
+        "custom_domain": "records.example",
+        "slug": "custom-album",
+        "item_type": "a"
+      }
+    }
+  ],
+  "total_count": 2
+}
