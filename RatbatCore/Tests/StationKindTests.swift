@@ -89,6 +89,15 @@ final class StationKindTests: XCTestCase {
         XCTAssertTrue(second.name.contains("(2)"))
     }
 
+    func testStationKind_bandcamp_roundTrips() throws {
+        let cfg = BandcampStationConfig(name: "X", query: FacetedQuery(genreTags: ["t"]))
+        let station = Station.fromBandcamp(cfg)
+        let data = try JSONEncoder().encode(station)
+        let decoded = try JSONDecoder().decode(Station.self, from: data)
+        XCTAssertEqual(decoded.bandcampConfig?.name, "X")
+        XCTAssertEqual(decoded.bandcampConfig?.query.genreTags, ["t"])
+    }
+
     /// A createNTS-authored station survives a save/load round-trip
     /// through ``StationStore`` — the Kind enum's `.nts` case must be
     /// covered by the file format's Codable schema.

@@ -319,6 +319,11 @@ public struct PlaylistsSidebarView: View {
             return isLive ? "waveform.circle.fill" : "waveform.circle"
         case .lastFM:
             return isLive ? "chart.bar.fill" : "chart.bar"
+        case .bandcamp:
+            // Placeholder icon — a dedicated Bandcamp glyph slots in once
+            // Task 9+ wires the controller through. `music.mic` reads as
+            // "curated discovery" distinct from Last.fm's chart bars.
+            return isLive ? "music.mic.circle.fill" : "music.mic"
         }
     }
 }

@@ -258,6 +258,14 @@ public final class RadioBroadcaster: ObservableObject {
             #else
             error = "Last.fm stations are macOS-only"
             #endif
+
+        #if os(macOS)
+        case .bandcamp:
+            // Wired up in Task 9 (BandcampStationController + BandcampSource).
+            // For now surface a clear error so the station row doesn't start
+            // broadcasting silently with no output.
+            error = "Bandcamp stations not yet supported (coming in Task 9)"
+        #endif
         }
     }
 

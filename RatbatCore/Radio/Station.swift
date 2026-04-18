@@ -2,18 +2,22 @@ import Foundation
 
 /// A radio station the broadcaster can serve.
 ///
-/// Three concrete kinds ship today:
+/// Four concrete kinds ship today:
 /// - ``Kind/playlist(queue:)`` — a pre-shuffled queue derived from a
 ///   user's library ``Playlist``.
 /// - ``Kind/nts(config:)`` — a generative, NTS-backed station driven by
 ///   an ``NTSStationConfig`` (tags + optional year range).
 /// - ``Kind/lastFM(config:)`` — a generative, Last.fm-backed station
 ///   driven by a ``LastFMStationConfig`` (tags + optional year range).
+/// - ``Kind/bandcamp(config:)`` — a generative, Bandcamp-backed station
+///   driven by a ``BandcampStationConfig`` (macOS-only; the scraping
+///   client that powers it is Foundation-heavy and guarded out on iOS).
 ///
 /// The `Kind` enum is the source-of-truth for where tracks come from;
 /// the old `seed: Seed` marker field has been retired. Convenience
-/// accessors (``queue``, ``ntsConfig``, ``lastFMConfig``) let existing
-/// call sites that only care about one variant keep working.
+/// accessors (``queue``, ``ntsConfig``, ``lastFMConfig``,
+/// ``bandcampConfig``) let existing call sites that only care about one
+/// variant keep working.
 ///
 /// `Sendable` + `Hashable` + `Identifiable` + `Codable` so stations
 /// compose with the rest of the library types (selection tags, cache,
@@ -25,8 +29,9 @@ public struct Station: Identifiable, Hashable, Sendable, Codable {
 
     /// Source-of-truth for where this station's tracks come from.
     /// Swift auto-synthesises Codable for enums with associated values
-    /// as long as every associated payload is Codable — all three
-    /// variants satisfy that.
+    /// as long as every associated payload is Codable — all four
+    /// variants satisfy that (the `.bandcamp` case is macOS-only; on iOS
+    /// the enum has only three variants, still all Codable).
     public enum Kind: Hashable, Sendable, Codable {
         /// Fixed, pre-shuffled queue. Replays the same tracks on every
         /// start — matches the pre-refactor behaviour.
@@ -39,6 +44,15 @@ public struct Station: Identifiable, Hashable, Sendable, Codable {
         /// config is the only persisted seed; controller + pool rebuild on
         /// every broadcast start.
         case lastFM(config: LastFMStationConfig)
+        #if os(macOS)
+        /// Generative Bandcamp-backed station. macOS-only because the
+        /// scraping client (``BandcampClient``) is Foundation-heavy and
+        /// not compiled on iOS — the associated config references
+        /// `BandcampClient.Sort` so this enum case has to follow the same
+        /// platform gate. Same lifecycle as Last.fm / NTS: config is the
+        /// persisted seed, controller + pool rebuild per broadcast start.
+        case bandcamp(config: BandcampStationConfig)
+        #endif
     }
 
     public init(id: UUID = UUID(), name: String, kind: Kind) {
@@ -70,6 +84,15 @@ public struct Station: Identifiable, Hashable, Sendable, Codable {
         return nil
     }
 
+    #if os(macOS)
+    /// Bandcamp config, or `nil` for non-Bandcamp stations. macOS-only,
+    /// mirroring the `.bandcamp` case's platform gate.
+    public var bandcampConfig: BandcampStationConfig? {
+        if case let .bandcamp(c) = kind { return c }
+        return nil
+    }
+    #endif
+
     // MARK: - Factories
 
     /// Build a station seeded from a playlist. Auto-names as
@@ -94,6 +117,15 @@ public struct Station: Identifiable, Hashable, Sendable, Codable {
     public static func fromLastFM(_ config: LastFMStationConfig) -> Station {
         Station(id: config.id, name: config.name, kind: .lastFM(config: config))
     }
+
+    #if os(macOS)
+    /// Build a station from a ``BandcampStationConfig``. Reuses the
+    /// config's `id` for history-dedup stability, same as NTS / Last.fm.
+    /// macOS-only to match ``Kind/bandcamp(config:)``'s gate.
+    public static func fromBandcamp(_ config: BandcampStationConfig) -> Station {
+        Station(id: config.id, name: config.name, kind: .bandcamp(config: config))
+    }
+    #endif
 
     // MARK: - Slug
 
