@@ -87,17 +87,43 @@ public actor NTSClient {
 
     /// Fetch shows currently matching a given tag (genre substring, case
     /// insensitive — e.g. `"ambient"` matches `"Ambient"`, `"Dark Ambient"`,
-    /// `"Ambient Techno"`). Returns up to `limit` shows.
+    /// `"Ambient Techno"`). Returns up to `limit` matching shows.
     ///
-    /// The NTS shows directory holds ~1700 entries. We scan the first page
-    /// only by default (up to 200 results per NTS page) which is enough to
-    /// seed a genre-curated station; heavier scans are left for a future
-    /// caller that wants deep lookup.
+    /// NTS's `/shows` endpoint hard-caps server responses at 12 items and
+    /// ignores the client-supplied `?limit=` parameter, so we paginate via
+    /// `?offset=` until we've collected `limit` matches or scanned a sane
+    /// cap of pages. Each offset page is cached by URL (6h TTL), so a cold
+    /// scan is a one-time cost — subsequent calls are effectively free.
+    ///
+    /// With the directory holding ~1700 shows and rare tags hitting a few
+    /// percent of them, the default 60-page ceiling scans ~720 shows: enough
+    /// to surface ~25-30 matches for common genres like jazz/techno/ambient.
     public func shows(forTag tag: String, limit: Int = 20) async throws -> [Show] {
-        let url = apiBase.appendingPathComponent("shows")
-            .appending(queryItems: [URLQueryItem(name: "limit", value: "200")])
-        let data = try await fetch(url)
-        return try parseShows(from: data, tag: tag, sourceURL: url).prefix(limit).map { $0 }
+        let pageSize = 12      // NTS server cap, ignores client `limit`
+        let maxPages = 60      // ~720 shows max — enough to surface 20+ matches for common tags
+        var collected: [Show] = []
+
+        for pageIndex in 0..<maxPages {
+            let offset = pageIndex * pageSize
+            let url = apiBase
+                .appendingPathComponent("shows")
+                .appending(queryItems: [URLQueryItem(name: "offset", value: "\(offset)")])
+            let data: Data
+            do {
+                data = try await fetch(url)
+            } catch {
+                logger.info("shows pagination stopped at offset \(offset): \(String(describing: error), privacy: .public)")
+                break
+            }
+            let page = try parseShowsPage(from: data, tag: tag, sourceURL: url)
+            collected.append(contentsOf: page.filtered)
+
+            if collected.count >= limit { break }
+            if page.rawCount == 0 { break }    // end of directory
+        }
+
+        logger.info("shows(forTag: \(tag, privacy: .public)) scanned, found \(collected.count) match(es)")
+        return Array(collected.prefix(limit))
     }
 
     /// Fetch the full tracklist for a given show URL.
@@ -132,6 +158,16 @@ public actor NTSClient {
     /// Parse the `/api/v2/shows` response. Filters results by tag substring
     /// (case-insensitive match against each show's `genres[].value`).
     internal func parseShows(from data: Data, tag: String, sourceURL: URL) throws -> [Show] {
+        try parseShowsPage(from: data, tag: tag, sourceURL: sourceURL).filtered
+    }
+
+    /// Like ``parseShows`` but also reports the raw (pre-filter) page size.
+    /// The pagination loop needs the raw count to know when it's hit the
+    /// end of the directory — a page that parses to 0 filtered shows could
+    /// either be "no matches in a full page" (keep going) or "directory
+    /// exhausted" (stop), and those cases are indistinguishable without
+    /// the raw count.
+    internal func parseShowsPage(from data: Data, tag: String, sourceURL: URL) throws -> (rawCount: Int, filtered: [Show]) {
         let needle = tag.lowercased()
         let envelope: ShowsEnvelope
         do {
@@ -139,7 +175,7 @@ public actor NTSClient {
         } catch {
             throw Error.malformed(sourceURL, reason: "shows envelope: \(error)")
         }
-        return envelope.results.compactMap { raw -> Show? in
+        let filtered = envelope.results.compactMap { raw -> Show? in
             let genreValues = (raw.genres ?? []).map { $0.value }
             guard genreValues.contains(where: { $0.lowercased().contains(needle) }) else {
                 return nil
@@ -156,6 +192,7 @@ public actor NTSClient {
                 tags: genreValues
             )
         }
+        return (envelope.results.count, filtered)
     }
 
     /// Parse `/api/v2/shows/<alias>/episodes/<ep>/tracklist` into

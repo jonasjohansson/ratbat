@@ -20,12 +20,39 @@ Exit codes:
     3 = download failure
 """
 import argparse
+import contextlib
+import io
 import json
 import os
+import shutil
 import sys
 
 from ytmusicapi import YTMusic
 from yt_dlp import YoutubeDL
+
+
+def _locate_ffmpeg() -> str | None:
+    """Return a directory containing `ffmpeg` + `ffprobe`, or None.
+
+    When Ratbat.app is launched from Dock/Finder/LaunchServices, macOS gives
+    it a minimal PATH that omits `/opt/homebrew/bin` and `/usr/local/bin`.
+    yt-dlp's post-processor then fails with "ffmpeg not found". We probe the
+    usual Homebrew/MacPorts locations ourselves and hand yt-dlp an explicit
+    path via its `ffmpeg_location` option.
+    """
+    candidates = [
+        "/opt/homebrew/bin",   # Apple Silicon Homebrew
+        "/usr/local/bin",      # Intel Homebrew / MacPorts
+        "/opt/local/bin",      # MacPorts alternate
+    ]
+    # Honor PATH first in case the user has a non-standard install.
+    shutil_which = shutil.which("ffmpeg")
+    if shutil_which:
+        return os.path.dirname(shutil_which)
+    for d in candidates:
+        if os.path.isfile(os.path.join(d, "ffmpeg")) and os.path.isfile(os.path.join(d, "ffprobe")):
+            return d
+    return None
 
 
 def best_match(artist: str, title: str) -> tuple[str, str]:
@@ -78,6 +105,10 @@ def download(yt_id: str, output: str) -> None:
         "outtmpl": tmpl_base,
         "quiet": True,
         "no_warnings": True,
+        # Belt-and-suspenders with `quiet`: some yt-dlp versions still emit
+        # progress-bar carriage-return lines to stdout even under `quiet`,
+        # which corrupts our JSON-on-stdout contract with Swift.
+        "noprogress": True,
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": "m4a"},
         ],
@@ -87,8 +118,17 @@ def download(yt_id: str, output: str) -> None:
         # lot on music.youtube.com; the android client is more reliable.
         "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
     }
-    with YoutubeDL(opts) as ydl:
-        ydl.download([url])
+    ffmpeg_dir = _locate_ffmpeg()
+    if ffmpeg_dir:
+        opts["ffmpeg_location"] = ffmpeg_dir
+    # Hard-redirect stdout around yt-dlp so anything else that slips past
+    # `quiet`/`noprogress` (e.g. ffmpeg post-processor chatter) can't
+    # corrupt the resolver's stdout contract. Captured text is dropped —
+    # real errors still surface via stderr and raised exceptions.
+    silenced = io.StringIO()
+    with contextlib.redirect_stdout(silenced):
+        with YoutubeDL(opts) as ydl:
+            ydl.download([url])
 
     produced = tmpl_base + ".m4a"
     if produced != output and os.path.exists(produced):
