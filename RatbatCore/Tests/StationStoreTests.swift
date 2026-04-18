@@ -88,12 +88,88 @@ final class StationStoreTests: XCTestCase {
         try Data("not json".utf8).write(to: url)
         XCTAssertThrowsError(try StationStore.load(from: tempRoot))
     }
+
+    /// A `.ratbat-stations.json` file shared across machines (e.g. via
+    /// Google Drive) may contain entries this build can't decode —
+    /// a `.bandcamp` station authored on macOS read by an iOS build,
+    /// or a future station kind seen by an older binary. Previously
+    /// those caused the whole decode to throw and the caller wiped the
+    /// entire station list. After the fix, each unreadable entry is
+    /// logged + skipped and the survivors come back intact.
+    func testLoadSkipsUndecodableStationEntries() throws {
+        // Encode two fully-valid playlist stations the normal way so we
+        // don't have to hand-craft the Swift-synthesised enum JSON.
+        let trackA = Track(
+            url: URL(fileURLWithPath: "/fake/a.m4a"),
+            title: "A",
+            artist: "ArtistA",
+            album: "AlbumA",
+            duration: 120
+        )
+        let trackB = Track(
+            url: URL(fileURLWithPath: "/fake/b.m4a"),
+            title: "B",
+            artist: "ArtistB",
+            album: "AlbumB",
+            duration: 180
+        )
+        let stationA = Station(name: "Alpha", kind: .playlist(queue: [trackA]))
+        let stationB = Station(name: "Beta", kind: .playlist(queue: [trackB]))
+
+        let encoder = JSONEncoder()
+        let dataA = try encoder.encode(stationA)
+        let dataB = try encoder.encode(stationB)
+        let objA = try JSONSerialization.jsonObject(with: dataA)
+        let objB = try JSONSerialization.jsonObject(with: dataB)
+
+        // Shove in two entries this build can't decode: an outright
+        // garbage blob, and an object pretending to be a station with
+        // an unknown kind. Swift synthesised enum coding keys the enum
+        // by variant name, so a made-up one won't match any case.
+        let garbage: [String: Any] = ["nope": "totally not a station"]
+        let unknownKind: [String: Any] = [
+            "id": UUID().uuidString,
+            "name": "From The Future",
+            "kind": ["futureKind": ["_0": ["foo": "bar"]]]
+        ]
+
+        let envelope: [String: Any] = [
+            "version": 1,
+            "stations": [objA, garbage, objB, unknownKind]
+        ]
+        let data = try JSONSerialization.data(withJSONObject: envelope)
+        let url = tempRoot.appendingPathComponent(".ratbat-stations.json")
+        try data.write(to: url)
+
+        let loaded = try StationStore.load(from: tempRoot)
+        XCTAssertEqual(loaded.count, 2, "Expected 2 decodable stations to survive; garbage + unknown-kind entries should be skipped.")
+        let names = Set(loaded.map(\.name))
+        XCTAssertEqual(names, ["Alpha", "Beta"])
+    }
+
+    /// Envelope itself is wrong — no `version` key at all — so we bail
+    /// with the dedicated corruptEnvelope error rather than silently
+    /// returning an empty list.
+    func testLoadRejectsEnvelopeMissingVersion() throws {
+        let url = tempRoot.appendingPathComponent(".ratbat-stations.json")
+        try Data(#"{"stations": []}"#.utf8).write(to: url)
+
+        XCTAssertThrowsError(try StationStore.load(from: tempRoot)) { error in
+            guard let storeError = error as? StationStore.StationError else {
+                XCTFail("Expected StationStore.StationError, got \(error)")
+                return
+            }
+            XCTAssertEqual(storeError, .corruptEnvelope)
+        }
+    }
 }
 
 extension StationStore.StationError: Equatable {
     public static func == (lhs: StationStore.StationError, rhs: StationStore.StationError) -> Bool {
         switch (lhs, rhs) {
         case (.versionMismatch, .versionMismatch): return true
+        case (.corruptEnvelope, .corruptEnvelope): return true
+        default: return false
         }
     }
 }

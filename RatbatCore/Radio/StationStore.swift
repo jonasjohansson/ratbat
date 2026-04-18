@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 
 /// On-disk persistence for the user's ``Station`` list, written next to the
 /// user's music folder as a hidden dotfile (`.ratbat-stations.json`).
@@ -23,6 +24,11 @@ enum StationStore {
     /// caller treats that like "no saved stations".
     static let currentVersion = 1
 
+    static let logger = Logger(
+        subsystem: "se.jonasjohansson.ratbat",
+        category: "station-store"
+    )
+
     struct StationFile: Codable {
         let version: Int
         let stations: [Station]
@@ -30,19 +36,64 @@ enum StationStore {
 
     enum StationError: Error {
         case versionMismatch
+        /// The envelope itself was unreadable (missing version, wrong shape,
+        /// not JSON). Distinct from per-station decode failures — those
+        /// don't throw, they get logged and skipped so one bad entry can't
+        /// nuke the user's entire station list.
+        case corruptEnvelope
     }
 
     /// Read and decode the stations file. Throws if the file is missing,
-    /// unreadable, corrupt, or tagged with a version this build doesn't
-    /// recognise — the manager catches any error and falls back to `[]`.
+    /// unreadable, or tagged with a version this build doesn't recognise —
+    /// the manager catches any error and falls back to `[]`.
+    ///
+    /// Stations are decoded **one at a time** so a single un-decodable
+    /// entry (e.g. a `.bandcamp` station authored on macOS, loaded by an
+    /// iOS build sharing the same Google Drive file) doesn't silently wipe
+    /// every other station. Skipped entries are logged at info.
     static func load(from root: URL) throws -> [Station] {
         let url = root.appendingPathComponent(filename)
         let data = try Data(contentsOf: url)
-        let decoded = try JSONDecoder().decode(StationFile.self, from: data)
-        guard decoded.version == currentVersion else {
+
+        let envelope: Any
+        do {
+            envelope = try JSONSerialization.jsonObject(with: data)
+        } catch {
+            // Not-JSON. Caller treats as "no file".
+            throw error
+        }
+
+        guard let dict = envelope as? [String: Any],
+              let version = dict["version"] as? Int else {
+            throw StationError.corruptEnvelope
+        }
+        guard version == currentVersion else {
             throw StationError.versionMismatch
         }
-        return decoded.stations
+
+        // `stations` missing / malformed → treat as empty list rather than
+        // throwing, same resilience stance as per-entry failures.
+        guard let rawStations = dict["stations"] as? [Any] else {
+            return []
+        }
+
+        let decoder = JSONDecoder()
+        var stations: [Station] = []
+        for raw in rawStations {
+            do {
+                let reserialized = try JSONSerialization.data(withJSONObject: raw)
+                let station = try decoder.decode(Station.self, from: reserialized)
+                stations.append(station)
+            } catch {
+                // Per-entry fail-open. Known trigger: a macOS-authored file
+                // containing a `.bandcamp` station, read by an iOS build
+                // where that case doesn't exist. Before this change the
+                // whole file decode threw and the caller wiped all
+                // stations — now only the unreadable entry is dropped.
+                logger.info("StationStore: skipped undecodable station — \(String(describing: error), privacy: .public)")
+            }
+        }
+        return stations
     }
 
     /// Encode and write the stations list atomically so a crash mid-write
