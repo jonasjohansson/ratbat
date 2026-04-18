@@ -98,16 +98,17 @@ public final class RadioBroadcaster: ObservableObject {
     private let tasteProfile: TasteProfile?
     /// Long-lived MusicBrainz client shared across every Last.fm /
     /// Bandcamp station so the per-artist / per-recording caches
-    /// accumulate across pool refills and across stations. Constructed
-    /// lazily the first time a generative station spins up — tests that
-    /// never hit MB pay nothing.
-    private var musicBrainz: MusicBrainzClient?
+    /// accumulate across pool refills and across stations. Eagerly
+    /// constructed at broadcaster init — the constructor makes no
+    /// network calls, so the cost is negligible, and eager init
+    /// removes a benign TOCTOU race between two concurrent
+    /// `startBroadcast` calls both lazy-initing the shared client.
+    private let musicBrainz: MusicBrainzClient
     /// Long-lived Bandcamp discover client. Same rationale as
     /// ``musicBrainz``: per-actor request throttling is more useful
-    /// when the throttle gate survives across stations / refills.
-    /// Requires no API key, so construction is unconditional once a
-    /// Bandcamp station first spins up.
-    private var bandcamp: BandcampClient?
+    /// when the throttle gate survives across stations / refills,
+    /// and the constructor is network-free so eager init is free.
+    private let bandcamp: BandcampClient
     #endif
 
     // MARK: - Internals
@@ -167,8 +168,8 @@ public final class RadioBroadcaster: ObservableObject {
         self.history = nil
         self.libraryConfig = nil
         self.tasteProfile = nil
-        self.musicBrainz = nil
-        self.bandcamp = nil
+        self.musicBrainz = MusicBrainzClient(userAgent: "Ratbat/1.0 (jns.johansson@gmail.com)")
+        self.bandcamp = BandcampClient(userAgent: "Ratbat/1.0 (jns.johansson@gmail.com)")
         #endif
         subscribeToPreferences()
     }
@@ -197,8 +198,8 @@ public final class RadioBroadcaster: ObservableObject {
         self.history = history
         self.libraryConfig = libraryConfig
         self.tasteProfile = tasteProfile
-        self.musicBrainz = nil
-        self.bandcamp = nil
+        self.musicBrainz = MusicBrainzClient(userAgent: "Ratbat/1.0 (jns.johansson@gmail.com)")
+        self.bandcamp = BandcampClient(userAgent: "Ratbat/1.0 (jns.johansson@gmail.com)")
         subscribeToPreferences()
     }
     #else
@@ -391,23 +392,14 @@ public final class RadioBroadcaster: ObservableObject {
         // still narrows via filters, it just loses the "you'd probably
         // like this" boost.
         let profile = tasteProfile ?? TasteProfile()
-        // Lazily construct the MusicBrainz client the first time a
-        // generative station needs it, then keep it around — its
-        // in-memory caches matter and MB's 1 req/sec budget is
-        // per-process, not per-client. The UA string is hard-coded to
-        // the real app's identity so MB's abuse-tracking has one
-        // consistent actor to rate-limit, not one per user.
-        let mb: MusicBrainzClient
-        if let existing = musicBrainz {
-            mb = existing
-        } else {
-            mb = MusicBrainzClient(userAgent: "Ratbat/1.0 (jns.johansson@gmail.com)")
-            musicBrainz = mb
-        }
+        // Shared MusicBrainz client — its in-memory caches matter and
+        // MB's 1 req/sec budget is per-process, not per-client. The UA
+        // string is baked into the eager init so MB's abuse-tracking
+        // sees one consistent actor across every station in the app.
         let controller = LastFMStationController(
             config: config,
             client: client,
-            musicBrainz: mb,
+            musicBrainz: musicBrainz,
             history: history,
             resolver: resolver,
             tasteProfile: profile
@@ -465,31 +457,14 @@ public final class RadioBroadcaster: ObservableObject {
         // degradation story as ``makeLastFMSource``.
         let profile = tasteProfile ?? TasteProfile()
 
-        // Lazy MB client — shared with Last.fm, so the per-artist cache
-        // carries across station types.
-        let mb: MusicBrainzClient
-        if let existing = musicBrainz {
-            mb = existing
-        } else {
-            mb = MusicBrainzClient(userAgent: "Ratbat/1.0 (jns.johansson@gmail.com)")
-            musicBrainz = mb
-        }
-
-        // Lazy Bandcamp client — same pattern as MB. UA string matches
-        // so Bandcamp's abuse-tracking sees one consistent actor rather
-        // than one per user.
-        let bc: BandcampClient
-        if let existing = bandcamp {
-            bc = existing
-        } else {
-            bc = BandcampClient(userAgent: "Ratbat/1.0 (jns.johansson@gmail.com)")
-            bandcamp = bc
-        }
-
+        // Shared MusicBrainz + Bandcamp clients — the per-artist cache
+        // and request-throttle gate carry across station types. Both
+        // are constructed at broadcaster init (network-free
+        // constructors), so every station sees the same actor instance.
         let controller = BandcampStationController(
             config: config,
-            client: bc,
-            musicBrainz: mb,
+            client: bandcamp,
+            musicBrainz: musicBrainz,
             history: history,
             resolver: resolver,
             tasteProfile: profile

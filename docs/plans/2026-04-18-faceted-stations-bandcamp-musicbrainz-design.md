@@ -124,14 +124,14 @@ public struct SourceCandidate: Sendable {
 | 1 | Seed fetch | `tag.getTopTracks` | scrape `/tag/<slug>` | Per-controller |
 | 2 | Tag mode (any/all) | ✓ | ✓ | `FacetedPipeline` (shared) |
 | 3 | Popularity tier | ✓ | — | Per-controller (LastFM) |
-| 4 | Precision verification | ✓ | — | Per-controller (LastFM) |
-| 5 | Library + artist exclusions | ✓ | ✓ | `FacetedPipeline` |
+| 4 | Library + artist exclusions | ✓ | ✓ | `FacetedPipeline` |
+| 5 | Precision verification | ✓ | — | Per-controller (LastFM) |
 | 6 | MB era filter | ✓ | ✓ | `FacetedPipeline` |
 | 7 | MB region filter | ✓ | ✓ | `FacetedPipeline` |
 | 8 | Taste score + wildcard shuffle | ✓ | ✓ | `FacetedPipeline` |
 
 **Ordering rationale:**
-- Cheap exclusions (stage 5) run **before** MB lookups (stages 6–7). No point burning 1 req/sec on an artist the user already owns.
+- Cheap exclusions (stage 4) run **before** the precision stage (5) and MB lookups (stages 6–7). Exclusions-before-precision saves per-artist Last.fm top-tag calls on artists we'd drop anyway (owned library / explicit blacklist); exclusions-before-MB keeps the 1 req/sec MusicBrainz budget spent only on artists that can still make the cut.
 - Era filter before region filter — year misses are more common than region misses for typical queries; dropping year-mismatches first shrinks the region-lookup set.
 
 **Samba bug, post-redesign:** "Techno + 1990s + Japan" becomes `genreTags: ["techno"]`, `yearMin: 1990, yearMax: 1999`, `regions: ["JP"]`. Exaltasamba fails stage 1 (not tagged "techno"); even if they snuck through they'd fail stage 7 (MB reports area = BR, not JP). Double defense.
