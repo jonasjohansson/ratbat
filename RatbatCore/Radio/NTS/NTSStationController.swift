@@ -30,14 +30,16 @@ import OSLog
 ///
 /// Unlike the Last.fm / Bandcamp sources — which fetch a big batch
 /// upfront — NTS paginates by show. Each refill pulls a small batch of
-/// shows (3 per pass), unions their tracklists, then runs the FULL
-/// ``FacetedPipeline`` over that batch so the per-track facets are
-/// enforced every pool cycle:
+/// shows (up to 8 per pass), unions their tracklists, then runs the
+/// FULL ``FacetedPipeline`` over that batch so the per-track facets are
+/// enforced every pool cycle. Batch size is deliberately larger than
+/// Last.fm/Bandcamp because NTS's pool is ~20× smaller to start with
+/// and the downstream facet filters can chew through it fast:
 ///
-/// - Stage 1: scrape 3 shows → build one ``SourceCandidate`` per unique
-///   (artist, title) with the show's genres as `matchedTags`. Retains
-///   insertion order so the "newest show first" ordering survives when
-///   `shufflePool` is off.
+/// - Stage 1: scrape up to 8 shows → build one ``SourceCandidate`` per
+///   unique (artist, title) with the show's genres as `matchedTags`.
+///   Retains insertion order so the "newest show first" ordering
+///   survives when `shufflePool` is off.
 /// - Stage 2: tag mode (any / all) via the shared pipeline.
 /// - Stage 4: library + artist exclusions via the shared pipeline.
 /// - Stage 5 (optional): per-artist top-tag verification through
@@ -88,8 +90,8 @@ public actor NTSStationController {
     private var pool: [SourceCandidate] = []
     private var cursor: Int = 0
 
-    /// Cached list of shows matching the station's tags. We drain three
-    /// shows per pool refill so NTS isn't hammered on every single
+    /// Cached list of shows matching the station's tags. We drain up to
+    /// eight shows per pool refill so NTS isn't hammered on every single
     /// `nextTrack()` call and so the pipeline has a healthy batch to
     /// work with.
     private var shows: [NTSClient.Show] = []
@@ -212,7 +214,7 @@ public actor NTSStationController {
             throw Error.noShowsForTags(config.query.genreTags)
         }
 
-        // Stage 1: scrape. Drain up to 3 shows, fold duplicate
+        // Stage 1: scrape. Drain up to 8 shows, fold duplicate
         // (artist, title) pairs into a single SourceCandidate with the
         // accumulated show genres as `matchedTags`.
         //
@@ -228,7 +230,7 @@ public actor NTSStationController {
         var seeds: [SeedRecord] = []
         var seedIndex: [DedupKey: Int] = [:]
 
-        let take = min(3, shows.count - showCursor)
+        let take = min(8, shows.count - showCursor)
         for _ in 0..<take {
             let show = shows[showCursor]
             showCursor += 1
@@ -333,12 +335,17 @@ public actor NTSStationController {
         // station's feed.
         //
         // When the user has a Last.fm API key configured we check each
-        // candidate artist's top-5 tags against the station's required
-        // tags and drop misses. When no key is present the stage is
-        // skipped and we log once so the reason for the drop-off in
+        // candidate artist's top-10 tags against the station's required
+        // tags and drop misses. Top-10 (vs Last.fm's top-5) is
+        // intentionally more lenient because NTS's pool is ~20× smaller
+        // to start with — strict top-5 over 60 candidates could easily
+        // filter to zero, while top-10 keeps genre-adjacent artists
+        // (e.g. techno tagged "electronic"/"minimal" but not "techno"
+        // in the top 5) in the pool. When no key is present the stage
+        // is skipped and we log once so the reason for the drop-off in
         // specificity is discoverable without reading source.
         if let lastFM, !candidates.isEmpty {
-            let topN = 5
+            let topN = 10
             let queryTagsLower = requiredTags
             var verified: [SourceCandidate] = []
             // Per-refill cache so repeated artists don't trigger a
