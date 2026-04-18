@@ -102,6 +102,12 @@ public final class RadioBroadcaster: ObservableObject {
     /// lazily the first time a generative station spins up — tests that
     /// never hit MB pay nothing.
     private var musicBrainz: MusicBrainzClient?
+    /// Long-lived Bandcamp discover client. Same rationale as
+    /// ``musicBrainz``: per-actor request throttling is more useful
+    /// when the throttle gate survives across stations / refills.
+    /// Requires no API key, so construction is unconditional once a
+    /// Bandcamp station first spins up.
+    private var bandcamp: BandcampClient?
     #endif
 
     // MARK: - Internals
@@ -162,6 +168,7 @@ public final class RadioBroadcaster: ObservableObject {
         self.libraryConfig = nil
         self.tasteProfile = nil
         self.musicBrainz = nil
+        self.bandcamp = nil
         #endif
         subscribeToPreferences()
     }
@@ -191,6 +198,7 @@ public final class RadioBroadcaster: ObservableObject {
         self.libraryConfig = libraryConfig
         self.tasteProfile = tasteProfile
         self.musicBrainz = nil
+        self.bandcamp = nil
         subscribeToPreferences()
     }
     #else
@@ -260,11 +268,11 @@ public final class RadioBroadcaster: ObservableObject {
             #endif
 
         #if os(macOS)
-        case .bandcamp:
-            // Wired up in Task 9 (BandcampStationController + BandcampSource).
-            // For now surface a clear error so the station row doesn't start
-            // broadcasting silently with no output.
-            error = "Bandcamp stations not yet supported (coming in Task 9)"
+        case .bandcamp(let config):
+            guard let source = await makeBandcampSource(config: config) else {
+                return
+            }
+            await startBroadcast(station: station, source: source)
         #endif
         }
     }
@@ -405,6 +413,88 @@ public final class RadioBroadcaster: ObservableObject {
             tasteProfile: profile
         )
         return LastFMSource(controller: controller)
+    }
+
+    /// Resolve a ``BandcampSource`` from injected dependencies. Mirrors
+    /// ``makeLastFMSource(config:)`` minus the API-key gate — Bandcamp's
+    /// discover endpoint doesn't require auth. The venv + resolver
+    /// bootstrap path is identical; the lazy ``BandcampClient`` and
+    /// ``MusicBrainzClient`` slots are shared across every subsequent
+    /// Bandcamp / Last.fm station so their request-throttle gates and
+    /// per-artist caches accumulate instead of resetting per station.
+    private func makeBandcampSource(config: BandcampStationConfig) async -> BandcampSource? {
+        guard let downloadService, let history else {
+            let msg = "Bandcamp station requires downloadService + history — none injected"
+            error = msg
+            logger.error("\(msg, privacy: .public)")
+            return nil
+        }
+
+        do {
+            try await downloadService.ensureReady()
+        } catch {
+            let msg = "Bandcamp station setup failed: \(error.localizedDescription)"
+            self.error = msg
+            logger.error("\(msg, privacy: .public)")
+            return nil
+        }
+
+        guard let venvPython = downloadService.venvPythonURL,
+              let resolverScript = downloadService.ntsResolverScriptURL else {
+            let msg = "Bandcamp station: venv python or resolver script path unavailable"
+            error = msg
+            logger.error("\(msg, privacy: .public)")
+            return nil
+        }
+
+        let resolver: TrackResolver
+        do {
+            resolver = try TrackResolver(
+                venvPython: venvPython,
+                wrapperScript: resolverScript
+            )
+        } catch {
+            let msg = "Bandcamp station: resolver init failed: \(error.localizedDescription)"
+            self.error = msg
+            logger.error("\(msg, privacy: .public)")
+            return nil
+        }
+
+        // Fall back to a fresh empty TasteProfile when the broadcaster
+        // wasn't wired up with one (test configs / legacy init). Same
+        // degradation story as ``makeLastFMSource``.
+        let profile = tasteProfile ?? TasteProfile()
+
+        // Lazy MB client — shared with Last.fm, so the per-artist cache
+        // carries across station types.
+        let mb: MusicBrainzClient
+        if let existing = musicBrainz {
+            mb = existing
+        } else {
+            mb = MusicBrainzClient(userAgent: "Ratbat/1.0 (jns.johansson@gmail.com)")
+            musicBrainz = mb
+        }
+
+        // Lazy Bandcamp client — same pattern as MB. UA string matches
+        // so Bandcamp's abuse-tracking sees one consistent actor rather
+        // than one per user.
+        let bc: BandcampClient
+        if let existing = bandcamp {
+            bc = existing
+        } else {
+            bc = BandcampClient(userAgent: "Ratbat/1.0 (jns.johansson@gmail.com)")
+            bandcamp = bc
+        }
+
+        let controller = BandcampStationController(
+            config: config,
+            client: bc,
+            musicBrainz: mb,
+            history: history,
+            resolver: resolver,
+            tasteProfile: profile
+        )
+        return BandcampSource(controller: controller)
     }
     #endif
 

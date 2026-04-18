@@ -320,9 +320,10 @@ public struct PlaylistsSidebarView: View {
         case .lastFM:
             return isLive ? "chart.bar.fill" : "chart.bar"
         case .bandcamp:
-            // Placeholder icon — a dedicated Bandcamp glyph slots in once
-            // Task 9+ wires the controller through. `music.mic` reads as
-            // "curated discovery" distinct from Last.fm's chart bars.
+            // Placeholder icon — Task 14 picks the final SF Symbol when
+            // it ships the Bandcamp detail view alongside the sidebar
+            // polish. `music.mic` reads as "curated discovery" distinct
+            // from Last.fm's chart bars in the interim.
             return isLive ? "music.mic.circle.fill" : "music.mic"
         }
     }
