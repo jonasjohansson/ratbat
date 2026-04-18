@@ -2,16 +2,18 @@ import Foundation
 
 /// A radio station the broadcaster can serve.
 ///
-/// Two concrete kinds ship today:
+/// Three concrete kinds ship today:
 /// - ``Kind/playlist(queue:)`` — a pre-shuffled queue derived from a
 ///   user's library ``Playlist``.
 /// - ``Kind/nts(config:)`` — a generative, NTS-backed station driven by
 ///   an ``NTSStationConfig`` (tags + optional year range).
+/// - ``Kind/lastFM(config:)`` — a generative, Last.fm-backed station
+///   driven by a ``LastFMStationConfig`` (tags + optional year range).
 ///
 /// The `Kind` enum is the source-of-truth for where tracks come from;
 /// the old `seed: Seed` marker field has been retired. Convenience
-/// accessors (``queue``, ``ntsConfig``) let existing call sites that
-/// only care about one variant keep working.
+/// accessors (``queue``, ``ntsConfig``, ``lastFMConfig``) let existing
+/// call sites that only care about one variant keep working.
 ///
 /// `Sendable` + `Hashable` + `Identifiable` + `Codable` so stations
 /// compose with the rest of the library types (selection tags, cache,
@@ -23,8 +25,8 @@ public struct Station: Identifiable, Hashable, Sendable, Codable {
 
     /// Source-of-truth for where this station's tracks come from.
     /// Swift auto-synthesises Codable for enums with associated values
-    /// as long as every associated payload is Codable — both
-    /// ``playlist(queue:)`` and ``nts(config:)`` satisfy that.
+    /// as long as every associated payload is Codable — all three
+    /// variants satisfy that.
     public enum Kind: Hashable, Sendable, Codable {
         /// Fixed, pre-shuffled queue. Replays the same tracks on every
         /// start — matches the pre-refactor behaviour.
@@ -33,6 +35,10 @@ public struct Station: Identifiable, Hashable, Sendable, Codable {
         /// dedup, resolver) is reconstructed on each broadcast start from
         /// the config; the config itself is the persisted seed.
         case nts(config: NTSStationConfig)
+        /// Generative Last.fm-backed station. Same lifecycle as NTS — the
+        /// config is the only persisted seed; controller + pool rebuild on
+        /// every broadcast start.
+        case lastFM(config: LastFMStationConfig)
     }
 
     public init(id: UUID = UUID(), name: String, kind: Kind) {
@@ -58,6 +64,12 @@ public struct Station: Identifiable, Hashable, Sendable, Codable {
         return nil
     }
 
+    /// Last.fm config, or `nil` for non-Last.fm stations.
+    public var lastFMConfig: LastFMStationConfig? {
+        if case let .lastFM(c) = kind { return c }
+        return nil
+    }
+
     // MARK: - Factories
 
     /// Build a station seeded from a playlist. Auto-names as
@@ -75,6 +87,12 @@ public struct Station: Identifiable, Hashable, Sendable, Codable {
     /// across broadcaster restarts.
     public static func fromNTS(_ config: NTSStationConfig) -> Station {
         Station(id: config.id, name: config.name, kind: .nts(config: config))
+    }
+
+    /// Build a station from a ``LastFMStationConfig``. Reuses the config's
+    /// `id` as the station id for history-dedup stability, same as NTS.
+    public static func fromLastFM(_ config: LastFMStationConfig) -> Station {
+        Station(id: config.id, name: config.name, kind: .lastFM(config: config))
     }
 
     // MARK: - Slug

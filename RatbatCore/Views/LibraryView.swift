@@ -141,6 +141,14 @@ public struct LibraryView: View {
     @State private var sortColumn: TrackColumn = .title
     @State private var sortAscending: Bool = true
 
+    /// When a playlist is larger than ``initialPageSize`` tracks we only
+    /// render the first page on launch — SwiftUI's `List` virtualization
+    /// still struggles with many-thousand-row selection churn on sidebar
+    /// toggle. The user can hit "Show all" to expand, or start typing in
+    /// the search field (which always sees the full track list).
+    @State private var showingAll: Bool = false
+    private static let initialPageSize = 500
+
     /// Visible columns persisted as a JSON-encoded `[TrackColumn]` string.
     /// `@AppStorage` can't hold a `Set<TrackColumn>` directly, so we keep
     /// the raw string here and go through a computed `visibleColumns`
@@ -186,7 +194,16 @@ public struct LibraryView: View {
                     || track.album.lowercased().contains(needle)
             }
         }
-        let sorted = filtered.sorted { lhs, rhs in
+        // Cap unfiltered view to initialPageSize for large playlists until
+        // the user explicitly opts in — keeps sidebar toggle + split-pane
+        // resize snappy on thousand-plus-track libraries.
+        let capped: [Track]
+        if searchText.isEmpty && !showingAll && filtered.count > Self.initialPageSize {
+            capped = Array(filtered.prefix(Self.initialPageSize))
+        } else {
+            capped = filtered
+        }
+        let sorted = capped.sorted { lhs, rhs in
             switch sortColumn {
             case .trackNumber:
                 return compareInt(lhs.trackNumber ?? .max, rhs.trackNumber ?? .max)
@@ -288,6 +305,26 @@ public struct LibraryView: View {
                             .foregroundStyle(.secondary)
                             .padding()
                             .frame(maxWidth: .infinity)
+                    }
+
+                    // "Show all" escape hatch when we capped a large playlist.
+                    // Searching or sorting still sees the whole set — the cap
+                    // only applies to the unfiltered default view.
+                    if !showingAll
+                        && searchText.isEmpty
+                        && playlist.tracks.count > Self.initialPageSize {
+                        HStack(spacing: 6) {
+                            Text("Showing first \(Self.initialPageSize) of \(playlist.tracks.count) tracks.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Button("Show all") { showingAll = true }
+                                .buttonStyle(.borderless)
+                                .font(.caption)
+                            Spacer()
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .background(.thinMaterial)
                     }
                 }
             }

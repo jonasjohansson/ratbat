@@ -92,6 +92,11 @@ public actor HistoryStore {
             try Self.execRaw("PRAGMA user_version = 1;", on: handle)
             logger.info("history.db migrated to v1 at \(self.dbURL.path, privacy: .public)")
         }
+        if Self.userVersion(on: handle) < 2 {
+            try Self.migrateToV2(on: handle)
+            try Self.execRaw("PRAGMA user_version = 2;", on: handle)
+            logger.info("history.db migrated to v2 at \(self.dbURL.path, privacy: .public)")
+        }
     }
 
     deinit {
@@ -252,6 +257,72 @@ public actor HistoryStore {
         return collectRows(stmt)
     }
 
+    // MARK: - v2: skip / play-count API (taste intelligence)
+
+    /// Mark an entry as explicitly skipped. The station-scoped blacklist
+    /// lookup (``hasSkipped(station:artist:)``) reads this to suppress any
+    /// future pool candidates from the same artist.
+    public func markSkipped(id: Int64) throws {
+        let sql = "UPDATE history SET skipped = 1, skipped_at = ? WHERE id = ?;"
+        let stmt = try prepare(sql)
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_double(stmt, 1, Date().timeIntervalSince1970)
+        sqlite3_bind_int64(stmt, 2, id)
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw Error.queryFailed(lastError())
+        }
+    }
+
+    /// Has this artist been skipped on this station? Station-scoped so a
+    /// skip on a jazz station doesn't suppress the same artist on a
+    /// different ambient station. Normalized artist match, case-insensitive.
+    public func hasSkipped(station: UUID, artist: String) throws -> Bool {
+        let sql = """
+            SELECT 1 FROM history
+            WHERE station_id = ? AND artist_norm = ? AND skipped = 1
+            LIMIT 1;
+            """
+        let stmt = try prepare(sql)
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, station.uuidString, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, Self.normalize(artist), -1, SQLITE_TRANSIENT)
+        let rc = sqlite3_step(stmt)
+        if rc == SQLITE_ROW { return true }
+        if rc == SQLITE_DONE { return false }
+        throw Error.queryFailed(lastError())
+    }
+
+    /// Every entry for a station where the user hit 👎. Newest-skipped
+    /// first. Used by the transparency UI and by scoring.
+    public func skippedEntries(forStation station: UUID, limit: Int = 200) throws -> [Entry] {
+        let sql = """
+            SELECT id, station_id, artist, title, played_at,
+                   source_show_url, youtube_id, saved, cached_path
+            FROM history
+            WHERE station_id = ? AND skipped = 1
+            ORDER BY skipped_at DESC
+            LIMIT ?;
+            """
+        let stmt = try prepare(sql)
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, station.uuidString, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(stmt, 2, Int64(limit))
+        return collectRows(stmt)
+    }
+
+    /// Increment the play-through counter for `id`. Call this when a track
+    /// finishes naturally (decoder hits EOF without the user skipping) so
+    /// the taste profile can weight repeat-play artists over one-offs.
+    public func incrementPlayCount(id: Int64) throws {
+        let sql = "UPDATE history SET play_count = play_count + 1 WHERE id = ?;"
+        let stmt = try prepare(sql)
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, id)
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw Error.queryFailed(lastError())
+        }
+    }
+
     // MARK: - Internals
 
     // Init-time helpers. Static so they can run from the nonisolated
@@ -275,6 +346,31 @@ public actor HistoryStore {
         }
         guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
         return Int(sqlite3_column_int64(stmt, 0))
+    }
+
+    /// v2 adds the taste-intelligence behavioral layer: each row can now
+    /// record whether it was explicitly skipped (`skipped` + `skipped_at`)
+    /// and how many times the track has been played through (`play_count`).
+    /// Fresh DBs created on v2 skip this ALTER and get the columns from
+    /// `migrateToV1` once that method is also bumped; for now v1 → v2 is
+    /// an additive migration so existing histories keep their data.
+    private static func migrateToV2(on handle: OpaquePointer) throws {
+        try execRaw(
+            "ALTER TABLE history ADD COLUMN skipped INTEGER NOT NULL DEFAULT 0;",
+            on: handle
+        )
+        try execRaw(
+            "ALTER TABLE history ADD COLUMN skipped_at REAL;",
+            on: handle
+        )
+        try execRaw(
+            "ALTER TABLE history ADD COLUMN play_count INTEGER NOT NULL DEFAULT 0;",
+            on: handle
+        )
+        try execRaw(
+            "CREATE INDEX IF NOT EXISTS history_skipped ON history(station_id, skipped, artist_norm);",
+            on: handle
+        )
     }
 
     private static func migrateToV1(on handle: OpaquePointer) throws {

@@ -93,5 +93,53 @@ final class HistoryStoreTests: XCTestCase {
         XCTAssertEqual(HistoryStore.normalize("  Hello   World  "), "hello world")
         XCTAssertEqual(HistoryStore.normalize("Drake's"), "drake's")
     }
+
+    // MARK: - v2 schema (taste-intelligence)
+
+    func testMarkSkippedRecordsSkip() async throws {
+        let store = try await HistoryStore(databaseURL: tempURL)
+        let station = UUID()
+        let rowid = try await store.record(
+            station: station, artist: "Groove Coverage", title: "Poison"
+        )
+        try await store.markSkipped(id: rowid)
+        let skipped = try await store.skippedEntries(forStation: station)
+        XCTAssertEqual(skipped.count, 1)
+        XCTAssertEqual(skipped.first?.artist, "Groove Coverage")
+    }
+
+    func testHasSkippedCaseInsensitive() async throws {
+        let store = try await HistoryStore(databaseURL: tempURL)
+        let station = UUID()
+        let rowid = try await store.record(
+            station: station, artist: "Scooter", title: "Fire"
+        )
+        try await store.markSkipped(id: rowid)
+        let hit = try await store.hasSkipped(station: station, artist: "scooter")
+        XCTAssertTrue(hit)
+        let miss = try await store.hasSkipped(station: station, artist: "Miles Davis")
+        XCTAssertFalse(miss)
+    }
+
+    func testSkipIsScopedPerStation() async throws {
+        let store = try await HistoryStore(databaseURL: tempURL)
+        let s1 = UUID(), s2 = UUID()
+        let rowid = try await store.record(station: s1, artist: "A", title: "B")
+        try await store.markSkipped(id: rowid)
+        let hitS1 = try await store.hasSkipped(station: s1, artist: "A")
+        let hitS2 = try await store.hasSkipped(station: s2, artist: "A")
+        XCTAssertTrue(hitS1)
+        XCTAssertFalse(hitS2)
+    }
+
+    func testV2SchemaReopensCleanly() async throws {
+        // First open creates / migrates a fresh v2 DB.
+        _ = try await HistoryStore(databaseURL: tempURL)
+        // Reopening shouldn't re-run the migration or throw.
+        let store = try await HistoryStore(databaseURL: tempURL)
+        let rowid = try await store.record(station: UUID(), artist: "X", title: "Y")
+        // Would fail with "no such column" if the v2 migration didn't stick.
+        try await store.markSkipped(id: rowid)
+    }
 }
 #endif

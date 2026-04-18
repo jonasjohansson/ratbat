@@ -306,8 +306,9 @@ public struct PlaylistsSidebarView: View {
     }
 
     /// Per-station icon. Playlist stations keep the antenna (matches the
-    /// pre-refactor look); NTS stations get the waveform so the sidebar
-    /// visually distinguishes "fixed queue" from "generative feed".
+    /// pre-refactor look); generative stations get source-specific glyphs
+    /// so the sidebar visually distinguishes "fixed queue" from
+    /// "generative feed" and NTS from Last.fm at a glance.
     private func iconName(for station: Station, isLive: Bool) -> String {
         switch station.kind {
         case .playlist:
@@ -316,6 +317,8 @@ public struct PlaylistsSidebarView: View {
                 : "antenna.radiowaves.left.and.right"
         case .nts:
             return isLive ? "waveform.circle.fill" : "waveform.circle"
+        case .lastFM:
+            return isLive ? "chart.bar.fill" : "chart.bar"
         }
     }
 }

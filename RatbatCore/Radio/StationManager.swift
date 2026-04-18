@@ -113,6 +113,18 @@ public final class StationManager: ObservableObject {
         return station
     }
 
+    /// Create a new Last.fm-backed station from a config and persist
+    /// immediately. Same collision-handling as ``createNTS(_:)``.
+    @discardableResult
+    public func createLastFM(_ config: LastFMStationConfig) -> Station {
+        var cfg = config
+        cfg.name = uniquifyName(cfg.name)
+        let station = Station.fromLastFM(cfg)
+        stations.append(station)
+        persist()
+        return station
+    }
+
     /// Find a station whose ``Station/slug`` matches `slug`. Used by the
     /// HTTP router to map an incoming `/stream/{slug}.aac` request to a
     /// specific station's broadcast pipeline.

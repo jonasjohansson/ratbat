@@ -90,6 +90,12 @@ public final class RadioBroadcaster: ObservableObject {
     /// flow to know where to copy cached files. `nil` in test configs;
     /// `handleLike` returns a 500 when it's missing.
     private let libraryConfig: LibraryConfig?
+    /// Locally-derived taste signals shared across every generative
+    /// station. Optional so minimal-init tests can skip it — stations
+    /// built without a profile just get an empty profile's zero-valued
+    /// scores, which degrades to near-random selection rather than
+    /// crashing.
+    private let tasteProfile: TasteProfile?
     #endif
 
     // MARK: - Internals
@@ -111,6 +117,12 @@ public final class RadioBroadcaster: ObservableObject {
         /// StationManager.
         let stationName: String
         var encodeTask: Task<Void, Never>?
+        /// Flipped `true` by ``RadioBroadcaster/skipCurrent(stationID:)``
+        /// when the user hits 👎. The encode loop's inner PCM loop reads
+        /// and clears it, breaking out of the current decoded track so
+        /// the outer loop advances. Avoids the complexity of cancelling
+        /// the decoder mid-track.
+        var skipRequested: Bool = false
 
         init(station: Station, buffer: AACRingBuffer, bitrate: Int, sampleRate: Double) {
             self.station = station
@@ -142,6 +154,7 @@ public final class RadioBroadcaster: ObservableObject {
         self.nts = nil
         self.history = nil
         self.libraryConfig = nil
+        self.tasteProfile = nil
         #endif
         subscribeToPreferences()
     }
@@ -159,7 +172,8 @@ public final class RadioBroadcaster: ObservableObject {
         downloadService: DownloadService? = nil,
         nts: NTSClient? = nil,
         history: HistoryStore? = nil,
-        libraryConfig: LibraryConfig? = nil
+        libraryConfig: LibraryConfig? = nil,
+        tasteProfile: TasteProfile? = nil
     ) {
         self.preferences = preferences
         let raw = UInt16(clamping: preferences.port)
@@ -168,6 +182,7 @@ public final class RadioBroadcaster: ObservableObject {
         self.nts = nts
         self.history = history
         self.libraryConfig = libraryConfig
+        self.tasteProfile = tasteProfile
         subscribeToPreferences()
     }
     #else
@@ -200,8 +215,8 @@ public final class RadioBroadcaster: ObservableObject {
 
     /// Convenience entry point. Branches on the station's ``Station/Kind``:
     /// playlist stations wrap their fixed queue in a ``PlaylistSource``;
-    /// NTS stations spin up an ``NTSStationController`` backed by the
-    /// broadcaster's injected NTS dependencies.
+    /// NTS/Last.fm stations spin up the matching controller backed by the
+    /// broadcaster's injected dependencies.
     public func startBroadcast(station: Station) async {
         // Match pre-refactor ordering: skip silently if already live, then
         // surface any variant-specific validation before spinning up a source.
@@ -224,6 +239,16 @@ public final class RadioBroadcaster: ObservableObject {
             await startBroadcast(station: station, source: source)
             #else
             error = "NTS stations are macOS-only"
+            #endif
+
+        case .lastFM(let config):
+            #if os(macOS)
+            guard let source = await makeLastFMSource(config: config) else {
+                return
+            }
+            await startBroadcast(station: station, source: source)
+            #else
+            error = "Last.fm stations are macOS-only"
             #endif
         }
     }
@@ -282,6 +307,74 @@ public final class RadioBroadcaster: ObservableObject {
             resolver: resolver
         )
         return NTSSource(controller: controller)
+    }
+
+    /// Resolve a ``LastFMSource`` from injected dependencies + the user's
+    /// Last.fm API key (read from preferences each time so key changes
+    /// take effect on the next broadcast start without reconstructing the
+    /// broadcaster). Shares the venv + resolver bootstrap path with the
+    /// NTS source.
+    private func makeLastFMSource(config: LastFMStationConfig) async -> LastFMSource? {
+        guard let downloadService, let history else {
+            let msg = "Last.fm station requires downloadService + history — none injected"
+            error = msg
+            logger.error("\(msg, privacy: .public)")
+            return nil
+        }
+
+        let apiKey = preferences.lastFMAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !apiKey.isEmpty else {
+            let msg = "Last.fm station: API key missing. Paste one in Settings → Last.fm API key."
+            error = msg
+            logger.error("\(msg, privacy: .public)")
+            return nil
+        }
+
+        do {
+            try await downloadService.ensureReady()
+        } catch {
+            let msg = "Last.fm station setup failed: \(error.localizedDescription)"
+            self.error = msg
+            logger.error("\(msg, privacy: .public)")
+            return nil
+        }
+
+        guard let venvPython = downloadService.venvPythonURL,
+              let resolverScript = downloadService.ntsResolverScriptURL else {
+            let msg = "Last.fm station: venv python or resolver script path unavailable"
+            error = msg
+            logger.error("\(msg, privacy: .public)")
+            return nil
+        }
+
+        let resolver: TrackResolver
+        do {
+            resolver = try TrackResolver(
+                venvPython: venvPython,
+                wrapperScript: resolverScript
+            )
+        } catch {
+            let msg = "Last.fm station: resolver init failed: \(error.localizedDescription)"
+            self.error = msg
+            logger.error("\(msg, privacy: .public)")
+            return nil
+        }
+
+        let client = LastFMClient(apiKey: apiKey)
+        // Fall back to a fresh empty TasteProfile when the broadcaster
+        // wasn't wired up with one (test configs / legacy init). Scoring
+        // against an empty profile just yields zero weights — the pool
+        // still narrows via filters, it just loses the "you'd probably
+        // like this" boost.
+        let profile = tasteProfile ?? TasteProfile()
+        let controller = LastFMStationController(
+            config: config,
+            client: client,
+            history: history,
+            resolver: resolver,
+            tasteProfile: profile
+        )
+        return LastFMSource(controller: controller)
     }
     #endif
 
@@ -399,6 +492,36 @@ public final class RadioBroadcaster: ObservableObject {
         broadcasting.contains(stationID)
     }
 
+    #if os(macOS)
+    /// User hit 👎 on the currently-playing track. Marks it as skipped
+    /// in history (so the taste profile's blacklist will suppress it on
+    /// this station) and nudges the encode loop to drop the current
+    /// track. The next track resolves through the normal pool pipeline,
+    /// which honors the fresh skip via its pre-scoring filter.
+    ///
+    /// No-op when the station isn't live, has no currently-playing
+    /// item, or the item lacks a historyID (playlist-backed stations).
+    public func skipCurrent(stationID: Station.ID) async {
+        guard pipelines[stationID] != nil else { return }
+        guard let item = currentItemByStation[stationID] else { return }
+        guard let historyID = item.historyID else { return }
+
+        if let history {
+            do {
+                try await history.markSkipped(id: historyID)
+                logger.info("👎 skip recorded: \(item.artist ?? "?", privacy: .public) — \(item.title ?? "?", privacy: .public)")
+            } catch {
+                logger.error("skip mark failed: \(String(describing: error), privacy: .public)")
+            }
+        }
+        // Nudge the encode loop. The inner PCM loop reads this flag on
+        // each iteration and breaks out, which advances the outer loop
+        // to the next item. Buffered AAC already written for this track
+        // still plays out; only future bytes come from the new track.
+        pipelines[stationID]?.skipRequested = true
+    }
+    #endif
+
     /// Local stream URL for `station`, or `nil` if it isn't broadcasting.
     /// Shape: `http://localhost:{port}/stream/{slug}.aac` — aligned with
     /// the path-based routing the shared listener implements.
@@ -441,6 +564,17 @@ public final class RadioBroadcaster: ObservableObject {
     /// the whole actor state.
     fileprivate func snapshotCurrentItem(stationID: Station.ID) -> TrackSourceItem? {
         currentItemByStation[stationID]
+    }
+
+    /// Detached encode loop uses this to read+clear the per-pipeline
+    /// skip flag once per PCM iteration. Returns `true` iff a skip was
+    /// requested; the loop then breaks out of the current track's inner
+    /// loop so the outer loop advances to the next item.
+    fileprivate func consumeSkipRequest(stationID: Station.ID) -> Bool {
+        guard let pipeline = pipelines[stationID] else { return false }
+        let was = pipeline.skipRequested
+        pipeline.skipRequested = false
+        return was
     }
 
     // MARK: - HTTP server
@@ -1307,10 +1441,26 @@ public final class RadioBroadcaster: ObservableObject {
             return
         }
 
+        // Track-index flag used to gate listener-presence idling: the first
+        // track always resolves unconditionally so the station feels
+        // responsive when the user clicks Start Broadcast, but subsequent
+        // tracks only resolve while at least one listener is connected.
+        var trackIndex = 0
+
         // Outer loop: pull items until the source is exhausted or the
         // task is cancelled. Inner loop: pump PCM → AAC → ring buffer
         // for the currently open item.
         outer: while !Task.isCancelled {
+            // Data-conscious idle. After the first track, hold here until
+            // someone is listening — the resolver + transient cache are
+            // both costly and pointless with nobody tuned in. The station
+            // stays ON AIR in the UI either way; only the encode loop
+            // sleeps. A new listener connection unblocks this within ~5s.
+            if trackIndex > 0 {
+                await Self.awaitListener(stationID: stationID, owner: owner, log: log)
+                if Task.isCancelled { break }
+            }
+
             let nextItem: TrackSourceItem?
             do {
                 nextItem = try await source.nextURL()
@@ -1323,6 +1473,7 @@ public final class RadioBroadcaster: ObservableObject {
                 log.info("source exhausted for \(stationName, privacy: .public)")
                 break
             }
+            trackIndex += 1
 
             do {
                 try decoder.open(url: item.url)
@@ -1338,6 +1489,14 @@ public final class RadioBroadcaster: ObservableObject {
             }
 
             while !Task.isCancelled {
+                // User-initiated skip? Break the inner loop so the outer
+                // loop pulls the next item. Already-encoded bytes in the
+                // ring buffer play out for any current listener — the
+                // skip kicks in at the track boundary from their POV.
+                if let owner {
+                    let skip = await MainActor.run { owner.consumeSkipRequest(stationID: stationID) }
+                    if skip { break }
+                }
                 guard let pcm = decoder.readNextBuffer() else {
                     break   // EOF — advance to next item
                 }
@@ -1375,5 +1534,31 @@ public final class RadioBroadcaster: ObservableObject {
             }
         }
         log.info("encode loop exiting")
+    }
+
+    /// Block until at least one listener is connected to `stationID`, polling
+    /// `listenerCount` every 5s. Returns immediately when already ≥1, or when
+    /// the task is cancelled. Logs one line on entering idle and one on
+    /// resuming, so long idles are visible in the OSLog stream.
+    private static func awaitListener(
+        stationID: Station.ID,
+        owner: RadioBroadcaster?,
+        log: Logger
+    ) async {
+        let initial = await MainActor.run { owner?.listenerCount[stationID] ?? 0 }
+        if initial > 0 { return }
+
+        let shortID = stationID.uuidString.prefix(8)
+        log.info("idling \(shortID, privacy: .public) — no listeners, will resume on connect")
+        let pollNanos: UInt64 = 5_000_000_000
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: pollNanos)
+            if Task.isCancelled { return }
+            let count = await MainActor.run { owner?.listenerCount[stationID] ?? 0 }
+            if count > 0 {
+                log.info("resuming \(shortID, privacy: .public) — \(count, privacy: .public) listener(s)")
+                return
+            }
+        }
     }
 }

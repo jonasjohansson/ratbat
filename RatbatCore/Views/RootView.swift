@@ -35,9 +35,15 @@ public struct RootView: View {
     @StateObject private var preferences = BroadcastPreferences.shared
     @StateObject private var downloadService: DownloadService
     @StateObject private var radio: RadioBroadcaster
+    /// Shared taste profile — owned by the view for window lifetime. Not
+    /// an `ObservableObject` (scoring reads don't drive SwiftUI updates),
+    /// just a reference we pass into the broadcaster so Last.fm
+    /// controllers can consult it for pool scoring.
+    private let tasteProfile: TasteProfile
     @State private var sidebarSelection: SidebarSelection?
     @State private var showingAddDownload: Bool = false
     @State private var showingAddNTSStation: Bool = false
+    @State private var showingAddLastFMStation: Bool = false
     /// Owned by the view so it lives as long as the window does. Held as
     /// optional `@State` because we can't `@StateObject` a non-
     /// `ObservableObject`, and we want to construct it *after* `player`
@@ -54,15 +60,22 @@ public struct RootView: View {
         // download service is shared between the broadcaster and the
         // sidebar's Downloads section — one venv, one state publisher.
         let ds = DownloadService()
+        // Construct the taste profile once per window — it'll be
+        // ingested with library tracks after the first library load,
+        // and the scoring actor outlives individual broadcasts so ♥
+        // and 👎 signals accumulate across the session.
+        let profile = TasteProfile()
         let broadcaster = RadioBroadcaster(
             preferences: .shared,
             downloadService: ds,
             nts: NTSClient(),
             history: try? HistoryStore(),
-            libraryConfig: config
+            libraryConfig: config,
+            tasteProfile: profile
         )
         self._downloadService = StateObject(wrappedValue: ds)
         self._radio = StateObject(wrappedValue: broadcaster)
+        self.tasteProfile = profile
     }
 
     public var body: some View {
@@ -119,12 +132,28 @@ public struct RootView: View {
                     .sheet(isPresented: $showingAddNTSStation) {
                         AddNTSStationView(stations: stations)
                     }
+                    .sheet(isPresented: $showingAddLastFMStation) {
+                        AddLastFMStationView(stations: stations, preferences: preferences)
+                    }
                     .task(id: folder) {
                         // Point the station manager at the new folder
                         // BEFORE loading the library so any saved stations
                         // are visible in the sidebar as soon as it appears.
                         stations.setStorage(root: folder)
                         await libraryVM.load(from: folder)
+                        // Feed the taste profile with the freshly-loaded
+                        // tracks so Last.fm pool scoring has something to
+                        // work with. Runs after the library load so an
+                        // "All Songs" playlist exists to draw from.
+                        let allTracks = libraryVM.playlists.flatMap { $0.tracks }
+                        await tasteProfile.ingestLibrary(allTracks)
+                        // Persist the snapshot so future launches can prime
+                        // the profile synchronously and scoring is live
+                        // before the library re-scan finishes.
+                        if let snapshotURL = try? TasteProfileStore.defaultURL() {
+                            let snapshot = await tasteProfile.currentSnapshot()
+                            try? TasteProfileStore.save(snapshot, to: snapshotURL)
+                        }
                     }
                     // Mirror the unified sidebar selection back into the
                     // library view model so anything still reading
@@ -217,13 +246,17 @@ public struct RootView: View {
         .disabled(musicFolder == nil)
     }
 
-    /// Toolbar menu for creating new stations. Currently surfaces only the
-    /// NTS-backed flow — playlist stations are created via the sidebar's
-    /// right-click "Create Station from this" on any playlist row.
+    /// Toolbar menu for creating new stations. Playlist stations are
+    /// created via the sidebar's right-click "Create Station from this"
+    /// on any playlist row; this menu covers the generative kinds
+    /// (NTS / Last.fm) which need a config sheet.
     @ViewBuilder private var newStationMenu: some View {
         Menu {
             Button("New NTS Station…") {
                 showingAddNTSStation = true
+            }
+            Button("New Last.fm Station…") {
+                showingAddLastFMStation = true
             }
         } label: {
             Image(systemName: "plus.circle.dashed")
@@ -365,6 +398,21 @@ public struct RootView: View {
                     }
                 }
             )
+        } else if let lastFMStation = resolvedLastFMStation {
+            LastFMStationDetailView(
+                station: lastFMStation.0,
+                config: lastFMStation.1,
+                radio: radio,
+                onBroadcastToggle: {
+                    Task {
+                        if radio.isBroadcasting(stationID: lastFMStation.0.id) {
+                            radio.stopBroadcast(stationID: lastFMStation.0.id)
+                        } else {
+                            await radio.startBroadcast(station: lastFMStation.0)
+                        }
+                    }
+                }
+            )
         } else if let playlist = resolvedDetailPlaylist {
             LibraryView(playlist: playlist) { tracks, startIndex in
                 // Queue the whole playlist and start from the picked
@@ -401,6 +449,17 @@ public struct RootView: View {
         guard case let .some(.station(id)) = sidebarSelection,
               let station = stations.stations.first(where: { $0.id == id }),
               let config = station.ntsConfig
+        else { return nil }
+        return (station, config)
+    }
+
+    /// When the sidebar selection resolves to a Last.fm-backed station,
+    /// return it + its config so the detail pane can render its dedicated
+    /// view. Mirrors ``resolvedNTSStation`` for the other generative kind.
+    private var resolvedLastFMStation: (Station, LastFMStationConfig)? {
+        guard case let .some(.station(id)) = sidebarSelection,
+              let station = stations.stations.first(where: { $0.id == id }),
+              let config = station.lastFMConfig
         else { return nil }
         return (station, config)
     }

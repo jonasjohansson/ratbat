@@ -70,6 +70,15 @@ public final class BroadcastPreferences: ObservableObject {
     @AppStorage("ratbat.broadcast.icyMetadata")
     public var icyMetadataEnabled: Bool = true
 
+    /// Last.fm API key for generative Last.fm-backed stations. Free to
+    /// register at https://www.last.fm/api/account/create. Empty string
+    /// disables the Last.fm source — ``RadioBroadcaster`` surfaces a
+    /// user-visible error if a Last.fm station is started without one.
+    /// Stored in `UserDefaults` for simplicity; migrate to Keychain if the
+    /// threat model ever grows past "single user, local Mac".
+    @AppStorage("ratbat.lastfm.apiKey")
+    public var lastFMAPIKey: String = ""
+
     /// Republishes whenever any stored setting changes so Combine observers
     /// (notably ``RadioBroadcaster``) can mark themselves "needs restart".
     /// `@AppStorage` doesn't expose a publisher we can subscribe to, so we
