@@ -3,31 +3,37 @@ import SwiftUI
 
 /// Sheet for creating a new NTS-backed radio station.
 ///
-/// The user picks a name and one-or-more tags; the station is then
-/// persisted via ``StationManager/createNTS(_:)`` and appears in the
-/// sidebar. Clicking broadcast on it later constructs an
-/// ``NTSStationController`` + ``NTSSource`` on the fly (see
+/// The user picks a name (optional — falls back to ``FacetedQuery/suggestedName``
+/// when blank) and one-or-more facets via the shared
+/// ``FacetedQueryEditor``. The station is persisted via
+/// ``StationManager/createNTS(_:)`` and appears in the sidebar. Clicking
+/// broadcast on it later constructs an ``NTSStationController`` +
+/// ``NTSSource`` on the fly (see
 /// ``RadioBroadcaster/startBroadcast(station:)``), so creation itself
 /// is quick — no subprocess / network I/O happens until the user
 /// actually hits play.
 ///
-/// v1 scope: a curated ~25-tag picker + an optional year-range filter
-/// (the year filter is wired into ``NTSStationConfig`` but acts as a
-/// soft guide; the controller's year filtering ships in a later task).
-/// Free-text tag entry and a live tag browser sourced from NTS are
-/// out-of-scope for this first pass.
+/// Mirrors ``AddLastFMStationView`` in shape so the sources feel like
+/// siblings in the UI: genre / era / region via the shared editor, plus
+/// a collapsed disclosure for the per-source knobs that only apply to
+/// certain controllers. NTS's pipeline honors `tagMatch` and
+/// `excludeOwnedLibrary`; popularity is a Last.fm-only signal and is
+/// hidden here.
 public struct AddNTSStationView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject public var stations: StationManager
 
     @State private var name: String = ""
-    @State private var selectedTags: Set<String> = []
-    @State private var yearMinString: String = ""
-    @State private var yearMaxString: String = ""
+
+    /// All facet state lives in a single ``FacetedQuery`` value. Nested
+    /// bindings (`$query.tagMatch` etc.) work because `@State` wraps a
+    /// struct — SwiftUI re-renders whenever any field mutates.
+    @State private var query = FacetedQuery(genreTags: [])
 
     /// Curated list of common NTS genre/mood tags. Sourced from a quick
     /// pass through what the NTS API actually returns — a later task
-    /// will replace this with a live-fetched list.
+    /// may replace this with a live-fetched list. Passed into the
+    /// shared ``FacetedQueryEditor`` as its `palette`.
     private static let availableTags: [String] = [
         "ambient", "electronic", "techno", "house",
         "jazz", "experimental", "hip hop", "ECM",
@@ -54,48 +60,23 @@ public struct AddNTSStationView: View {
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("Name").font(.caption).foregroundStyle(.secondary)
-                TextField("Saturday Ambient", text: $name)
+                TextField(query.suggestedName, text: $name)
                     .textFieldStyle(.roundedBorder)
             }
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Tags (pick at least one)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                LazyVGrid(
-                    columns: [GridItem(.adaptive(minimum: 120), spacing: 4)],
-                    spacing: 4
-                ) {
-                    ForEach(Self.availableTags, id: \.self) { tag in
-                        Toggle(tag, isOn: Binding(
-                            get: { selectedTags.contains(tag) },
-                            set: { isOn in
-                                if isOn {
-                                    selectedTags.insert(tag)
-                                } else {
-                                    selectedTags.remove(tag)
-                                }
-                            }
-                        ))
-                        .toggleStyle(.button)
-                        .controlSize(.small)
-                    }
-                }
-                .frame(maxHeight: 200)
-            }
+            FacetedQueryEditor(query: $query, palette: Self.availableTags)
 
-            DisclosureGroup("Filters (optional)") {
-                HStack {
-                    Text("Year range:")
-                    TextField("2000", text: $yearMinString)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 70)
-                    Text("—")
-                    TextField("2026", text: $yearMaxString)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 70)
+            DisclosureGroup("NTS filters") {
+                VStack(alignment: .leading, spacing: 10) {
+                    Picker("Tag mode", selection: $query.tagMatch) {
+                        Text("Any tag matches (broad)").tag(TagMatch.any)
+                        Text("All tags must match (narrow)").tag(TagMatch.all)
+                    }
+                    .pickerStyle(.segmented)
+
+                    Toggle("Only surprise me — exclude my library", isOn: $query.excludeOwnedLibrary)
                 }
-                .font(.caption)
+                .padding(.top, 4)
             }
 
             HStack {
@@ -108,29 +89,20 @@ public struct AddNTSStationView: View {
             }
         }
         .padding(20)
-        .frame(width: 520)
+        .frame(width: 540)
     }
 
-    /// Name + at least one tag required. Year fields are optional; we
-    /// don't validate them here — bad input parses to `nil` and the
-    /// controller treats that as "no filter".
+    /// At least one tag required. Name is optional — when blank,
+    /// `create()` falls back to ``FacetedQuery/suggestedName``.
+    /// Era / region remain optional narrowing knobs.
     private var canSubmit: Bool {
-        !name.trimmingCharacters(in: .whitespaces).isEmpty
-            && !selectedTags.isEmpty
+        !query.genreTags.isEmpty
     }
 
     private func create() {
         let trimmedName = name.trimmingCharacters(in: .whitespaces)
-        // Commit-3 follow-up will replace this sheet's tag-grid + year
-        // fields with the shared FacetedQueryEditor. For now we just
-        // translate the existing state into a FacetedQuery inline so
-        // the new config API compiles.
-        let query = FacetedQuery(
-            genreTags: Array(selectedTags),
-            yearMin: Int(yearMinString),
-            yearMax: Int(yearMaxString)
-        )
-        let config = NTSStationConfig(name: trimmedName, query: query)
+        let finalName = trimmedName.isEmpty ? query.suggestedName : trimmedName
+        let config = NTSStationConfig(name: finalName, query: query)
         stations.createNTS(config)
         dismiss()
     }

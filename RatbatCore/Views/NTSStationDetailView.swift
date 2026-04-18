@@ -3,9 +3,11 @@ import SwiftUI
 
 /// Detail pane shown when the user selects an NTS-backed station in the
 /// sidebar. NTS stations don't have a fixed queue — tracks are resolved
-/// on demand — so a plain track list isn't meaningful. We show the
-/// station's config + its broadcast state + the most recent plays so
-/// the user knows what's been going out.
+/// on demand — so a plain track list isn't meaningful. Mirrors the
+/// Last.fm / Bandcamp detail views: surface the station's facets
+/// (genre tags, era, regions) as read-only chips plus the shared
+/// broadcast controls (On Air badge, Start/Stop, stream URL) and ICY
+/// save/skip buttons.
 public struct NTSStationDetailView: View {
     public let station: Station
     public let config: NTSStationConfig
@@ -59,18 +61,7 @@ public struct NTSStationDetailView: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .tracking(0.8)
-                    HStack {
-                        ForEach(config.query.genreTags, id: \.self) { tag in
-                            Text(tag)
-                                .font(.caption)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 3)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 3)
-                                        .strokeBorder(Color.secondary.opacity(0.4), lineWidth: 1)
-                                )
-                        }
-                    }
+                    FlowingChipList(items: config.query.genreTags)
                 }
 
                 // Year range (if set)
@@ -84,6 +75,17 @@ public struct NTSStationDetailView: View {
                         let yMax = config.query.yearMax.map { "\($0)" } ?? "—"
                         Text("\(yMin) – \(yMax)")
                             .font(.callout.monospacedDigit())
+                    }
+                }
+
+                // Regions (if any)
+                if !config.query.regions.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("REGIONS")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .tracking(0.8)
+                        FlowingChipList(items: config.query.regions)
                     }
                 }
 
@@ -219,6 +221,29 @@ public struct NTSStationDetailView: View {
         .buttonStyle(.bordered)
         .tint(saved ? .red : .accentColor)
         .disabled(saved || saveInFlight)
+    }
+}
+
+/// Lightweight chip row that wraps to multiple lines. Local to this file
+/// to match the pattern established by ``LastFMStationDetailView`` /
+/// ``BandcampStationDetailView`` — if any of the three grow a third
+/// caller the helper should be promoted into a shared location.
+private struct FlowingChipList: View {
+    let items: [String]
+
+    var body: some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 80), spacing: 6)], alignment: .leading, spacing: 6) {
+            ForEach(items, id: \.self) { item in
+                Text(item)
+                    .font(.caption)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 3)
+                            .strokeBorder(Color.secondary.opacity(0.4), lineWidth: 1)
+                    )
+            }
+        }
     }
 }
 #endif
