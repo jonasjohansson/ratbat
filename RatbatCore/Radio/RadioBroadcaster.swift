@@ -1123,10 +1123,17 @@ public final class RadioBroadcaster: ObservableObject {
         return LikeResponse(status: "error", path: nil, message: "decode failed")
     }
 
-    /// Copy the cached file into `~/<musicFolder>/Saved from <station>/<artist> — <title>.m4a`.
+    /// Copy the cached file into `~/<musicFolder>/<YYMMDD> <station>/<artist> — <title>.m4a`.
     /// Idempotent: if the destination already exists we return its path
-    /// rather than throwing. This keeps the UI behaviour for double-clicks
-    /// ("yes, still saved") consistent without extra round-trips.
+    /// rather than throwing — double-click ♥ means "yes, still saved",
+    /// not "error".
+    ///
+    /// The folder name carries today's date + the station so each day of
+    /// broadcasting builds a dated mix-tape folder. A save today lands
+    /// in `260418 90s Techno/`, tomorrow's in `260419 90s Techno/` — if
+    /// the station plays overnight the folder rolls naturally at
+    /// midnight (the formatter resolves `Date()` at save time, not
+    /// broadcast-start time).
     nonisolated private static func saveCached(
         cachedURL: URL,
         artist: String,
@@ -1134,8 +1141,9 @@ public final class RadioBroadcaster: ObservableObject {
         stationName: String,
         musicFolder: URL
     ) throws -> String {
+        let stamp = yymmddFormatter.string(from: Date())
         let folder = musicFolder.appendingPathComponent(
-            "Saved from \(sanitize(stationName))",
+            "\(stamp) \(sanitize(stationName))",
             isDirectory: true
         )
         try FileManager.default.createDirectory(
@@ -1151,6 +1159,16 @@ public final class RadioBroadcaster: ObservableObject {
         try FileManager.default.copyItem(at: cachedURL, to: destination)
         return destination.path
     }
+
+    /// Date formatter for the save-folder prefix. Short-form (YYMMDD),
+    /// POSIX locale + UTC so the stamp lines up across time-zone changes
+    /// instead of shifting when the user flies somewhere new.
+    nonisolated private static let yymmddFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyMMdd"
+        return f
+    }()
 
     /// Replace characters that trip macOS or URL handling (slashes,
     /// control chars, `:` which confuses classic Finder, Windows-reserved

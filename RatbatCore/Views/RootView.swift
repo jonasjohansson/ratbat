@@ -94,16 +94,6 @@ public struct RootView: View {
                     } detail: {
                         detailView
                     }
-                    .inspector(isPresented: $libraryVM.isInspectorOpen) {
-                        TrackInspectorView(track: libraryVM.selectedTrack) { track in
-                            // Play just the inspected track — the Inspector
-                            // button is a scoped "play this one thing" action
-                            // rather than the full-playlist queue semantics
-                            // of LibraryView's own play path.
-                            player.play(queue: [track], startingAt: 0)
-                        }
-                        .inspectorColumnWidth(min: 240, ideal: 300, max: 500)
-                    }
                     .toolbar {
                         ToolbarItem(placement: .primaryAction) {
                             addDownloadButton
@@ -116,9 +106,6 @@ public struct RootView: View {
                         }
                         ToolbarItem(placement: .primaryAction) {
                             broadcastButton
-                        }
-                        ToolbarItem(placement: .primaryAction) {
-                            inspectorToggle
                         }
                     }
                     .sheet(isPresented: $showingAddDownload) {
@@ -276,20 +263,6 @@ public struct RootView: View {
         }
         .pickerStyle(.menu)
         .help("Broadcast quality · Set in Preferences (⌘,) for more options")
-    }
-
-    /// Toolbar button that toggles the right-side Inspector pane. Bound to
-    /// `libraryVM.isInspectorOpen` so context-menu "Get Info" and the
-    /// toolbar share a single source of truth. ⌘I matches the Finder /
-    /// Music.app convention for opening an info panel.
-    @ViewBuilder private var inspectorToggle: some View {
-        Button {
-            libraryVM.isInspectorOpen.toggle()
-        } label: {
-            Image(systemName: "info.circle")
-        }
-        .keyboardShortcut("i", modifiers: .command)
-        .help(libraryVM.isInspectorOpen ? "Hide Info (⌘I)" : "Show Info (⌘I)")
     }
 
     /// Toolbar button that broadcasts the currently-selected station.

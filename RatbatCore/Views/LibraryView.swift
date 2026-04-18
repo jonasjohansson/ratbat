@@ -147,7 +147,7 @@ public struct LibraryView: View {
     /// toggle. The user can hit "Show all" to expand, or start typing in
     /// the search field (which always sees the full track list).
     @State private var showingAll: Bool = false
-    private static let initialPageSize = 500
+    private static let initialPageSize = 100
 
     /// Visible columns persisted as a JSON-encoded `[TrackColumn]` string.
     /// `@AppStorage` can't hold a `Set<TrackColumn>` directly, so we keep
@@ -156,33 +156,50 @@ public struct LibraryView: View {
     @AppStorage("ratbat.visibleColumns")
     private var visibleColumnsRaw: String = TrackColumn.defaultVisibleRaw
 
-    private var visibleColumns: Set<TrackColumn> {
-        guard let data = visibleColumnsRaw.data(using: .utf8),
-              let arr = try? JSONDecoder().decode([TrackColumn].self, from: data)
-        else {
-            return TrackColumn.defaultVisible
-        }
-        let decoded = Set(arr)
-        return decoded.isEmpty ? TrackColumn.defaultVisible : decoded
-    }
+    /// Memoised ordered-visible-columns. `@AppStorage` stores a JSON
+    /// blob and decoding it on every access is ~cheap but happens
+    /// 100-ish times per body re-eval (once per row + the header),
+    /// which dominated click latency on large playlists. We decode
+    /// once at appear + on every `visibleColumnsRaw` change and hand
+    /// rows the same array reference so Swift's Array equality check
+    /// sees identity-equality and no cell re-renders.
+    @State private var orderedVisibleColumns: [TrackColumn] = []
 
     public init(playlist: Playlist, onPlay: @escaping ([Track], Int) -> Void) {
         self.playlist = playlist
         self.onPlay = onPlay
     }
 
-    /// Columns actually rendered in the UI, in enum declaration order,
-    /// filtered by which ones the user has enabled.
-    private var orderedVisibleColumns: [TrackColumn] {
-        let visible = visibleColumns
-        return TrackColumn.allCases.filter { visible.contains($0) }
+    /// Decode the `@AppStorage` columns blob once. Called from
+    /// onAppear + onChange hooks that watch `visibleColumnsRaw`.
+    private func recomputeColumns() {
+        let decoded: Set<TrackColumn>
+        if let data = visibleColumnsRaw.data(using: .utf8),
+           let arr = try? JSONDecoder().decode([TrackColumn].self, from: data) {
+            let set = Set(arr)
+            decoded = set.isEmpty ? TrackColumn.defaultVisible : set
+        } else {
+            decoded = TrackColumn.defaultVisible
+        }
+        orderedVisibleColumns = TrackColumn.allCases.filter { decoded.contains($0) }
     }
 
-    /// The playlist's tracks after applying the current search filter and
-    /// sort order. Computed on every render; playlist sizes for a personal
-    /// music library (thousands, not millions) make this fine without
-    /// memoisation.
-    private var visibleTracks: [Track] {
+    /// Read-only accessor for places that still want the `Set` form.
+    /// Derived from the memoised list so it shares the same cache.
+    private var visibleColumns: Set<TrackColumn> {
+        Set(orderedVisibleColumns)
+    }
+
+    /// Memoised visible-tracks list. Recomputed by ``recomputeVisible()``
+    /// only when the inputs (playlist, searchText, sort, showingAll)
+    /// actually change — NOT on every SwiftUI re-render. Without this the
+    /// 500-track filter+sort would re-run on every click, which is what
+    /// was making row selection feel sluggish at library scale.
+    @State private var visibleTracks: [Track] = []
+
+    /// Recompute the memoised visible list. Called from onChange hooks
+    /// on each input state; keeps the expensive sort out of the body.
+    private func recomputeVisible() {
         let filtered: [Track]
         if searchText.isEmpty {
             filtered = playlist.tracks
@@ -194,16 +211,13 @@ public struct LibraryView: View {
                     || track.album.lowercased().contains(needle)
             }
         }
-        // Cap unfiltered view to initialPageSize for large playlists until
-        // the user explicitly opts in — keeps sidebar toggle + split-pane
-        // resize snappy on thousand-plus-track libraries.
         let capped: [Track]
         if searchText.isEmpty && !showingAll && filtered.count > Self.initialPageSize {
             capped = Array(filtered.prefix(Self.initialPageSize))
         } else {
             capped = filtered
         }
-        let sorted = capped.sorted { lhs, rhs in
+        visibleTracks = capped.sorted { lhs, rhs in
             switch sortColumn {
             case .trackNumber:
                 return compareInt(lhs.trackNumber ?? .max, rhs.trackNumber ?? .max)
@@ -227,7 +241,6 @@ public struct LibraryView: View {
                                      : lhs.dateAdded > rhs.dateAdded
             }
         }
-        return sorted
     }
 
     /// Localised case-insensitive compare, honouring the current sort
@@ -271,32 +284,28 @@ public struct LibraryView: View {
                     List(selection: $selectedID) {
                         ForEach(visibleTracks) { track in
                             TrackRow(track: track, columns: orderedVisibleColumns)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                                 .contentShape(Rectangle())
-                                // `simultaneousGesture` — not `.onTapGesture` —
-                                // so the List's own single-click selection
-                                // handler still fires. A plain onTapGesture
-                                // here swallows some clicks depending on
-                                // where in the row you hit, leaving rows
-                                // that look selected-but-aren't.
-                                .simultaneousGesture(
-                                    TapGesture(count: 2).onEnded { play(track) }
-                                )
-                                .contextMenu {
-                                    Button("Play") { play(track) }
-                                    Button("Show in Finder") { showInFinder(track) }
-                                    Divider()
-                                    Button("Get Info") {
-                                        // Surfaces the Inspector pane on
-                                        // macOS. On iOS the VM property is
-                                        // still there but harmlessly unused
-                                        // (LibraryView also isn't used
-                                        // there today).
-                                        selectedID = track.id
-                                        vm.selectedTrack = track
-                                        vm.isInspectorOpen = true
-                                    }
+                                .onTapGesture(count: 2) {
+                                    selectedID = track.id
+                                    play(track)
+                                }
+                                .onTapGesture(count: 1) {
+                                    selectedID = track.id
                                 }
                                 .tag(track.id)
+                        }
+                    }
+                    // One shared context menu for the List, driven by
+                    // current selection. Attaching 100 per-row
+                    // `.contextMenu` modifiers noticeably slowed down
+                    // click response on large playlists — this API
+                    // builds the menu on-demand when the user right-
+                    // clicks, once, instead of eagerly per row.
+                    .contextMenu(forSelectionType: Track.ID.self) { selectedIDs in
+                        if let track = listContextTarget(for: selectedIDs) {
+                            Button("Play") { play(track) }
+                            Button("Show in Finder") { showInFinder(track) }
                         }
                     }
                     .onKeyPress(.return) {
@@ -339,19 +348,35 @@ public struct LibraryView: View {
         }
         .navigationTitle(playlist.name)
         .searchable(text: $searchText, placement: .toolbar, prompt: "Filter tracks")
-        // Mirror row selection onto the view model so sibling UI — the
-        // macOS Inspector pane, or any future panel keyed on the current
-        // track — observes the same pick. We check both the visible
-        // (filtered + sorted) list and the full playlist so selection made
-        // via arrow keys or the context menu always resolves.
-        .onChange(of: selectedID) { _, newID in
-            guard let id = newID else {
-                vm.selectedTrack = nil
-                return
-            }
-            vm.selectedTrack = visibleTracks.first(where: { $0.id == id })
-                ?? playlist.tracks.first(where: { $0.id == id })
+        // Single onChange driven by a combined key so the SwiftUI
+        // body type-checker doesn't have to unify six separate
+        // onChange generics — the multi-modifier version was tipping
+        // past its "reasonable time" limit. Selection clicks no longer
+        // trigger a re-sort.
+        .onAppear {
+            recomputeVisible()
+            recomputeColumns()
         }
+        .onChange(of: recomputeKey) { _, _ in recomputeVisible() }
+        .onChange(of: visibleColumnsRaw) { _, _ in recomputeColumns() }
+    }
+
+    /// Combined hash of every input the memoised ``visibleTracks``
+    /// depends on. When any of these change the list gets resorted;
+    /// selection state is deliberately not included so clicks remain
+    /// cheap.
+    private var recomputeKey: String {
+        "\(playlist.id.uuidString)|\(playlist.tracks.count)|\(searchText)|\(sortColumn.rawValue)|\(sortAscending)|\(showingAll)"
+    }
+
+    /// Resolve the List's current selection set to the single track the
+    /// context menu should operate on. Falls back to the full playlist
+    /// when the id lives outside the visible page. Returns `nil` when
+    /// the selection is empty — caller renders no menu items.
+    private func listContextTarget(for ids: Set<Track.ID>) -> Track? {
+        guard let first = ids.first else { return nil }
+        return visibleTracks.first(where: { $0.id == first })
+            ?? playlist.tracks.first(where: { $0.id == first })
     }
 
     /// Builds a single clickable header cell. Widths come from

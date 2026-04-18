@@ -31,8 +31,12 @@ public struct PreferencesView: View {
                 .tabItem {
                     Label("Broadcast", systemImage: "antenna.radiowaves.left.and.right")
                 }
+            lastFMTab
+                .tabItem {
+                    Label("Last.fm", systemImage: "chart.bar")
+                }
         }
-        .frame(width: 480, height: 340)
+        .frame(width: 520, height: 360)
         .padding()
     }
 
@@ -69,6 +73,35 @@ public struct PreferencesView: View {
                     )
                     .foregroundStyle(.orange)
                 }
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    @ViewBuilder
+    private var lastFMTab: some View {
+        Form {
+            Section("API Key") {
+                VStack(alignment: .leading, spacing: 6) {
+                    SecureField("Paste Last.fm API key…", text: $preferences.lastFMAPIKey)
+                        .textFieldStyle(.roundedBorder)
+                    Text(preferences.lastFMAPIKey.isEmpty
+                         ? "Register a free key at last.fm/api/account/create and paste it here — Last.fm-backed stations won't play until one is set."
+                         : "Stored in UserDefaults. Clearing this field disables Last.fm stations on the next broadcast start.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Section {
+                Button {
+                    if let url = URL(string: "https://www.last.fm/api/account/create") {
+                        NSWorkspace.shared.open(url)
+                    }
+                } label: {
+                    Label("Register a key at last.fm", systemImage: "arrow.up.right.square")
+                }
+                .buttonStyle(.link)
             }
         }
         .formStyle(.grouped)
