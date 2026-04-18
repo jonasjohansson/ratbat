@@ -36,10 +36,15 @@ public final class LibraryViewModel: ObservableObject {
     /// double-click to play); it just mirrors the picked track here whenever
     /// the row selection changes.
     @Published public var selectedTrack: Track?
-    /// Whether the macOS Inspector pane is open. Published so both the
-    /// toolbar button (toggle) and the context-menu "Get Info" action can
-    /// drive the same `.inspector(isPresented:)` binding on `RootView`.
-    @Published public var isInspectorOpen: Bool = false
+    /// Whether the macOS Inspector pane is open. Defaults to open —
+    /// Ratbat's detail panes carry enough surface area (station config,
+    /// now-playing, etc.) that the inspector rarely needs to hide, so
+    /// starting visible feels more natural than "click ⌘I to discover
+    /// there's a second pane". User can still toggle it away via the
+    /// toolbar button or ⌘I. Published so the toolbar, context menus,
+    /// and `.inspector(isPresented:)` binding on `RootView` all share
+    /// one source of truth.
+    @Published public var isInspectorOpen: Bool = true
     /// Current scan phase, published during a scan. Nil at rest and while a
     /// cache hit short-circuits the scan — cache loads are instant, so
     /// there's nothing to report. The UI switches the caption based on the

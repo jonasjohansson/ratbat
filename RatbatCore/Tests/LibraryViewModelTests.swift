@@ -74,7 +74,8 @@ final class LibraryViewModelTests: XCTestCase {
         // contract at the VM boundary instead.
         let vm = LibraryViewModel()
         XCTAssertNil(vm.selectedTrack)
-        XCTAssertFalse(vm.isInspectorOpen)
+        // Inspector now defaults open — see LibraryViewModel docstring.
+        XCTAssertTrue(vm.isInspectorOpen)
 
         let track = Track(
             url: URL(fileURLWithPath: "/x.m4a"),
@@ -86,8 +87,8 @@ final class LibraryViewModelTests: XCTestCase {
         vm.selectedTrack = track
         XCTAssertEqual(vm.selectedTrack?.id, track.id)
 
-        vm.isInspectorOpen = true
-        XCTAssertTrue(vm.isInspectorOpen)
+        vm.isInspectorOpen = false
+        XCTAssertFalse(vm.isInspectorOpen)
     }
 
     @MainActor
