@@ -88,5 +88,82 @@ final class LastFMStationConfigTests: XCTestCase {
         XCTAssertNil(json["tags"], "legacy 'tags' key should not be written")
         XCTAssertNil(json["yearMin"], "legacy top-level 'yearMin' should not be written")
     }
+
+    /// Legacy configs carried decade strings like "1990s" in the flat
+    /// `tags` list — the root cause of the Exaltasamba bug, because
+    /// precision verification treated temporal tags as genre proof.
+    /// The migration in `init(from:)` lifts them into numeric
+    /// yearMin/yearMax bounds so they can no longer confuse the
+    /// genre-tag pipeline.
+    func testDecode_legacyShapeWithDecadeTags_liftsYearRange() throws {
+        let legacy = """
+        {
+          "id": "\(UUID().uuidString)",
+          "name": "Legacy 90s Techno",
+          "tags": ["techno", "1990s"],
+          "shufflePool": true
+        }
+        """.data(using: .utf8)!
+        let decoded = try JSONDecoder().decode(LastFMStationConfig.self, from: legacy)
+        XCTAssertEqual(decoded.query.genreTags, ["techno"])
+        XCTAssertEqual(decoded.query.yearMin, 1990)
+        XCTAssertEqual(decoded.query.yearMax, 1999)
+    }
+
+    /// Multiple decade tags should union into a single wider range
+    /// rather than either keeping the string tags or picking one.
+    func testDecode_legacyShapeWithMultipleDecades_unionsYearRange() throws {
+        let legacy = """
+        {
+          "id": "\(UUID().uuidString)",
+          "name": "1970s-80s",
+          "tags": ["rock", "1970s", "1980s"],
+          "shufflePool": true
+        }
+        """.data(using: .utf8)!
+        let decoded = try JSONDecoder().decode(LastFMStationConfig.self, from: legacy)
+        XCTAssertEqual(decoded.query.genreTags, ["rock"])
+        XCTAssertEqual(decoded.query.yearMin, 1970)
+        XCTAssertEqual(decoded.query.yearMax, 1989)
+    }
+
+    /// When the legacy shape already has a yearMin/yearMax AND a decade
+    /// tag, the range widens to cover both — never narrowing the user's
+    /// stated intent.
+    func testDecode_legacyShapeDecadeTagWidensExistingRange() throws {
+        let legacy = """
+        {
+          "id": "\(UUID().uuidString)",
+          "name": "Widen",
+          "tags": ["techno", "2000s"],
+          "yearMin": 1995,
+          "yearMax": 1999,
+          "shufflePool": true
+        }
+        """.data(using: .utf8)!
+        let decoded = try JSONDecoder().decode(LastFMStationConfig.self, from: legacy)
+        XCTAssertEqual(decoded.query.genreTags, ["techno"])
+        XCTAssertEqual(decoded.query.yearMin, 1995)
+        XCTAssertEqual(decoded.query.yearMax, 2009)
+    }
+
+    /// Genre tags that coincidentally start with four digits but aren't
+    /// the NNNNs decade shape stay in the tag list — we don't want to
+    /// accidentally eat a band name like "1349" or "1999 (The Artist
+    /// Formerly Known As…)".
+    func testDecode_legacyShape_nonDecadeTagsStayAsGenres() throws {
+        let legacy = """
+        {
+          "id": "\(UUID().uuidString)",
+          "name": "Metal",
+          "tags": ["black metal", "1349", "1990s_lofi"],
+          "shufflePool": true
+        }
+        """.data(using: .utf8)!
+        let decoded = try JSONDecoder().decode(LastFMStationConfig.self, from: legacy)
+        XCTAssertEqual(decoded.query.genreTags, ["black metal", "1349", "1990s_lofi"])
+        XCTAssertNil(decoded.query.yearMin)
+        XCTAssertNil(decoded.query.yearMax)
+    }
 }
 #endif
