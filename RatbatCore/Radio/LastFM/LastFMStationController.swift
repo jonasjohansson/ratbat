@@ -152,7 +152,7 @@ public actor LastFMStationController {
         // Stage 1: raw fetch per configured tag. Aggregated into a
         // `tagHits` map so tag-mode union/intersection is one scan.
         var tagHits: [DedupKey: TagHitRecord] = [:]
-        for tag in config.tags {
+        for tag in config.query.genreTags {
             do {
                 let tracks = try await client.topTracks(forTag: tag, limit: 200)
                 for t in tracks {
@@ -167,13 +167,13 @@ public actor LastFMStationController {
         }
 
         if tagHits.isEmpty {
-            throw Error.noTracksForTags(config.tags)
+            throw Error.noTracksForTags(config.query.genreTags)
         }
 
         // Stage 2: tag mode (union / intersection).
-        let requiredTags = Set(config.tags.map { $0.lowercased() })
+        let requiredTags = Set(config.query.genreTags.map { $0.lowercased() })
         var candidates: [LastFMClient.TrackCandidate] = tagHits.values.compactMap { hit in
-            switch config.tagMode {
+            switch config.query.tagMatch {
             case .any:
                 return hit.candidate
             case .all:
@@ -189,7 +189,7 @@ public actor LastFMStationController {
         if total > 0 {
             let topCut = max(1, total / 10)           // top 10%
             let midCut = max(topCut + 1, total / 2)   // through 50%
-            switch config.popularity {
+            switch config.query.popularity {
             case .hits:
                 candidates = Array(candidates.prefix(topCut))
             case .middle:
@@ -198,10 +198,10 @@ public actor LastFMStationController {
                 candidates = Array(candidates[min(midCut, candidates.count)..<candidates.count])
             }
         }
-        logger.info("stage3 popularity \(String(describing: self.config.popularity), privacy: .public): \(candidates.count) candidates remain")
+        logger.info("stage3 popularity \(String(describing: self.config.query.popularity), privacy: .public): \(candidates.count) candidates remain")
 
         // Stage 4: library + artist exclusions.
-        if config.excludeOwnedLibrary {
+        if config.query.excludeOwnedLibrary {
             var filtered: [LastFMClient.TrackCandidate] = []
             for c in candidates {
                 let owned = await tasteProfile.libraryContainsArtist(c.artist)
@@ -209,18 +209,21 @@ public actor LastFMStationController {
             }
             candidates = filtered
         }
-        if !config.excludedArtists.isEmpty {
-            let excluded = Set(config.excludedArtists.map { $0.lowercased() })
+        if !config.query.excludedArtists.isEmpty {
+            let excluded = Set(config.query.excludedArtists.map { $0.lowercased() })
             candidates = candidates.filter { !excluded.contains($0.artist.lowercased()) }
         }
         logger.info("stage4 exclusions: \(candidates.count) candidates remain")
 
-        // Stage 5: precision mode — verify artist's top tags include at
-        // least one of the query tags. Off = skip, verified = top-5,
-        // strict = top-3. One API call per unique artist; cached in
-        // `LastFMClient`.
-        if config.precision != .off && !candidates.isEmpty {
-            let topN: Int = (config.precision == .strict) ? 3 : 5
+        // Stage 5: precision verification — artist's top-5 tags must
+        // include at least one of the query tags. One API call per
+        // unique artist; cached in `LastFMClient`. The old off/verified/
+        // strict knob was dropped in the faceted migration; Task 6 will
+        // formalize precision handling, but for now we always run the
+        // verified-equivalent check since it's cheap and catches the
+        // noisy-tag-contamination bug the feature was introduced for.
+        if !candidates.isEmpty {
+            let topN = 5
             let queryTagsLower = requiredTags
             var verified: [LastFMClient.TrackCandidate] = []
             for c in candidates {
@@ -262,7 +265,7 @@ public actor LastFMStationController {
         if scored.isEmpty {
             pool = []
             cursor = 0
-            throw Error.noTracksForTags(config.tags)
+            throw Error.noTracksForTags(config.query.genreTags)
         }
 
         // Stage 7: wildcard reservation. Split the survivors: top (1 -

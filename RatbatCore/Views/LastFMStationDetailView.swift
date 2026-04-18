@@ -55,18 +55,18 @@ public struct LastFMStationDetailView: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .tracking(0.8)
-                    FlowingTagList(tags: config.tags)
+                    FlowingTagList(tags: config.query.genreTags)
                 }
 
                 // Year range (if set)
-                if config.yearMin != nil || config.yearMax != nil {
+                if config.query.yearMin != nil || config.query.yearMax != nil {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("YEAR")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                             .tracking(0.8)
-                        let yMin = config.yearMin.map { "\($0)" } ?? "—"
-                        let yMax = config.yearMax.map { "\($0)" } ?? "—"
+                        let yMin = config.query.yearMin.map { "\($0)" } ?? "—"
+                        let yMax = config.query.yearMax.map { "\($0)" } ?? "—"
                         Text("\(yMin) – \(yMax)")
                             .font(.callout.monospacedDigit())
                         Text("Stored for reference; not enforced in v1 — tag filtering drives selection.")

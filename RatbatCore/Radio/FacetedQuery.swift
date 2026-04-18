@@ -54,3 +54,17 @@ public enum PopularityTier: String, Hashable, Codable, Sendable {
     case middle     // 10-50th percentile — default, balanced
     case deepCuts   // bottom 50% — underground / discovery
 }
+
+// Pin the on-disk schema explicitly. `.ratbat-stations.json` lives on
+// a shared Google Drive and is read by multiple machines, so we don't
+// want Swift's synthesized Codable keys tracking property identifiers
+// — a future rename would silently break compatibility otherwise.
+// The synthesized `init(from:)` / `encode(to:)` still apply; we just
+// nail down the key names here.
+extension FacetedQuery {
+    private enum CodingKeys: String, CodingKey {
+        case genreTags, yearMin, yearMax, regions
+        case tagMatch, popularity
+        case excludeOwnedLibrary, excludedArtists
+    }
+}

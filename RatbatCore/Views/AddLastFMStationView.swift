@@ -29,11 +29,13 @@ public struct AddLastFMStationView: View {
     @State private var yearMaxString: String = ""
     @State private var apiKeyDraft: String = ""
 
-    // Filter suite — defaults mirror LastFMStationConfig's defaults so
+    // Filter suite — defaults mirror FacetedQuery's defaults so
     // "just click Create" yields the same pool shape as pre-filter-UI.
-    @State private var tagMode: LastFMTagMode = .any
-    @State private var popularity: LastFMPopularityTier = .middle
-    @State private var precision: LastFMPrecisionMode = .verified
+    // Precision UI was removed as part of the faceted migration;
+    // LastFMStationController hard-codes .verified behavior for now —
+    // Task 6 will formalize this.
+    @State private var tagMode: TagMatch = .any
+    @State private var popularity: PopularityTier = .middle
     @State private var excludeOwnedLibrary: Bool = false
 
     /// Curated list of popular Last.fm tags. Ordered by rough popularity
@@ -115,22 +117,15 @@ public struct AddLastFMStationView: View {
             DisclosureGroup("Filters") {
                 VStack(alignment: .leading, spacing: 10) {
                     Picker("Tag mode", selection: $tagMode) {
-                        Text("Any tag matches (broad)").tag(LastFMTagMode.any)
-                        Text("All tags must match (narrow)").tag(LastFMTagMode.all)
+                        Text("Any tag matches (broad)").tag(TagMatch.any)
+                        Text("All tags must match (narrow)").tag(TagMatch.all)
                     }
                     .pickerStyle(.segmented)
 
                     Picker("Popularity", selection: $popularity) {
-                        Text("Hits — top 10%").tag(LastFMPopularityTier.hits)
-                        Text("Middle — 10–50%").tag(LastFMPopularityTier.middle)
-                        Text("Deep cuts — bottom 50%").tag(LastFMPopularityTier.deepCuts)
-                    }
-                    .pickerStyle(.menu)
-
-                    Picker("Precision", selection: $precision) {
-                        Text("Off — fast, noisy").tag(LastFMPrecisionMode.off)
-                        Text("Artist-verified (default)").tag(LastFMPrecisionMode.verified)
-                        Text("Strict — top-3 tags only").tag(LastFMPrecisionMode.strict)
+                        Text("Hits — top 10%").tag(PopularityTier.hits)
+                        Text("Middle — 10–50%").tag(PopularityTier.middle)
+                        Text("Deep cuts — bottom 50%").tag(PopularityTier.deepCuts)
                     }
                     .pickerStyle(.menu)
 
@@ -185,16 +180,15 @@ public struct AddLastFMStationView: View {
         if !trimmedKey.isEmpty {
             preferences.lastFMAPIKey = trimmedKey
         }
-        let config = LastFMStationConfig(
-            name: trimmedName,
-            tags: Array(selectedTags),
+        let query = FacetedQuery(
+            genreTags: Array(selectedTags),
             yearMin: Int(yearMinString),
             yearMax: Int(yearMaxString),
-            tagMode: tagMode,
+            tagMatch: tagMode,
             popularity: popularity,
-            precision: precision,
             excludeOwnedLibrary: excludeOwnedLibrary
         )
+        let config = LastFMStationConfig(name: trimmedName, query: query)
         stations.createLastFM(config)
         dismiss()
     }

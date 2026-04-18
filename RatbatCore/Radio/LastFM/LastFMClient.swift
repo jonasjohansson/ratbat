@@ -130,7 +130,7 @@ public actor LastFMClient {
     /// relevance count (descending). Cached per-actor so repeated calls
     /// for the same artist are free after the first.
     ///
-    /// Used by the `LastFMPrecisionMode` filter to verify that a candidate
+    /// Used by the precision-verification stage to check that a candidate
     /// actually belongs to the requested genre — drops mis-tagged tracks
     /// (e.g. eurodance tracks leaking into a "techno" pool) before they
     /// reach the encoder.
