@@ -70,7 +70,7 @@ public struct AddLastFMStationView: View {
                     Text("Last.fm API key (paste once, saved in preferences)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    TextField("0943b6f7…", text: $apiKeyDraft)
+                    TextField("paste your API key", text: $apiKeyDraft)
                         .textFieldStyle(.roundedBorder)
                     Text("Register a free key at last.fm/api/account/create")
                         .font(.caption2)
