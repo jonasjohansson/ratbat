@@ -110,14 +110,16 @@ extension FacetedPipeline {
         let hi = yearMax ?? Int.max
 
         var kept: [SourceCandidate] = []
+        var unknownCount = 0
         for c in candidates {
             if let y = await mb.firstReleaseYear(artist: c.artist, title: c.title) {
                 if y >= lo && y <= hi { kept.append(c) }
             } else {
                 kept.append(c) // unknown → keep (fail-open)
+                unknownCount += 1
             }
         }
-        logger.info("era filter \(lo, privacy: .public)..\(hi, privacy: .public): \(candidates.count) → \(kept.count)")
+        logger.info("era filter \(lo, privacy: .public)..\(hi, privacy: .public): \(candidates.count) → \(kept.count) (\(unknownCount, privacy: .public) unknown, kept fail-open)")
         return kept
     }
 
@@ -135,6 +137,7 @@ extension FacetedPipeline {
         // Dedup artist lookups — one MB call per unique artist, not per
         // track. Pipeline refills can have 3-5 tracks per artist easily.
         var artistCode: [String: String?] = [:]
+        var unknownArtists: Set<String> = []
 
         for c in candidates {
             let key = c.artist.lowercased()
@@ -149,9 +152,10 @@ extension FacetedPipeline {
                 if allowed.contains(code.uppercased()) { kept.append(c) }
             } else {
                 kept.append(c) // unknown → keep (fail-open)
+                unknownArtists.insert(key)
             }
         }
-        logger.info("region filter \(allowed.sorted().joined(separator: ","), privacy: .public): \(candidates.count) → \(kept.count)")
+        logger.info("region filter \(allowed.sorted().joined(separator: ","), privacy: .public): \(candidates.count) → \(kept.count) (\(unknownArtists.count, privacy: .public) unknown artists, kept fail-open)")
         return kept
     }
 }
