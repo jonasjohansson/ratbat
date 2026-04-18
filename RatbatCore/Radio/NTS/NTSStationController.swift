@@ -5,23 +5,50 @@ import OSLog
 /// Orchestrator that turns an ``NTSStationConfig`` into a stream of
 /// playable, cached tracks.
 ///
-/// The controller is the glue layer between three actors:
+/// Glue between up to six actors:
+/// - ``NTSClient`` supplies the candidate pool via show + tracklist
+///   scraping for the configured tags.
+/// - ``MusicBrainzClient`` supplies authoritative release-year + country
+///   metadata, used by the shared ``FacetedPipeline`` for era + region
+///   filtering.
+/// - ``LastFMClient`` (optional) supplies per-artist top-tag verification
+///   so we can defuse the class of bug where a DJ's "techno" show has
+///   jazz/soul interludes — the show is tagged techno, but individual
+///   tracks may not be. Without a Last.fm API key the controller
+///   degrades to the legacy behaviour (pre-facet filtering only).
+/// - ``HistoryStore`` provides per-station dedup + the skip blacklist.
+/// - ``TrackResolver`` turns `(artist, title)` into a cached audio file
+///   via the shared yt-dlp + YT Music pipeline.
+/// - ``TasteProfile`` scores survivors against a locally derived taste
+///   profile (library top artists / top tags + per-station ♥-saves).
 ///
-/// - ``NTSClient`` supplies the candidate pool (shows → tracklists for
-///   the configured tags).
-/// - ``HistoryStore`` provides per-station dedup and records each play.
-/// - ``TrackResolver`` turns an (artist, title) pair into a cached
-///   audio file via YouTube Music + yt-dlp.
+/// ``nextTrack()`` is the only consumer-facing entry point. It pulls the
+/// next unseen candidate, resolves it, records the play, and returns a
+/// ``ResolvedTrack`` the broadcaster can hand to its decoder.
 ///
-/// ``nextTrack()`` is the only consumer-facing entry point. It pulls
-/// the next unseen candidate, resolves it, records the play, and
-/// returns a ``ResolvedTrack`` the broadcaster can hand to its decoder.
+/// ### Pool pipeline
 ///
-/// The pool is lazily refilled from NTS — we fetch a batch of shows
-/// for the tags, then drain them one tracklist at a time. When the
-/// pool runs dry we refill; when no more shows are available we throw
-/// ``Error/poolExhausted``. Callers (the broadcaster) are expected to
-/// decide what to do: widen tags, wait, stop.
+/// Unlike the Last.fm / Bandcamp sources — which fetch a big batch
+/// upfront — NTS paginates by show. Each refill pulls a small batch of
+/// shows (3 per pass), unions their tracklists, then runs the FULL
+/// ``FacetedPipeline`` over that batch so the per-track facets are
+/// enforced every pool cycle:
+///
+/// - Stage 1: scrape 3 shows → build one ``SourceCandidate`` per unique
+///   (artist, title) with the show's genres as `matchedTags`. Retains
+///   insertion order so the "newest show first" ordering survives when
+///   `shufflePool` is off.
+/// - Stage 2: tag mode (any / all) via the shared pipeline.
+/// - Stage 4: library + artist exclusions via the shared pipeline.
+/// - Stage 5 (optional): per-artist top-tag verification through
+///   Last.fm. When no API key is configured the stage is skipped and a
+///   single info log explains why.
+/// - Stage 6 / 7: MB era + region filters via the shared pipeline.
+/// - Stage 8: taste scoring + skip blacklist (drop negative scores).
+/// - Stage 9: wildcard reservation + optional shuffle.
+///
+/// Each stage logs surviving cardinality so a suspicious drop is
+/// obvious in OSLog.
 public actor NTSStationController {
 
     public struct ResolvedTrack: Sendable {
@@ -42,31 +69,53 @@ public actor NTSStationController {
 
     private let config: NTSStationConfig
     private let nts: NTSClient
+    private let musicBrainz: MusicBrainzClient
+    private let lastFM: LastFMClient?
     private let history: HistoryStore
     private let resolver: TrackResolver
+    private let tasteProfile: TasteProfile
     private let logger = Logger(subsystem: "se.jonasjohansson.ratbat", category: "nts-station")
 
-    /// Scraped candidate pool. Refilled from NTS when the cursor runs
-    /// past the end.
-    private var pool: [NTSClient.Tracklisting] = []
+    /// Carries the NTS show-URL for the artist/title pair through the
+    /// pipeline — ``SourceCandidate`` has no such field, but we need it
+    /// when recording history so "where did this come from?" is
+    /// answerable. Rebuilt on each refill; lookups are case-insensitive
+    /// on (artist, title) so casing drift between `matchedTags` copies
+    /// and the candidate out the back of the pipeline doesn't matter.
+    private var showURLByCandidate: [DedupKey: URL] = [:]
+
+    /// Survivors of the last pipeline pass.
+    private var pool: [SourceCandidate] = []
     private var cursor: Int = 0
 
-    /// Cached list of shows matching the station's tags. We drain two
-    /// or three shows per pool refill so NTS isn't hammered on every
-    /// single `nextTrack()` call.
+    /// Cached list of shows matching the station's tags. We drain three
+    /// shows per pool refill so NTS isn't hammered on every single
+    /// `nextTrack()` call and so the pipeline has a healthy batch to
+    /// work with.
     private var shows: [NTSClient.Show] = []
     private var showCursor: Int = 0
+
+    /// Reservation ratio: what fraction of the pool is unscored wildcards
+    /// vs taste-sorted top picks. 0.2 matches the Last.fm / Bandcamp
+    /// controllers so all three generative stations behave consistently.
+    private let wildcardFraction: Double = 0.2
 
     public init(
         config: NTSStationConfig,
         nts: NTSClient,
+        musicBrainz: MusicBrainzClient,
+        lastFM: LastFMClient?,
         history: HistoryStore,
-        resolver: TrackResolver
+        resolver: TrackResolver,
+        tasteProfile: TasteProfile
     ) {
         self.config = config
         self.nts = nts
+        self.musicBrainz = musicBrainz
+        self.lastFM = lastFM
         self.history = history
         self.resolver = resolver
+        self.tasteProfile = tasteProfile
     }
 
     /// Produce the next resolved track for this station.
@@ -104,7 +153,16 @@ public actor NTSStationController {
             )
             if seen { continue }
 
-            // (Year / duration filters would slot in here. Deferred to v2.)
+            let dedup = DedupKey(
+                artist: candidate.artist.lowercased(),
+                title: candidate.title.lowercased()
+            )
+            // Fall back to an NTS base URL if the side-table lookup
+            // misses — shouldn't happen in practice, but history.record
+            // needs a non-optional URL and we'd rather log a synthetic
+            // than crash on a stale pool entry.
+            let sourceShowURL = showURLByCandidate[dedup]
+                ?? URL(string: "https://www.nts.live/")!
 
             do {
                 let resolution = try await resolver.resolve(
@@ -115,7 +173,7 @@ public actor NTSStationController {
                     station: config.id,
                     artist: candidate.artist,
                     title: candidate.title,
-                    sourceShowURL: candidate.showURL,
+                    sourceShowURL: sourceShowURL,
                     youtubeID: resolution.youtubeID,
                     cachedPath: resolution.cachedURL.path
                 )
@@ -126,7 +184,7 @@ public actor NTSStationController {
                     cachedURL: resolution.cachedURL,
                     youtubeID: resolution.youtubeID,
                     historyID: rowid,
-                    sourceShowURL: candidate.showURL
+                    sourceShowURL: sourceShowURL
                 )
             } catch TrackResolver.Error.noYouTubeMatch {
                 // Don't record — if the YT catalog adds a match later
@@ -142,13 +200,10 @@ public actor NTSStationController {
         throw Error.poolExhausted
     }
 
-    // MARK: - Pool management
+    // MARK: - Pool pipeline
 
-    /// Fetch fresh tracklists from NTS when the pool runs low.
-    ///
-    /// Pulls two or three shows per refill so the pool has breadth
-    /// without triggering an NTS fetch on every single dequeue. If the
-    /// cached show list is empty, it's refreshed first.
+    /// Drain the next batch of NTS shows, collapse their tracklists into
+    /// a ``SourceCandidate`` list, then run the full faceted pipeline.
     private func refillPool() async throws {
         if showCursor >= shows.count {
             try await refreshShows()
@@ -157,7 +212,22 @@ public actor NTSStationController {
             throw Error.noShowsForTags(config.query.genreTags)
         }
 
-        var collected: [NTSClient.Tracklisting] = []
+        // Stage 1: scrape. Drain up to 3 shows, fold duplicate
+        // (artist, title) pairs into a single SourceCandidate with the
+        // accumulated show genres as `matchedTags`.
+        //
+        // Preserve first-insertion order — dictionary iteration is
+        // non-deterministic (randomised hash seeding) which would
+        // reshuffle the pool on every refill and fight `shufflePool =
+        // false`.
+        struct SeedRecord {
+            var candidate: SourceCandidate
+            var matchedTags: Set<String>
+            var showURL: URL
+        }
+        var seeds: [SeedRecord] = []
+        var seedIndex: [DedupKey: Int] = [:]
+
         let take = min(3, shows.count - showCursor)
         for _ in 0..<take {
             let show = shows[showCursor]
@@ -167,19 +237,211 @@ public actor NTSStationController {
                 if config.shufflePool {
                     listings.shuffle()
                 }
-                collected.append(contentsOf: listings)
+                // Show-level genres double as each tracklisting's
+                // matchedTags — the show is the unit of tag curation on
+                // NTS. Lowercased to match FacetedPipeline conventions.
+                let showTagsLower = Set(show.tags.map { $0.lowercased() })
+                for row in listings {
+                    let key = DedupKey(
+                        artist: row.artist.lowercased(),
+                        title: row.title.lowercased()
+                    )
+                    if let idx = seedIndex[key] {
+                        var existing = seeds[idx]
+                        existing.matchedTags.formUnion(showTagsLower)
+                        existing.candidate = SourceCandidate(
+                            artist: existing.candidate.artist,
+                            title: existing.candidate.title,
+                            resolvedURL: existing.candidate.resolvedURL,
+                            listenersHint: existing.candidate.listenersHint,
+                            matchedTags: existing.matchedTags
+                        )
+                        seeds[idx] = existing
+                    } else {
+                        let cand = SourceCandidate(
+                            artist: row.artist,
+                            title: row.title,
+                            resolvedURL: nil,
+                            listenersHint: nil,
+                            matchedTags: showTagsLower
+                        )
+                        seedIndex[key] = seeds.count
+                        seeds.append(SeedRecord(
+                            candidate: cand,
+                            matchedTags: showTagsLower,
+                            showURL: show.url
+                        ))
+                    }
+                }
             } catch {
                 logger.info("skip show with unfetchable tracklist: \(show.url.absoluteString, privacy: .public)")
             }
         }
 
-        if collected.isEmpty {
+        if seeds.isEmpty {
+            throw Error.noTracklistsAvailable
+        }
+        logger.info("stage1 scrape: \(seeds.count) candidates from \(take) show(s)")
+
+        // Rebuild the show-URL side-table so history.record can source
+        // the original NTS page.
+        showURLByCandidate.removeAll(keepingCapacity: true)
+        for seed in seeds {
+            let key = DedupKey(
+                artist: seed.candidate.artist.lowercased(),
+                title: seed.candidate.title.lowercased()
+            )
+            showURLByCandidate[key] = seed.showURL
+        }
+
+        // Stage 2: tag mode via the shared pipeline. `.any` is a no-op
+        // here — NTS tags are show-level, not Last.fm's global cloud,
+        // so every candidate already matched SOME required tag just by
+        // surviving the per-tag show scrape. `.all` narrows to
+        // candidates whose parent show was tagged with every required
+        // tag simultaneously.
+        let requiredTags = Set(config.query.genreTags.map { $0.lowercased() })
+        let tagModeInput: [(SourceCandidate, Set<String>)] = seeds.map { ($0.candidate, $0.matchedTags) }
+        var candidates: [SourceCandidate] = FacetedPipeline.applyTagMode(
+            tagModeInput,
+            required: requiredTags,
+            mode: config.query.tagMatch
+        )
+        logger.info("stage2 tag mode: \(candidates.count) candidates remain")
+
+        // Stage 3: popularity tier — SKIPPED for NTS. There is no
+        // listener-count signal (DJ-curated, not aggregated); popularity
+        // doesn't translate.
+
+        // Stage 4: library + artist exclusions via the shared pipeline.
+        // Runs BEFORE the network-expensive stages so we don't spend
+        // HTTP budget on candidates we're about to drop anyway.
+        candidates = await FacetedPipeline.applyExclusions(
+            candidates,
+            excludedArtists: config.query.excludedArtists,
+            excludeOwnedLibrary: config.query.excludeOwnedLibrary,
+            tasteProfile: tasteProfile
+        )
+        logger.info("stage4 exclusions: \(candidates.count) candidates remain")
+
+        // Stage 5: optional precision verification through Last.fm.
+        //
+        // This is the whole reason NTS moved onto the shared pipeline:
+        // a DJ's "techno" show can include jazz or soul interludes. The
+        // SHOW is tagged techno, but the individual tracks aren't.
+        // Without precision, those interludes leak into a "techno"
+        // station's feed.
+        //
+        // When the user has a Last.fm API key configured we check each
+        // candidate artist's top-5 tags against the station's required
+        // tags and drop misses. When no key is present the stage is
+        // skipped and we log once so the reason for the drop-off in
+        // specificity is discoverable without reading source.
+        if let lastFM, !candidates.isEmpty {
+            let topN = 5
+            let queryTagsLower = requiredTags
+            var verified: [SourceCandidate] = []
+            // Per-refill cache so repeated artists don't trigger a
+            // second Last.fm call. LastFMClient has its own actor-
+            // scoped cache too, but this keeps the hot path bounded.
+            var artistTagCache: [String: Set<String>] = [:]
+            for c in candidates {
+                let key = c.artist.lowercased()
+                let topTags: Set<String>
+                if let cached = artistTagCache[key] {
+                    topTags = cached
+                } else {
+                    do {
+                        let tags = try await lastFM.artistTopTags(c.artist)
+                        topTags = Set(tags.prefix(topN).map { $0.name })
+                        artistTagCache[key] = topTags
+                    } catch {
+                        // Fail-open: if the API call fails, keep the
+                        // candidate rather than over-filter. Logged at
+                        // info so OSLog doesn't fill with noise.
+                        logger.info("precision lookup failed for \(c.artist, privacy: .public); keeping: \(String(describing: error), privacy: .public)")
+                        verified.append(c)
+                        continue
+                    }
+                }
+                if !topTags.isDisjoint(with: queryTagsLower) {
+                    verified.append(c)
+                } else {
+                    logger.info("precision dropped \(c.artist, privacy: .public) (top: \(topTags.sorted().joined(separator: ", "), privacy: .public))")
+                }
+            }
+            candidates = verified
+        } else if lastFM == nil {
+            logger.info("stage5 precision: skipped — Last.fm key not set")
+        }
+        logger.info("stage5 precision: \(candidates.count) candidates remain")
+
+        // Stage 6: MB era filter — enforce `config.query.yearMin/yearMax`
+        // via the shared pipeline. Fail-open for unknown MB entries.
+        candidates = await FacetedPipeline.applyEraFilter(
+            candidates,
+            yearMin: config.query.yearMin,
+            yearMax: config.query.yearMax,
+            mb: musicBrainz
+        )
+        logger.info("stage6 era: \(candidates.count) candidates remain")
+
+        // Stage 7: MB region filter — enforce `config.query.regions` via
+        // the shared pipeline. Also fail-open; one MB call per unique
+        // artist courtesy of the pipeline's internal cache.
+        candidates = await FacetedPipeline.applyRegionFilter(
+            candidates,
+            regions: config.query.regions,
+            mb: musicBrainz
+        )
+        logger.info("stage7 region: \(candidates.count) candidates remain")
+
+        // Stage 8: skip blacklist + taste scoring. Drop negative-scored
+        // (skipped) candidates and sort the rest high→low.
+        var scored: [(cand: SourceCandidate, score: Double)] = []
+        for c in candidates {
+            let s = await tasteProfile.score(
+                candidateArtist: c.artist,
+                candidateTags: Array(c.matchedTags),
+                stationID: config.id,
+                history: history
+            )
+            if s < 0 { continue }     // skip blacklist hit
+            scored.append((c, s))
+        }
+        scored.sort { $0.score > $1.score }
+        logger.info("stage8 scored: \(scored.count) candidates ranked")
+
+        if scored.isEmpty {
+            // Pipeline drained the batch entirely. The outer refill loop
+            // will call refillPool again on the next nextTrack(), which
+            // advances showCursor to the next batch. Let that ride
+            // rather than pre-draining recursively here.
+            pool = []
+            cursor = 0
             throw Error.noTracklistsAvailable
         }
 
-        pool = collected
-        cursor = 0
-        logger.info("refilled pool with \(collected.count) candidates")
+        // Stage 9: wildcard reservation + optional shuffle. Mirrors
+        // LastFM/Bandcamp so the three generative stations feel
+        // consistent. When `shufflePool` is off we keep scrape order
+        // (newest show first), skipping the wildcard split.
+        if config.shufflePool {
+            let wildcardCount = max(1, Int(Double(scored.count) * wildcardFraction))
+            let topCount = max(scored.count - wildcardCount, 0)
+            let topSlice = Array(scored.prefix(topCount)).map { $0.cand }
+            var wildcardSlice = Array(scored.suffix(wildcardCount)).map { $0.cand }
+            wildcardSlice.shuffle()
+
+            pool = interleave(topSlice, wildcardSlice)
+            pool = softShuffle(pool, window: 4)
+            cursor = 0
+            logger.info("stage9 pool ready: \(self.pool.count) candidates (wildcards: \(wildcardCount))")
+        } else {
+            pool = scored.map { $0.cand }
+            cursor = 0
+            logger.info("stage9 pool ready: \(self.pool.count) candidates (order preserved)")
+        }
     }
 
     /// Fetch the show list for each configured tag, dedup by URL,
@@ -205,6 +467,42 @@ public actor NTSStationController {
         showCursor = 0
         let tagList = config.query.genreTags.joined(separator: ", ")
         logger.info("refreshed shows pool: \(collected.count) shows for tags \(tagList, privacy: .public)")
+    }
+
+    // MARK: - Helpers
+
+    private struct DedupKey: Hashable {
+        let artist: String
+        let title: String
+    }
+
+    /// Interleave `primary` with `secondary` — take one from each as
+    /// long as both are non-empty, then append whichever still has
+    /// items. Yields a "scored, wildcard, scored, wildcard, …" ordering.
+    private func interleave<T>(_ primary: [T], _ secondary: [T]) -> [T] {
+        var out: [T] = []
+        out.reserveCapacity(primary.count + secondary.count)
+        var i = 0, j = 0
+        while i < primary.count || j < secondary.count {
+            if i < primary.count { out.append(primary[i]); i += 1 }
+            if j < secondary.count { out.append(secondary[j]); j += 1 }
+        }
+        return out
+    }
+
+    /// Shuffle within fixed-size windows. Preserves coarse ordering
+    /// (top-ranked slice stays near the front) while jittering the
+    /// first-play pick so we don't always lead with the same track.
+    private func softShuffle<T>(_ items: [T], window: Int) -> [T] {
+        var out: [T] = []
+        out.reserveCapacity(items.count)
+        var i = 0
+        while i < items.count {
+            let end = min(i + window, items.count)
+            out.append(contentsOf: items[i..<end].shuffled())
+            i = end
+        }
+        return out
     }
 }
 #endif

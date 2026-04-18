@@ -325,13 +325,40 @@ public final class RadioBroadcaster: ObservableObject {
             return nil
         }
 
+        // Fall back to a fresh empty TasteProfile when the broadcaster
+        // wasn't wired up with one (test configs / legacy init). Same
+        // degradation story as the Last.fm / Bandcamp sources.
+        let profile = tasteProfile ?? TasteProfile()
+
+        // Optional Last.fm client — powers the shared pipeline's
+        // stage-5 precision check. Without it the NTS controller
+        // still filters via MB era/region + taste scoring, but
+        // `artist.getTopTags` verification is skipped (fail-open).
+        let lastFM = lastFMClientIfAvailable()
+
         let controller = NTSStationController(
             config: config,
             nts: nts,
+            musicBrainz: musicBrainz,
+            lastFM: lastFM,
             history: history,
-            resolver: resolver
+            resolver: resolver,
+            tasteProfile: profile
         )
         return NTSSource(controller: controller)
+    }
+
+    /// Shared helper returning a ``LastFMClient`` when the user has
+    /// pasted an API key, or nil otherwise. Used by both
+    /// ``makeLastFMSource(config:)`` (where nil is fatal — Last.fm
+    /// stations need the key to seed their pool) and
+    /// ``makeNTSSource(config:)`` (where nil just skips the optional
+    /// precision verification stage). Reads preferences each call so a
+    /// freshly-pasted key takes effect on the next broadcast start.
+    private func lastFMClientIfAvailable() -> LastFMClient? {
+        let apiKey = preferences.lastFMAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !apiKey.isEmpty else { return nil }
+        return LastFMClient(apiKey: apiKey)
     }
 
     /// Resolve a ``LastFMSource`` from injected dependencies + the user's
@@ -347,8 +374,7 @@ public final class RadioBroadcaster: ObservableObject {
             return nil
         }
 
-        let apiKey = preferences.lastFMAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !apiKey.isEmpty else {
+        guard let client = lastFMClientIfAvailable() else {
             let msg = "Last.fm station: API key missing. Paste one in Settings → Last.fm API key."
             error = msg
             logger.error("\(msg, privacy: .public)")
@@ -385,7 +411,6 @@ public final class RadioBroadcaster: ObservableObject {
             return nil
         }
 
-        let client = LastFMClient(apiKey: apiKey)
         // Fall back to a fresh empty TasteProfile when the broadcaster
         // wasn't wired up with one (test configs / legacy init). Scoring
         // against an empty profile just yields zero weights — the pool

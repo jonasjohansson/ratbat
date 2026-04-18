@@ -4,11 +4,14 @@ import XCTest
 
 /// Tests for ``NTSStationController``.
 ///
-/// The controller composes three actors (NTSClient, HistoryStore,
-/// TrackResolver) and only its NTS/history sides are cheap to stand
-/// up in a test. ``TrackResolver`` wraps a Python subprocess and needs
-/// a real venv, so we don't invoke `nextTrack()` here — that belongs
-/// in an end-to-end / smoke test with real services.
+/// The controller composes up to six actors (NTSClient, MusicBrainzClient,
+/// optional LastFMClient, HistoryStore, TrackResolver, TasteProfile) and
+/// only the network-free sides are cheap to stand up here.
+/// ``TrackResolver`` wraps a Python subprocess and needs a real venv, so
+/// we don't invoke `nextTrack()` — that belongs in an end-to-end / smoke
+/// test with real services. ``MusicBrainzClient`` is constructed because
+/// the new init signature requires it; it makes no network calls in
+/// these tests (no stage that would trigger one is exercised).
 ///
 /// These tests cover:
 /// - ``NTSStationConfig`` Codable round-trip + defaults
@@ -78,11 +81,16 @@ final class NTSStationControllerTests: XCTestCase {
         )
 
         let cfg = NTSStationConfig(name: "Test", query: FacetedQuery(genreTags: ["ambient"]))
+        let mb = MusicBrainzClient(userAgent: "Ratbat/test (jns.johansson@gmail.com)")
+        let profile = TasteProfile()
         let controller = NTSStationController(
             config: cfg,
             nts: nts,
+            musicBrainz: mb,
+            lastFM: nil,
             history: history,
-            resolver: resolver
+            resolver: resolver,
+            tasteProfile: profile
         )
         // Just confirm construction succeeded; don't drive the state
         // machine (that requires the network + venv).
