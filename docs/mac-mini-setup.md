@@ -27,8 +27,8 @@ Python 3.14 specifically — some of the resolver's transitive deps (spotapi in 
 ## 2. Clone + build
 
 ```bash
-mkdir -p ~/Documents/GitHub
-cd ~/Documents/GitHub
+mkdir -p ~/Documents/GitHub/org/jonasjohansson
+cd ~/Documents/GitHub/org/jonasjohansson
 git clone https://github.com/jonasjohansson/ratbat.git
 cd ratbat
 ./install.sh
