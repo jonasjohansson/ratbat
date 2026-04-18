@@ -40,6 +40,11 @@ public enum FacetedPipeline {
 
     /// Applies `.any` (union) / `.all` (intersection) across the candidate
     /// tags vs the required query tags.
+    ///
+    /// Precondition for `.any`: the caller (stage 1 seed fetch) has already
+    /// ensured every candidate matched at least one of the `required` tags.
+    /// The function does not defensively re-check this — passing in candidates
+    /// with empty matchedTags will let them through unfiltered.
     public static func applyTagMode(
         _ candidates: [(SourceCandidate, Set<String>)],
         required: Set<String>,
@@ -75,6 +80,78 @@ public enum FacetedPipeline {
             }
             kept.append(c)
         }
+        return kept
+    }
+}
+
+/// Minimal surface the pipeline needs from a MusicBrainz-style lookup.
+/// Lets tests substitute a stub. The real ``MusicBrainzClient`` conforms
+/// via an extension in the client file.
+public protocol MusicBrainzLookup: Actor {
+    func firstReleaseYear(artist: String, title: String) async -> Int?
+    func countryCode(forArtist artist: String) async -> String?
+}
+
+extension FacetedPipeline {
+    // MARK: - Era filter (stage 6)
+
+    /// Drops candidates whose MB-reported release year falls outside the
+    /// configured range. Candidates with unknown year (MB said nothing)
+    /// are **kept** — fail-open per the design doc, since MB coverage on
+    /// Bandcamp bedroom-producer material is ~50%.
+    public static func applyEraFilter(
+        _ candidates: [SourceCandidate],
+        yearMin: Int?,
+        yearMax: Int?,
+        mb: MusicBrainzLookup
+    ) async -> [SourceCandidate] {
+        guard yearMin != nil || yearMax != nil else { return candidates }
+        let lo = yearMin ?? Int.min
+        let hi = yearMax ?? Int.max
+
+        var kept: [SourceCandidate] = []
+        for c in candidates {
+            if let y = await mb.firstReleaseYear(artist: c.artist, title: c.title) {
+                if y >= lo && y <= hi { kept.append(c) }
+            } else {
+                kept.append(c) // unknown → keep (fail-open)
+            }
+        }
+        logger.info("era filter \(lo, privacy: .public)..\(hi, privacy: .public): \(candidates.count) → \(kept.count)")
+        return kept
+    }
+
+    // MARK: - Region filter (stage 7)
+
+    public static func applyRegionFilter(
+        _ candidates: [SourceCandidate],
+        regions: [String],
+        mb: MusicBrainzLookup
+    ) async -> [SourceCandidate] {
+        guard !regions.isEmpty else { return candidates }
+        let allowed = Set(regions.map { $0.uppercased() })
+
+        var kept: [SourceCandidate] = []
+        // Dedup artist lookups — one MB call per unique artist, not per
+        // track. Pipeline refills can have 3-5 tracks per artist easily.
+        var artistCode: [String: String?] = [:]
+
+        for c in candidates {
+            let key = c.artist.lowercased()
+            let code: String?
+            if let cached = artistCode[key] {
+                code = cached
+            } else {
+                code = await mb.countryCode(forArtist: c.artist)
+                artistCode[key] = .some(code)
+            }
+            if let code {
+                if allowed.contains(code.uppercased()) { kept.append(c) }
+            } else {
+                kept.append(c) // unknown → keep (fail-open)
+            }
+        }
+        logger.info("region filter \(allowed.sorted().joined(separator: ","), privacy: .public): \(candidates.count) → \(kept.count)")
         return kept
     }
 }

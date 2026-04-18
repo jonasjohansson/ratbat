@@ -173,4 +173,6 @@ public actor MusicBrainzClient {
         return data
     }
 }
+
+extension MusicBrainzClient: MusicBrainzLookup {}
 #endif
