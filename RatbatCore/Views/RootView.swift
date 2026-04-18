@@ -393,6 +393,21 @@ public struct RootView: View {
                     }
                 }
             )
+        } else if let bandcampStation = resolvedBandcampStation {
+            BandcampStationDetailView(
+                station: bandcampStation.0,
+                config: bandcampStation.1,
+                radio: radio,
+                onBroadcastToggle: {
+                    Task {
+                        if radio.isBroadcasting(stationID: bandcampStation.0.id) {
+                            radio.stopBroadcast(stationID: bandcampStation.0.id)
+                        } else {
+                            await radio.startBroadcast(station: bandcampStation.0)
+                        }
+                    }
+                }
+            )
         } else if let playlist = resolvedDetailPlaylist {
             LibraryView(playlist: playlist) { tracks, startIndex in
                 // Queue the whole playlist and start from the picked
@@ -440,6 +455,18 @@ public struct RootView: View {
         guard case let .some(.station(id)) = sidebarSelection,
               let station = stations.stations.first(where: { $0.id == id }),
               let config = station.lastFMConfig
+        else { return nil }
+        return (station, config)
+    }
+
+    /// When the sidebar selection resolves to a Bandcamp-backed station,
+    /// return it + its config so the detail pane can render its dedicated
+    /// view. Mirrors ``resolvedLastFMStation`` — same shape, different
+    /// config type.
+    private var resolvedBandcampStation: (Station, BandcampStationConfig)? {
+        guard case let .some(.station(id)) = sidebarSelection,
+              let station = stations.stations.first(where: { $0.id == id }),
+              let config = station.bandcampConfig
         else { return nil }
         return (station, config)
     }
