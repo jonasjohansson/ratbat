@@ -16,12 +16,12 @@ import OSLog
 ///   ``FacetedPipeline`` stages.
 /// - ``HistoryStore`` provides per-station dedup (don't replay a track
 ///   on the same station) + the skip blacklist.
-/// - ``TrackResolver`` turns `(artist, title)` into a cached audio file
-///   via the shared yt-dlp + YT Music pipeline. Task 10 adds a
-///   direct-URL shortcut so the resolver can hand yt-dlp the Bandcamp
-///   release URL straight, skipping YouTube-Music matching — this
-///   controller already sets ``SourceCandidate/resolvedURL`` so that
-///   shortcut lights up without further changes here.
+/// - ``TrackResolver`` turns a candidate into a cached audio file. For
+///   Bandcamp sources it takes the direct-URL shortcut — every candidate
+///   here carries ``SourceCandidate/resolvedURL``, so the resolver hands
+///   that URL straight to yt-dlp's `BandcampIE` extractor and skips the
+///   YouTube-Music search. No Ratbat-side scraping beyond the discover
+///   endpoint is involved in the download path.
 /// - ``TasteProfile`` scores the surviving candidates against a locally
 ///   derived taste profile (library top artists / top tags + per-station
 ///   ♥-saves).
@@ -129,21 +129,21 @@ public actor BandcampStationController {
             if seen { continue }
 
             do {
-                // Task 10 will extend the resolver to take a different
-                // path when ``SourceCandidate/resolvedURL`` is set (hand
-                // yt-dlp the Bandcamp URL directly, skip YT-Music
-                // matching). For now we call the same (artist, title)
-                // shape as the Last.fm controller; the shortcut lights
-                // up once the resolver change lands, with no further
-                // modifications needed here.
-                let resolution = try await resolver.resolve(
-                    artist: candidate.artist,
-                    title: candidate.title
-                )
+                // Direct-URL shortcut (Task 10): the resolver branches
+                // internally on ``SourceCandidate/resolvedURL``. When that
+                // field is set — which our stage-1 scrape guarantees for
+                // every Bandcamp candidate — the resolver hands the URL
+                // straight to yt-dlp's `BandcampIE` extractor, skipping
+                // the YouTube-Music search entirely. ``Resolution/youtubeID``
+                // in that case is a synthetic `"bandcamp:<id>"` identifier,
+                // not a real YT catalog id.
+                let resolution = try await resolver.resolve(candidate: candidate)
                 // Prefer the Bandcamp release URL when we have it so the
                 // history row points at the actual source page (useful
                 // for "where did this come from?" debugging) rather than
-                // the YT-Music fallback.
+                // a synthetic YT-Music fallback. For direct-URL results
+                // the fallback wouldn't resolve to a playable YT page
+                // anyway — its id is a `"bandcamp:..."` sentinel.
                 let sourceURL = candidate.resolvedURL
                     ?? URL(string: "https://music.youtube.com/watch?v=\(resolution.youtubeID)")
                     ?? URL(string: "https://bandcamp.com/")!

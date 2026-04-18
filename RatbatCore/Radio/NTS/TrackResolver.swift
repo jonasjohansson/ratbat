@@ -76,6 +76,44 @@ public actor TrackResolver {
     ///   ``Error/venvNotReady`` if the configured Python binary doesn't exist,
     ///   ``Error/resolverScriptMissing`` if the wrapper script is missing.
     public func resolve(artist: String, title: String) async throws -> Resolution {
+        try await runResolver(artist: artist, title: title, sourceURL: nil)
+    }
+
+    /// Dispatches to the direct-URL shortcut when the candidate carries a
+    /// pre-resolved audio URL, otherwise falls back to the standard
+    /// YouTube-Music search path.
+    ///
+    /// Sources that already know where the audio lives (Bandcamp's discover
+    /// endpoint hands us the release page URL in stage 1) set
+    /// ``SourceCandidate/resolvedURL``. When that's present we skip the
+    /// `ytmusicapi` search and let yt-dlp's extractor (e.g. `BandcampIE`)
+    /// handle the URL directly — no second-round matching that could pick
+    /// a different artist's cover, and no wasted API calls.
+    ///
+    /// The resulting ``Resolution/youtubeID`` is a synthetic identifier of
+    /// the form `"<extractor>:<id>"` (e.g. `"bandcamp:1234567890"`) so
+    /// downstream code can still use it as an opaque dedup key.
+    ///
+    /// - Throws: same set as ``resolve(artist:title:)``, plus
+    ///   ``Error/downloadFailed(_:)`` for a direct-URL fetch that fails
+    ///   (there is no ``Error/noYouTubeMatch(artist:title:)`` in this path
+    ///   — the caller picked the URL, so "nothing found" isn't a concept).
+    public func resolve(candidate: SourceCandidate) async throws -> Resolution {
+        try await runResolver(
+            artist: candidate.artist,
+            title: candidate.title,
+            sourceURL: candidate.resolvedURL
+        )
+    }
+
+    /// Shared subprocess invocation for both the search-and-download path
+    /// and the direct-URL path. When `sourceURL` is non-nil the wrapper
+    /// skips its YT-Music search stage and hands the URL to yt-dlp as-is.
+    private func runResolver(
+        artist: String,
+        title: String,
+        sourceURL: URL?
+    ) async throws -> Resolution {
         // Sanity-check paths up-front so the failure mode is obvious.
         guard FileManager.default.isExecutableFile(atPath: venvPython.path) else {
             throw Error.venvNotReady
@@ -89,14 +127,19 @@ public actor TrackResolver {
         let outFilename = "\(UUID().uuidString).m4a"
         let outURL = cacheRoot.appendingPathComponent(outFilename)
 
-        let proc = Process()
-        proc.executableURL = venvPython
-        proc.arguments = [
+        var arguments: [String] = [
             wrapperScript.path,
             "--artist", artist,
             "--title", title,
             "--output", outURL.path,
         ]
+        if let sourceURL {
+            arguments.append(contentsOf: ["--source-url", sourceURL.absoluteString])
+        }
+
+        let proc = Process()
+        proc.executableURL = venvPython
+        proc.arguments = arguments
 
         let outPipe = Pipe()
         let errPipe = Pipe()
@@ -123,7 +166,10 @@ public actor TrackResolver {
         guard exit == 0 else {
             logger.error("resolve failed for \(artist, privacy: .public) — \(title, privacy: .public) [exit \(exit)]: \(errMsg, privacy: .public)")
             // Wrapper exits 1 on NO_MATCH and prints "NO_MATCH" to stderr.
-            if exit == 1 || errMsg.contains("NO_MATCH") {
+            // NO_MATCH is only reachable on the search path — the direct-URL
+            // path never runs the YT-Music search, so exit 1 there would be
+            // a bug. Treat it as a generic download failure regardless.
+            if sourceURL == nil && (exit == 1 || errMsg.contains("NO_MATCH")) {
                 // Best effort: the wrapper shouldn't have produced a file,
                 // but if an earlier partial write happened, clean it up.
                 try? FileManager.default.removeItem(at: outURL)
