@@ -20,32 +20,34 @@ final class NTSStationControllerTests: XCTestCase {
     func testConfigCodableRoundTrip() throws {
         let cfg = NTSStationConfig(
             name: "Saturday Ambient",
-            tags: ["ambient", "drone"],
-            yearMin: 2020,
-            yearMax: 2026,
+            query: FacetedQuery(
+                genreTags: ["ambient", "drone"],
+                yearMin: 2020,
+                yearMax: 2026
+            ),
             shufflePool: false
         )
         let data = try JSONEncoder().encode(cfg)
         let decoded = try JSONDecoder().decode(NTSStationConfig.self, from: data)
         XCTAssertEqual(decoded, cfg)
         XCTAssertEqual(decoded.id, cfg.id)
-        XCTAssertEqual(decoded.tags, ["ambient", "drone"])
-        XCTAssertEqual(decoded.yearMin, 2020)
-        XCTAssertEqual(decoded.yearMax, 2026)
+        XCTAssertEqual(decoded.query.genreTags, ["ambient", "drone"])
+        XCTAssertEqual(decoded.query.yearMin, 2020)
+        XCTAssertEqual(decoded.query.yearMax, 2026)
         XCTAssertFalse(decoded.shufflePool)
     }
 
     func testConfigDefaults() {
-        let cfg = NTSStationConfig(name: "X", tags: ["y"])
+        let cfg = NTSStationConfig(name: "X", query: FacetedQuery(genreTags: ["y"]))
         XCTAssertEqual(cfg.name, "X")
-        XCTAssertEqual(cfg.tags, ["y"])
-        XCTAssertNil(cfg.yearMin)
-        XCTAssertNil(cfg.yearMax)
+        XCTAssertEqual(cfg.query.genreTags, ["y"])
+        XCTAssertNil(cfg.query.yearMin)
+        XCTAssertNil(cfg.query.yearMax)
         XCTAssertTrue(cfg.shufflePool)
     }
 
     func testConfigIdentityStableAcrossEncode() throws {
-        let cfg = NTSStationConfig(name: "Ambient", tags: ["ambient"])
+        let cfg = NTSStationConfig(name: "Ambient", query: FacetedQuery(genreTags: ["ambient"]))
         let data = try JSONEncoder().encode(cfg)
         let decoded = try JSONDecoder().decode(NTSStationConfig.self, from: data)
         // Station id must survive round-trip — HistoryStore dedup keys off it.
@@ -75,7 +77,7 @@ final class NTSStationControllerTests: XCTestCase {
             cacheRoot: cacheRoot
         )
 
-        let cfg = NTSStationConfig(name: "Test", tags: ["ambient"])
+        let cfg = NTSStationConfig(name: "Test", query: FacetedQuery(genreTags: ["ambient"]))
         let controller = NTSStationController(
             config: cfg,
             nts: nts,

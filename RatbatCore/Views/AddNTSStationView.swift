@@ -121,12 +121,16 @@ public struct AddNTSStationView: View {
 
     private func create() {
         let trimmedName = name.trimmingCharacters(in: .whitespaces)
-        let config = NTSStationConfig(
-            name: trimmedName,
-            tags: Array(selectedTags),
+        // Commit-3 follow-up will replace this sheet's tag-grid + year
+        // fields with the shared FacetedQueryEditor. For now we just
+        // translate the existing state into a FacetedQuery inline so
+        // the new config API compiles.
+        let query = FacetedQuery(
+            genreTags: Array(selectedTags),
             yearMin: Int(yearMinString),
             yearMax: Int(yearMaxString)
         )
+        let config = NTSStationConfig(name: trimmedName, query: query)
         stations.createNTS(config)
         dismiss()
     }

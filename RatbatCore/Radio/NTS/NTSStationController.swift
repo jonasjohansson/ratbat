@@ -154,7 +154,7 @@ public actor NTSStationController {
             try await refreshShows()
         }
         guard showCursor < shows.count else {
-            throw Error.noShowsForTags(config.tags)
+            throw Error.noShowsForTags(config.query.genreTags)
         }
 
         var collected: [NTSClient.Tracklisting] = []
@@ -187,7 +187,7 @@ public actor NTSStationController {
     private func refreshShows() async throws {
         var seen: Set<URL> = []
         var collected: [NTSClient.Show] = []
-        for tag in config.tags {
+        for tag in config.query.genreTags {
             do {
                 let fetched = try await nts.shows(forTag: tag, limit: 20)
                 for s in fetched where !seen.contains(s.url) {
@@ -203,7 +203,7 @@ public actor NTSStationController {
         }
         shows = collected
         showCursor = 0
-        let tagList = config.tags.joined(separator: ", ")
+        let tagList = config.query.genreTags.joined(separator: ", ")
         logger.info("refreshed shows pool: \(collected.count) shows for tags \(tagList, privacy: .public)")
     }
 }

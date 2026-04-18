@@ -60,7 +60,7 @@ public struct NTSStationDetailView: View {
                         .foregroundStyle(.secondary)
                         .tracking(0.8)
                     HStack {
-                        ForEach(config.tags, id: \.self) { tag in
+                        ForEach(config.query.genreTags, id: \.self) { tag in
                             Text(tag)
                                 .font(.caption)
                                 .padding(.horizontal, 8)
@@ -74,14 +74,14 @@ public struct NTSStationDetailView: View {
                 }
 
                 // Year range (if set)
-                if config.yearMin != nil || config.yearMax != nil {
+                if config.query.yearMin != nil || config.query.yearMax != nil {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("YEAR")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                             .tracking(0.8)
-                        let yMin = config.yearMin.map { "\($0)" } ?? "—"
-                        let yMax = config.yearMax.map { "\($0)" } ?? "—"
+                        let yMin = config.query.yearMin.map { "\($0)" } ?? "—"
+                        let yMax = config.query.yearMax.map { "\($0)" } ?? "—"
                         Text("\(yMin) – \(yMax)")
                             .font(.callout.monospacedDigit())
                     }

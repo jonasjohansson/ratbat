@@ -30,9 +30,11 @@ final class StationKindTests: XCTestCase {
     func testNTSKindCodableRoundTrip() throws {
         let config = NTSStationConfig(
             name: "Saturday Ambient",
-            tags: ["ambient", "ECM"],
-            yearMin: 2020,
-            yearMax: 2026
+            query: FacetedQuery(
+                genreTags: ["ambient", "ECM"],
+                yearMin: 2020,
+                yearMax: 2026
+            )
         )
         let station = Station.fromNTS(config)
         let data = try JSONEncoder().encode(station)
@@ -40,16 +42,16 @@ final class StationKindTests: XCTestCase {
 
         XCTAssertEqual(decoded.id, config.id)
         XCTAssertEqual(decoded.name, "Saturday Ambient")
-        XCTAssertEqual(decoded.ntsConfig?.tags, ["ambient", "ECM"])
-        XCTAssertEqual(decoded.ntsConfig?.yearMin, 2020)
-        XCTAssertEqual(decoded.ntsConfig?.yearMax, 2026)
+        XCTAssertEqual(decoded.ntsConfig?.query.genreTags, ["ambient", "ECM"])
+        XCTAssertEqual(decoded.ntsConfig?.query.yearMin, 2020)
+        XCTAssertEqual(decoded.ntsConfig?.query.yearMax, 2026)
         XCTAssertTrue(decoded.queue.isEmpty)
     }
 
     /// `fromNTS` must reuse the config's id so HistoryStore dedup keys
     /// remain stable across broadcaster restarts.
     func testFromNTSReusesConfigID() {
-        let config = NTSStationConfig(name: "T", tags: ["ambient"])
+        let config = NTSStationConfig(name: "T", query: FacetedQuery(genreTags: ["ambient"]))
         let station = Station.fromNTS(config)
         XCTAssertEqual(station.id, config.id)
     }
@@ -68,7 +70,7 @@ final class StationKindTests: XCTestCase {
         mgr.setStorage(root: tempRoot)
         XCTAssertEqual(mgr.stations.count, 0)
 
-        mgr.createNTS(NTSStationConfig(name: "T", tags: ["ambient"]))
+        mgr.createNTS(NTSStationConfig(name: "T", query: FacetedQuery(genreTags: ["ambient"])))
         XCTAssertEqual(mgr.stations.count, 1)
         XCTAssertNotNil(mgr.stations.first?.ntsConfig)
         XCTAssertEqual(mgr.stations.first?.name, "T")
@@ -80,9 +82,9 @@ final class StationKindTests: XCTestCase {
     @MainActor
     func testCreateNTSDisambiguatesDuplicateName() {
         let mgr = StationManager()
-        mgr.createNTS(NTSStationConfig(name: "Chill", tags: ["ambient"]))
+        mgr.createNTS(NTSStationConfig(name: "Chill", query: FacetedQuery(genreTags: ["ambient"])))
         let second = mgr.createNTS(
-            NTSStationConfig(name: "Chill", tags: ["ambient"])
+            NTSStationConfig(name: "Chill", query: FacetedQuery(genreTags: ["ambient"]))
         )
         XCTAssertEqual(mgr.stations.count, 2)
         XCTAssertNotEqual(mgr.stations[0].slug, mgr.stations[1].slug)
@@ -114,7 +116,7 @@ final class StationKindTests: XCTestCase {
         let first = StationManager()
         first.setStorage(root: tempRoot)
         let created = first.createNTS(
-            NTSStationConfig(name: "Night Drive", tags: ["downtempo", "dub"])
+            NTSStationConfig(name: "Night Drive", query: FacetedQuery(genreTags: ["downtempo", "dub"]))
         )
 
         let second = StationManager()
@@ -122,7 +124,7 @@ final class StationKindTests: XCTestCase {
         XCTAssertEqual(second.stations.count, 1)
         XCTAssertEqual(second.stations.first?.id, created.id)
         XCTAssertEqual(
-            second.stations.first?.ntsConfig?.tags.sorted(),
+            second.stations.first?.ntsConfig?.query.genreTags.sorted(),
             ["downtempo", "dub"]
         )
     }
