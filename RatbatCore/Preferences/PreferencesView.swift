@@ -1,27 +1,33 @@
 #if os(macOS)
 import SwiftUI
+import AppKit
 
 /// Standard macOS Settings pane exposing the configurable subset of
-/// ``BroadcastPreferences``. Wired from the app's `Settings` scene, so
-/// ⌘, opens it from anywhere in the app.
+/// ``BroadcastPreferences`` plus the Library folder path. Wired from
+/// the app's `Settings` scene, so ⌘, opens it from anywhere in the app.
 ///
-/// Layout follows the platform convention: a `TabView` of named tabs
-/// (only one right now — Broadcast — but leaves room for future Library /
-/// Tunnel tabs without restructuring), each tab rendered as a grouped
-/// `Form` so labels and controls align naturally.
+/// Layout follows the platform convention: a `TabView` of named tabs,
+/// each tab rendered as a grouped `Form` so labels and controls align
+/// naturally.
 ///
 /// A compact "restart to apply" banner appears when the parent has
 /// flagged ``needsRestart``. That signal lives on the broadcaster, not on
 /// the preferences, so the view just receives it as a plain Bool.
 public struct PreferencesView: View {
     @ObservedObject public var preferences: BroadcastPreferences
+    /// Optional so tests / previews that don't care about the Library tab
+    /// can still construct the view. When nil the tab renders a hint
+    /// instead of the folder controls.
+    @ObservedObject public var libraryConfig: LibraryConfig
     public var needsRestart: Bool
 
     public init(
         preferences: BroadcastPreferences = .shared,
+        libraryConfig: LibraryConfig = LibraryConfig(),
         needsRestart: Bool = false
     ) {
         self.preferences = preferences
+        self.libraryConfig = libraryConfig
         self.needsRestart = needsRestart
     }
 
@@ -30,6 +36,10 @@ public struct PreferencesView: View {
             broadcastTab
                 .tabItem {
                     Label("Broadcast", systemImage: "antenna.radiowaves.left.and.right")
+                }
+            libraryTab
+                .tabItem {
+                    Label("Library", systemImage: "music.note.list")
                 }
             lastFMTab
                 .tabItem {
@@ -76,6 +86,62 @@ public struct PreferencesView: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    @ViewBuilder
+    private var libraryTab: some View {
+        Form {
+            Section("Music Folder") {
+                VStack(alignment: .leading, spacing: 6) {
+                    if let url = libraryConfig.musicFolder {
+                        Text(url.path)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .textSelection(.enabled)
+                    } else {
+                        Text("No folder picked yet.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    HStack(spacing: 8) {
+                        Button("Change…") { pickMusicFolder() }
+                        Button("Reload Library") { libraryConfig.requestReload() }
+                            .disabled(libraryConfig.musicFolder == nil)
+                    }
+                }
+            }
+            Section {
+                Text("""
+                Changing folders re-scans the library in place and re-points \
+                every playlist-backed station. Stations persist to \
+                `.ratbat-stations.json` next to the selected folder, so \
+                stations created against the previous folder will not appear \
+                until you point the app back at that folder.
+                """)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    /// Show a folder picker and, on OK, assign the new URL through the
+    /// `@Published` `musicFolder` setter. `RootView` observes the same
+    /// `LibraryConfig`, so it re-fires its library-load task automatically.
+    private func pickMusicFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        if let current = libraryConfig.musicFolder {
+            panel.directoryURL = current
+        }
+        if panel.runModal() == .OK, let url = panel.url {
+            libraryConfig.musicFolder = url
+        }
     }
 
     @ViewBuilder

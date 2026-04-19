@@ -28,7 +28,7 @@ import SwiftUI
 /// iOS uses a different entry point (no folder picker, no bottom player
 /// bar, no split view), so this view is macOS-only.
 public struct RootView: View {
-    @State private var musicFolder: URL?
+    @ObservedObject private var config: LibraryConfig
     @StateObject private var player = AudioPlayer()
     @StateObject private var libraryVM = LibraryViewModel()
     @StateObject private var stations = StationManager()
@@ -50,11 +50,9 @@ public struct RootView: View {
     /// `ObservableObject`, and we want to construct it *after* `player`
     /// is guaranteed to exist (first `onAppear`).
     @State private var nowPlaying: NowPlayingController?
-    private let config: LibraryConfig
 
     public init(config: LibraryConfig = LibraryConfig()) {
         self.config = config
-        self._musicFolder = State(initialValue: config.musicFolder)
 
         // Wire up the broadcaster with the NTS stack dependencies so
         // NTS-backed stations can actually resolve + cache tracks. The
@@ -82,7 +80,7 @@ public struct RootView: View {
     public var body: some View {
         VStack(spacing: 0) {
             Group {
-                if let folder = musicFolder {
+                if let folder = config.musicFolder {
                     NavigationSplitView {
                         PlaylistsSidebarView(
                             vm: libraryVM,
@@ -110,7 +108,7 @@ public struct RootView: View {
                         }
                     }
                     .sheet(isPresented: $showingAddDownload) {
-                        if let folder = musicFolder {
+                        if let folder = config.musicFolder {
                             AddDownloadView(
                                 downloadService: downloadService,
                                 libraryFolder: folder
@@ -126,7 +124,10 @@ public struct RootView: View {
                     .sheet(isPresented: $showingAddBandcampStation) {
                         AddBandcampStationView(stations: stations)
                     }
-                    .task(id: folder) {
+                    // Task id includes `reloadNonce` so a "Reload Library"
+                    // action in Preferences re-fires the scan even when the
+                    // folder URL itself hasn't changed.
+                    .task(id: ReloadKey(folder: folder, nonce: config.reloadNonce)) {
                         // Point the station manager at the new folder
                         // BEFORE loading the library so any saved stations
                         // are visible in the sidebar as soon as it appears.
@@ -170,13 +171,12 @@ public struct RootView: View {
                     // Re-scanning an already-scanned folder is cheap and
                     // cache-backed, so we don't need a more precise trigger.
                     .onChange(of: downloadService.batches.map(\.finishedAt)) { _, _ in
-                        guard let folder = musicFolder else { return }
+                        guard let folder = config.musicFolder else { return }
                         Task { await libraryVM.load(from: folder) }
                     }
                 } else {
                     FolderPickerView { url in
                         config.musicFolder = url
-                        musicFolder = url
                     }
                 }
             }
@@ -184,7 +184,7 @@ public struct RootView: View {
 
             // Only show the player bar once we're past folder-picking.
             // Sits outside the split so it spans the whole window.
-            if musicFolder != nil {
+            if config.musicFolder != nil {
                 if radio.needsRestart {
                     // Surfaces here rather than in the Settings pane because
                     // the user may have Settings closed when they change
@@ -234,7 +234,7 @@ public struct RootView: View {
         }
         .keyboardShortcut("d", modifiers: [.command, .shift])
         .help("Download from Spotify (⇧⌘D)")
-        .disabled(musicFolder == nil)
+        .disabled(config.musicFolder == nil)
     }
 
     /// Toolbar menu for creating new stations. Playlist stations are
@@ -485,6 +485,13 @@ public struct RootView: View {
             return libraryVM.selectedPlaylist
         }
     }
+}
+
+/// Composite id for the library-load `.task`: re-fires when the folder
+/// changes OR when `LibraryConfig.requestReload()` bumps the nonce.
+private struct ReloadKey: Hashable {
+    let folder: URL?
+    let nonce: Int
 }
 
 private extension Station {
