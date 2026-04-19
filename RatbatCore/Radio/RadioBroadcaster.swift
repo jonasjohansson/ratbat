@@ -712,7 +712,7 @@ public final class RadioBroadcaster: ObservableObject {
                 switch state {
                 case .failed(let err):
                     self.error = "Listener failed: \(err.localizedDescription)"
-                    self.logger.error("listener failed: \(String(describing: err))")
+                    self.logger.error("listener failed: \(String(describing: err), privacy: .public)")
                     self.stopAll()
                 case .cancelled:
                     self.logger.info("listener cancelled")
