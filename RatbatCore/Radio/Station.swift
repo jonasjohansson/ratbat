@@ -3,8 +3,8 @@ import Foundation
 /// A radio station the broadcaster can serve.
 ///
 /// Four concrete kinds ship today:
-/// - ``Kind/playlist(queue:)`` — a pre-shuffled queue derived from a
-///   user's library ``Playlist``.
+/// - ``Kind/playlist(queue:)`` — a fixed queue derived from a user's
+///   library ``Playlist``, reshuffled by ``PlaylistSource`` on each start.
 /// - ``Kind/nts(config:)`` — a generative, NTS-backed station driven by
 ///   an ``NTSStationConfig`` (tags + optional year range).
 /// - ``Kind/lastFM(config:)`` — a generative, Last.fm-backed station
@@ -33,8 +33,9 @@ public struct Station: Identifiable, Hashable, Sendable, Codable {
     /// variants satisfy that (the `.bandcamp` case is macOS-only; on iOS
     /// the enum has only three variants, still all Codable).
     public enum Kind: Hashable, Sendable, Codable {
-        /// Fixed, pre-shuffled queue. Replays the same tracks on every
-        /// start — matches the pre-refactor behaviour.
+        /// Fixed queue of tracks. ``PlaylistSource`` shuffles it on every
+        /// broadcast start (and after each full pass), so the order — and
+        /// the opening track — varies from one start to the next.
         case playlist(queue: [Track])
         /// Generative NTS-backed station. Controller state (pool, history
         /// dedup, resolver) is reconstructed on each broadcast start from
@@ -97,11 +98,13 @@ public struct Station: Identifiable, Hashable, Sendable, Codable {
 
     /// Build a station seeded from a playlist. Auto-names as
     /// "Radio based on {playlist name}" so the sidebar immediately reads
-    /// as what the user just did.
+    /// as what the user just did. The queue is stored in natural playlist
+    /// order; ``PlaylistSource`` shuffles it on every broadcast start, so
+    /// there's no need to freeze a single shuffle here.
     public static func from(playlist: Playlist) -> Station {
         Station(
             name: "Radio based on \(playlist.name)",
-            kind: .playlist(queue: playlist.tracks.shuffled())
+            kind: .playlist(queue: playlist.tracks)
         )
     }
 
