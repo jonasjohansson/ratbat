@@ -541,7 +541,8 @@ public final class RadioBroadcaster: ObservableObject {
         let buffer = pipeline.buffer
         let stationID = station.id
         let stationName = station.name
-        pipeline.encodeTask = Task.detached { [weak self, buffer] in
+        let history = self.history
+        pipeline.encodeTask = Task.detached { [weak self, buffer, history] in
             await Self.runEncodeLoop(
                 source: source,
                 stationID: stationID,
@@ -549,6 +550,7 @@ public final class RadioBroadcaster: ObservableObject {
                 buffer: buffer,
                 bitrate: bitrate,
                 sampleRate: sampleRate,
+                history: history,
                 owner: self
             )
         }
@@ -1554,6 +1556,7 @@ public final class RadioBroadcaster: ObservableObject {
         buffer: AACRingBuffer,
         bitrate: Int,
         sampleRate: Double,
+        history: HistoryStore?,
         owner: RadioBroadcaster?
     ) async {
         let decoder = AudioDecoder()
@@ -1622,10 +1625,11 @@ public final class RadioBroadcaster: ObservableObject {
                 }
             } catch {
                 let label = item.title ?? item.url.lastPathComponent
-                log.error("open failed for \(label, privacy: .public): \(String(describing: error))")
+                log.error("open failed for \(label, privacy: .public) at \(item.url.path, privacy: .public): \(String(describing: error), privacy: .public)")
                 continue outer
             }
 
+            var playedThrough = false
             while !Task.isCancelled {
                 // User-initiated skip? Break the inner loop so the outer
                 // loop pulls the next item. Already-encoded bytes in the
@@ -1636,6 +1640,7 @@ public final class RadioBroadcaster: ObservableObject {
                     if skip { break }
                 }
                 guard let pcm = decoder.readNextBuffer() else {
+                    playedThrough = true
                     break   // EOF — advance to next item
                 }
                 do {
@@ -1655,6 +1660,16 @@ public final class RadioBroadcaster: ObservableObject {
             }
 
             decoder.close()
+
+            // A track that drained all the way to EOF — rather than being
+            // skipped or aborted by an encode error — counts as a full
+            // play-through, the strongest positive taste signal we get.
+            // Feed it back so the profile can weight tracks the user lets
+            // run against ones they skip. Playlist items carry no historyID,
+            // so this is naturally a no-op for non-generative stations.
+            if playedThrough, let historyID = item.historyID {
+                try? await history?.incrementPlayCount(id: historyID)
+            }
         }
 
         decoder.close()
