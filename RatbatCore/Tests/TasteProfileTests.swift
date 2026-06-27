@@ -134,6 +134,38 @@ final class TasteProfileTests: XCTestCase {
         XCTAssertGreaterThan(candidate, stranger)
     }
 
+    func testScore_saveAffinity_isGraduatedByCount() async throws {
+        // More saves of the same artist on a station should yield a
+        // strictly higher score than a single save — the signal is
+        // graduated, not binary.
+        let profile = TasteProfile()
+        await profile.ingestLibrary([])   // empty library — isolate save signal
+        let history = try await makeHistoryStore()
+
+        func scoreAfterSaves(_ n: Int) async throws -> Double {
+            let station = UUID()
+            for i in 0..<n {
+                let rowid = try await history.record(
+                    station: station, artist: "Aphex Twin", title: "Track \(i)",
+                    cachedPath: "/tmp/\(i).m4a"
+                )
+                try await history.markSaved(id: rowid, cachedPath: "/final/\(i).m4a")
+            }
+            return await profile.score(
+                candidateArtist: "Aphex Twin",
+                candidateTags: [],
+                stationID: station,
+                history: history
+            )
+        }
+
+        let one = try await scoreAfterSaves(1)
+        let three = try await scoreAfterSaves(3)
+        let none = try await scoreAfterSaves(0)
+        XCTAssertGreaterThan(one, none, "one save should beat no saves")
+        XCTAssertGreaterThan(three, one, "three saves should beat one save")
+    }
+
     func testScore_tagOverlap_boostsCandidate() async throws {
         let profile = TasteProfile()
         await profile.ingestLibrary([

@@ -153,17 +153,28 @@ public actor TasteProfile {
             tagMatch = overlap / Double(candidateTags.count)
         }
 
-        // Save-affinity: has any track from this artist been ♥-saved on
-        // THIS station? Keeping it station-scoped so saves on an ambient
-        // station don't swing scoring on a techno station.
+        // Save-affinity: how strongly has the user ♥-saved this artist on
+        // THIS station? Station-scoped so saves on an ambient station don't
+        // swing scoring on a techno station. Graduated rather than binary —
+        // ten saves of an artist is a far stronger signal than one, and a
+        // save made just now should count more than one from months ago.
+        // `savedEntries` is newest-first, so each successive match for the
+        // artist gets a smaller harmonic weight (1, 1/2, 1/3, …); the
+        // accumulated weight is then squashed through a saturating curve so
+        // the term stays in [0, 1) and a single beloved artist can't run
+        // away with the pool. One save → ~0.5, two → ~0.65, asymptote 1.0.
         var saveAffinity: Double = 0
         if let saved = try? await history.savedEntries(forStation: stationID, limit: 500) {
             let normalized = candidateArtist
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .lowercased()
-            if saved.contains(where: { $0.artist.lowercased() == normalized }) {
-                saveAffinity = 1.0
+            var weight = 0.0
+            var rank = 0
+            for entry in saved where entry.artist.lowercased() == normalized {
+                rank += 1
+                weight += 1.0 / Double(rank)
             }
+            saveAffinity = weight > 0 ? 1.0 - pow(0.5, weight) : 0.0
         }
 
         return 0.30 * libraryMatch
