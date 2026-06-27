@@ -29,6 +29,21 @@ final class LastFMStationConfigTests: XCTestCase {
         XCTAssertEqual(decoded.query.excludedArtists, ["Groove Coverage", "Scooter"])
     }
 
+    func testExploration_roundTripsAndClamps() throws {
+        var cfg = LastFMStationConfig(name: "T", query: FacetedQuery(genreTags: ["techno"]))
+        XCTAssertEqual(cfg.exploration, 0.25, accuracy: 0.0001, "default leans gently to comfort")
+        cfg.exploration = 0.8
+        let decoded = try JSONDecoder().decode(
+            LastFMStationConfig.self, from: try JSONEncoder().encode(cfg)
+        )
+        XCTAssertEqual(decoded.exploration, 0.8, accuracy: 0.0001)
+        // Out-of-range values are clamped at construction.
+        let clampedHigh = LastFMStationConfig(name: "T", query: FacetedQuery(genreTags: ["x"]), exploration: 5)
+        let clampedLow = LastFMStationConfig(name: "T", query: FacetedQuery(genreTags: ["x"]), exploration: -2)
+        XCTAssertEqual(clampedHigh.exploration, 1.0, accuracy: 0.0001)
+        XCTAssertEqual(clampedLow.exploration, 0.0, accuracy: 0.0001)
+    }
+
     func testDecode_legacyJSONWithoutNewFields_fillsDefaults() throws {
         // Shape stored on Jonas's Mac before the v2 config bump — missing
         // all the filter fields. The decoder must read it and supply the

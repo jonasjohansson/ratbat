@@ -196,6 +196,41 @@ final class TasteProfileTests: XCTestCase {
         XCTAssertGreaterThan(twoPlays, onePlay, "more play-throughs score higher")
     }
 
+    func testScore_explorationFlattensComfort() async throws {
+        // A library artist scores high in comfort mode (exploration 0) and
+        // collapses toward 0 in full-explore mode (exploration 1), so
+        // unfamiliar candidates can compete.
+        let profile = TasteProfile()
+        await profile.ingestLibrary([track("Aphex Twin")])
+        let history = try await makeHistoryStore()
+        let station = UUID()
+        let comfort = await profile.score(
+            candidateArtist: "Aphex Twin", candidateTags: [],
+            stationID: station, history: history, exploration: 0
+        )
+        let explore = await profile.score(
+            candidateArtist: "Aphex Twin", candidateTags: [],
+            stationID: station, history: history, exploration: 1
+        )
+        XCTAssertGreaterThan(comfort, explore, "comfort ranks familiar artists higher")
+        XCTAssertEqual(explore, 0, accuracy: 0.0001, "full explore flattens the taste blend")
+    }
+
+    func testScore_explorationDoesNotRescueSkips() async throws {
+        // Even at full explore, a skipped artist stays a hard veto.
+        let profile = TasteProfile()
+        await profile.ingestLibrary([])
+        let history = try await makeHistoryStore()
+        let station = UUID()
+        let rowid = try await history.record(station: station, artist: "Nickelback", title: "x")
+        try await history.markSkipped(id: rowid)
+        let score = await profile.score(
+            candidateArtist: "Nickelback", candidateTags: [],
+            stationID: station, history: history, exploration: 1
+        )
+        XCTAssertLessThan(score, 0, "skip veto survives exploration")
+    }
+
     func testScore_tagOverlap_boostsCandidate() async throws {
         let profile = TasteProfile()
         await profile.ingestLibrary([
