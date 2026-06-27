@@ -27,6 +27,31 @@ final class HistoryStoreTests: XCTestCase {
         XCTAssertTrue(after)
     }
 
+    func testPlayThroughCount_sumsAndScopesPerStation() async throws {
+        let store = try await HistoryStore(databaseURL: tempURL)
+        let s1 = UUID(), s2 = UUID()
+        let a = try await store.record(station: s1, artist: "Aphex Twin", title: "Xtal")
+        let b = try await store.record(station: s1, artist: "Aphex Twin", title: "Ageispolis")
+        let c = try await store.record(station: s2, artist: "Aphex Twin", title: "Xtal")
+
+        let initial = try await store.playThroughCount(forStation: s1, artist: "Aphex Twin")
+        XCTAssertEqual(initial, 0)
+        try await store.incrementPlayCount(id: a)
+        try await store.incrementPlayCount(id: a)
+        try await store.incrementPlayCount(id: b)
+        try await store.incrementPlayCount(id: c)
+
+        // s1 sums across both of the artist's rows (2 + 1 = 3).
+        let s1Count = try await store.playThroughCount(forStation: s1, artist: "aphex twin")
+        XCTAssertEqual(s1Count, 3)
+        // s2 is scoped separately (just c).
+        let s2Count = try await store.playThroughCount(forStation: s2, artist: "Aphex Twin")
+        XCTAssertEqual(s2Count, 1)
+        // Unknown artist → 0.
+        let unknown = try await store.playThroughCount(forStation: s1, artist: "Nobody")
+        XCTAssertEqual(unknown, 0)
+    }
+
     func testDedupIsCaseInsensitive() async throws {
         let store = try await HistoryStore(databaseURL: tempURL)
         let station = UUID()

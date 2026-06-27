@@ -115,12 +115,13 @@ public actor TasteProfile {
     /// Affinity score for a single candidate, blending the library layer
     /// with per-station behavioral signals read from ``HistoryStore``.
     ///
-    /// Weighting (sums to 0.90 at max + hard -1 for skip):
+    /// Weighting (sums to 1.0 at max + hard -1 for skip):
     /// ```
-    /// score = 0.30 * library_match      // artist in your library
-    ///       + 0.25 * tag_match          // tag overlap with library top tags
-    ///       + 0.35 * save_affinity      // any ♥ for this artist on this station
-    ///       - 1.00 * skip_penalty       // hard blacklist, short-circuits
+    /// score = 0.25 * library_match        // artist in your library
+    ///       + 0.20 * tag_match            // tag overlap with library top tags
+    ///       + 0.30 * save_affinity        // graduated ♥ for this artist (this station)
+    ///       + 0.25 * playthrough_affinity // full listens you didn't skip
+    ///       - 1.00 * skip_penalty         // hard blacklist, short-circuits
     /// ```
     /// Callers treat `score < 0` as a filter (drop the candidate) rather
     /// than a sort key — scoring is only meaningful for candidates that
@@ -177,9 +178,21 @@ public actor TasteProfile {
             saveAffinity = weight > 0 ? 1.0 - pow(0.5, weight) : 0.0
         }
 
-        return 0.30 * libraryMatch
-             + 0.25 * tagMatch
-             + 0.35 * saveAffinity
+        // Play-through affinity: how many times has the user let a track
+        // from this artist run to the end on THIS station? A full listen is
+        // a quieter signal than a deliberate ♥, but it accumulates — an
+        // artist the user never skips earns its place. Same saturating
+        // shape as save-affinity. 1 play → 0.5, 2 → 0.75, asymptote 1.0.
+        var playThroughAffinity: Double = 0
+        if let plays = try? await history.playThroughCount(forStation: stationID, artist: candidateArtist),
+           plays > 0 {
+            playThroughAffinity = 1.0 - pow(0.5, Double(plays))
+        }
+
+        return 0.25 * libraryMatch
+             + 0.20 * tagMatch
+             + 0.30 * saveAffinity
+             + 0.25 * playThroughAffinity
     }
     #endif
 }
