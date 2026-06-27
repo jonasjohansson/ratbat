@@ -323,6 +323,25 @@ public actor HistoryStore {
         }
     }
 
+    /// Total full play-throughs recorded for `artist` on this station —
+    /// the sum of `play_count` across the artist's rows. Station-scoped to
+    /// match the rest of the behavioral signals, and case-insensitive on
+    /// the normalized artist. `0` when the artist has never played through.
+    public func playThroughCount(forStation station: UUID, artist: String) throws -> Int {
+        let sql = """
+            SELECT COALESCE(SUM(play_count), 0) FROM history
+            WHERE station_id = ? AND artist_norm = ?;
+            """
+        let stmt = try prepare(sql)
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, station.uuidString, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, Self.normalize(artist), -1, SQLITE_TRANSIENT)
+        let rc = sqlite3_step(stmt)
+        if rc == SQLITE_ROW { return Int(sqlite3_column_int64(stmt, 0)) }
+        if rc == SQLITE_DONE { return 0 }
+        throw Error.queryFailed(lastError())
+    }
+
     // MARK: - Internals
 
     // Init-time helpers. Static so they can run from the nonisolated

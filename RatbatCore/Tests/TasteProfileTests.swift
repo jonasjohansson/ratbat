@@ -166,6 +166,36 @@ final class TasteProfileTests: XCTestCase {
         XCTAssertGreaterThan(three, one, "three saves should beat one save")
     }
 
+    func testScore_playThrough_boostsCandidate() async throws {
+        // Full play-throughs are a positive signal: an artist the user
+        // lets run should outscore a stranger, and more play-throughs
+        // should score higher than one.
+        let profile = TasteProfile()
+        await profile.ingestLibrary([])   // empty library — isolate the signal
+        let history = try await makeHistoryStore()
+        let station = UUID()
+
+        let rowid = try await history.record(
+            station: station, artist: "Boards of Canada", title: "Roygbiv"
+        )
+        try await history.incrementPlayCount(id: rowid)
+        let onePlay = await profile.score(
+            candidateArtist: "Boards of Canada", candidateTags: [],
+            stationID: station, history: history
+        )
+        try await history.incrementPlayCount(id: rowid)
+        let twoPlays = await profile.score(
+            candidateArtist: "Boards of Canada", candidateTags: [],
+            stationID: station, history: history
+        )
+        let stranger = await profile.score(
+            candidateArtist: "Nobody", candidateTags: [],
+            stationID: station, history: history
+        )
+        XCTAssertGreaterThan(onePlay, stranger, "a played-through artist beats a stranger")
+        XCTAssertGreaterThan(twoPlays, onePlay, "more play-throughs score higher")
+    }
+
     func testScore_tagOverlap_boostsCandidate() async throws {
         let profile = TasteProfile()
         await profile.ingestLibrary([
