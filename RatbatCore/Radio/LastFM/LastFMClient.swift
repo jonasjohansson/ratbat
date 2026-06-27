@@ -70,6 +70,10 @@ public actor LastFMClient {
     /// "Portishead" or "portishead". Lives for the process lifetime —
     /// artist tags change slowly enough that we don't bother persisting.
     private var artistTagCache: [String: [ArtistTag]] = [:]
+    /// Per-artist cache of `artist.getSimilar` results (lowercased seed →
+    /// ordered similar-artist names). Same rationale as `artistTagCache`:
+    /// similarity graphs move slowly, so a process-lifetime cache is plenty.
+    private var similarArtistCache: [String: [String]] = [:]
     private let session: URLSession
     private let apiBase = URL(string: "https://ws.audioscrobbler.com/2.0/")!
     private let userAgent = "Ratbat/1.0 (personal radio)"
@@ -157,6 +161,54 @@ public actor LastFMClient {
         return tags
     }
 
+    /// Artists Last.fm considers similar to `artist`, strongest match
+    /// first. Powers similar-artist discovery: given the artists a user
+    /// most engages with on a station, we pull their neighbours and feed
+    /// those neighbours' top tracks into the pool. Cached per-artist.
+    public func similarArtists(to artist: String, limit: Int = 10) async throws -> [String] {
+        guard !apiKey.isEmpty else { throw Error.apiKeyMissing }
+        let cacheKey = artist
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if let hit = similarArtistCache[cacheKey] { return Array(hit.prefix(limit)) }
+
+        var comps = URLComponents(url: apiBase, resolvingAgainstBaseURL: false)!
+        comps.queryItems = [
+            URLQueryItem(name: "method", value: "artist.getsimilar"),
+            URLQueryItem(name: "artist", value: artist),
+            URLQueryItem(name: "autocorrect", value: "1"),
+            URLQueryItem(name: "limit", value: "\(max(limit, 1))"),
+            URLQueryItem(name: "api_key", value: apiKey),
+            URLQueryItem(name: "format", value: "json"),
+        ]
+        guard let url = comps.url else { return [] }
+
+        let data = try await fetch(url)
+        let names = try parseSimilarArtists(from: data, sourceURL: url)
+        similarArtistCache[cacheKey] = names
+        return Array(names.prefix(limit))
+    }
+
+    /// Top tracks for a single artist (`artist.getTopTracks`). Used to turn
+    /// a similar-artist name into playable `(artist, title)` candidates.
+    /// Unlike ``topTracks(forTag:limit:)`` this is a single page — a
+    /// handful of an artist's biggest tracks is all the pool needs.
+    public func topTracksForArtist(_ artist: String, limit: Int = 5) async throws -> [TrackCandidate] {
+        guard !apiKey.isEmpty else { throw Error.apiKeyMissing }
+        var comps = URLComponents(url: apiBase, resolvingAgainstBaseURL: false)!
+        comps.queryItems = [
+            URLQueryItem(name: "method", value: "artist.gettoptracks"),
+            URLQueryItem(name: "artist", value: artist),
+            URLQueryItem(name: "autocorrect", value: "1"),
+            URLQueryItem(name: "limit", value: "\(max(limit, 1))"),
+            URLQueryItem(name: "api_key", value: apiKey),
+            URLQueryItem(name: "format", value: "json"),
+        ]
+        guard let url = comps.url else { return [] }
+        let data = try await fetch(url)
+        return try parseArtistTopTracks(from: data, sourceURL: url)
+    }
+
     // MARK: - Internal (exposed for @testable import)
 
     /// Parse a `tag.gettoptracks` response into ``TrackCandidate`` values.
@@ -212,6 +264,51 @@ public actor LastFMClient {
             return ArtistTag(name: name.lowercased(), count: count)
         }
         return rows.sorted { $0.count > $1.count }
+    }
+
+    /// Parse an `artist.getSimilar` response into ordered artist names.
+    /// Last.fm returns them pre-sorted by `match` descending; we preserve
+    /// that order and just drop blank names.
+    internal func parseSimilarArtists(from data: Data, sourceURL: URL) throws -> [String] {
+        if let errorEnvelope = try? JSONDecoder().decode(ApiError.self, from: data), errorEnvelope.error != 0 {
+            throw Error.apiError(code: errorEnvelope.error, message: errorEnvelope.message ?? "")
+        }
+        let envelope: SimilarArtistsEnvelope
+        do {
+            envelope = try JSONDecoder().decode(SimilarArtistsEnvelope.self, from: data)
+        } catch {
+            throw Error.malformed(sourceURL, reason: "similar artists envelope: \(error)")
+        }
+        return (envelope.similarartists?.artist ?? []).compactMap { raw in
+            let name = (raw.name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            return name.isEmpty ? nil : name
+        }
+    }
+
+    /// Parse an `artist.getTopTracks` response into ``TrackCandidate``s.
+    /// Same per-row shape as `tag.getTopTracks`, so it reuses ``TrackRaw``;
+    /// the artist name rides in the row's `artist.name`.
+    internal func parseArtistTopTracks(from data: Data, sourceURL: URL) throws -> [TrackCandidate] {
+        if let errorEnvelope = try? JSONDecoder().decode(ApiError.self, from: data), errorEnvelope.error != 0 {
+            throw Error.apiError(code: errorEnvelope.error, message: errorEnvelope.message ?? "")
+        }
+        let envelope: ArtistTopTracksEnvelope
+        do {
+            envelope = try JSONDecoder().decode(ArtistTopTracksEnvelope.self, from: data)
+        } catch {
+            throw Error.malformed(sourceURL, reason: "artist top tracks envelope: \(error)")
+        }
+        return (envelope.toptracks?.track ?? []).compactMap { raw -> TrackCandidate? in
+            let title = normalize(raw.name ?? "")
+            let artistName = normalize(raw.artist?.name ?? "")
+            guard !title.isEmpty, !artistName.isEmpty else { return nil }
+            return TrackCandidate(
+                artist: artistName,
+                title: title,
+                listeners: Int(raw.listeners ?? "0") ?? 0,
+                playcount: Int(raw.playcount ?? "0") ?? 0
+            )
+        }
     }
 
     // MARK: - Internals
@@ -311,6 +408,26 @@ public actor LastFMClient {
     private struct ArtistTagRaw: Decodable {
         let name: String?
         let count: Int?
+    }
+
+    private struct SimilarArtistsEnvelope: Decodable {
+        let similarartists: SimilarArtistsBody?
+    }
+
+    private struct SimilarArtistsBody: Decodable {
+        let artist: [SimilarArtistRaw]?
+    }
+
+    private struct SimilarArtistRaw: Decodable {
+        let name: String?
+    }
+
+    private struct ArtistTopTracksEnvelope: Decodable {
+        let toptracks: ArtistTopTracksBody?
+    }
+
+    private struct ArtistTopTracksBody: Decodable {
+        let track: [TrackRaw]?
     }
 }
 #endif

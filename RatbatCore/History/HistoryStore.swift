@@ -342,6 +342,42 @@ public actor HistoryStore {
         throw Error.queryFailed(lastError())
     }
 
+    /// Artists the user engages with most on this station, ranked by a
+    /// blend of ♥-saves (weighted heavier) and full play-throughs. These
+    /// are the seeds for similar-artist discovery — "find more like the
+    /// ones I love here." Returns distinct artist display names, strongest
+    /// affinity first; artists with no positive signal are excluded.
+    public func topAffinityArtists(forStation station: UUID, limit: Int = 5) throws -> [String] {
+        let sql = """
+            SELECT artist, (SUM(saved) * 3 + SUM(play_count)) AS affinity
+            FROM history
+            WHERE station_id = ?
+            GROUP BY artist_norm
+            HAVING affinity > 0
+            ORDER BY affinity DESC
+            LIMIT ?;
+            """
+        let stmt = try prepare(sql)
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, station.uuidString, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(stmt, 2, Int64(limit))
+
+        var out: [String] = []
+        while true {
+            let rc = sqlite3_step(stmt)
+            if rc == SQLITE_ROW {
+                if let c = sqlite3_column_text(stmt, 0) {
+                    out.append(String(cString: c))
+                }
+            } else if rc == SQLITE_DONE {
+                break
+            } else {
+                throw Error.queryFailed(lastError())
+            }
+        }
+        return out
+    }
+
     // MARK: - Internals
 
     // Init-time helpers. Static so they can run from the nonisolated

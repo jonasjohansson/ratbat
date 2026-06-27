@@ -33,7 +33,11 @@ final class StationTests: XCTestCase {
         }
     }
 
-    func testStationShufflesQueue() {
+    func testStationFromPlaylistPreservesNaturalOrder() {
+        // Station.from(playlist:) stores the queue in natural playlist
+        // order; shuffling happens in PlaylistSource on every broadcast
+        // start (covered by TrackSourceTests). Freezing a single shuffle
+        // here was the "always starts on the same song" bug.
         let tracks = (0..<30).map {
             Track(
                 url: URL(fileURLWithPath: "/fake/\($0).m4a"),
@@ -50,14 +54,9 @@ final class StationTests: XCTestCase {
             children: [],
             kind: .folder
         )
-        let s1 = Station.from(playlist: playlist)
-        let s2 = Station.from(playlist: playlist)
-        // Both queues are permutations of the same tracks…
-        XCTAssertEqual(Set(s1.queue.map(\.id)), Set(tracks.map(\.id)))
-        XCTAssertEqual(Set(s2.queue.map(\.id)), Set(tracks.map(\.id)))
-        // …but their orderings should differ. With 30! possible orderings
-        // this is effectively deterministic.
-        XCTAssertNotEqual(s1.queue.map(\.id), s2.queue.map(\.id))
+        let station = Station.from(playlist: playlist)
+        XCTAssertEqual(station.queue.map(\.id), tracks.map(\.id),
+                       "queue should preserve the playlist's natural order")
     }
 
     func testStationSlugIsUrlSafe() {

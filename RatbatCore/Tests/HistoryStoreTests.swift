@@ -52,6 +52,31 @@ final class HistoryStoreTests: XCTestCase {
         XCTAssertEqual(unknown, 0)
     }
 
+    func testTopAffinityArtists_ranksBySavesAndPlays() async throws {
+        let store = try await HistoryStore(databaseURL: tempURL)
+        let station = UUID()
+        // Artist A: one save (weight 3). Artist B: two play-throughs
+        // (weight 2). Artist C: recorded but no engagement (excluded).
+        let a = try await store.record(station: station, artist: "Artist A", title: "a1")
+        try await store.markSaved(id: a, cachedPath: "/tmp/a.m4a")
+        let b = try await store.record(station: station, artist: "Artist B", title: "b1")
+        try await store.incrementPlayCount(id: b)
+        try await store.incrementPlayCount(id: b)
+        _ = try await store.record(station: station, artist: "Artist C", title: "c1")
+
+        let ranked = try await store.topAffinityArtists(forStation: station, limit: 5)
+        XCTAssertEqual(ranked, ["Artist A", "Artist B"], "saved artist outranks played; unengaged excluded")
+    }
+
+    func testTopAffinityArtists_scopedPerStation() async throws {
+        let store = try await HistoryStore(databaseURL: tempURL)
+        let s1 = UUID(), s2 = UUID()
+        let x = try await store.record(station: s1, artist: "Only On S1", title: "t")
+        try await store.markSaved(id: x, cachedPath: "/tmp/x.m4a")
+        let s2Ranked = try await store.topAffinityArtists(forStation: s2, limit: 5)
+        XCTAssertTrue(s2Ranked.isEmpty, "affinity is station-scoped")
+    }
+
     func testDedupIsCaseInsensitive() async throws {
         let store = try await HistoryStore(databaseURL: tempURL)
         let station = UUID()
