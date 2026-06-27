@@ -169,6 +169,10 @@ public actor LastFMStationController {
             var candidate: SourceCandidate
             var matchedTags: Set<String>
         }
+        // Query tags, lowercased. Needed by both the similar-artist
+        // expansion (stage 1b) and tag-mode (stage 2), so compute once.
+        let requiredTags = Set(config.query.genreTags.map { $0.lowercased() })
+
         var seeds: [DedupKey: SeedRecord] = [:]
         for tag in config.query.genreTags {
             do {
@@ -205,13 +209,49 @@ public actor LastFMStationController {
             }
         }
 
+        logger.info("stage1 fetch: \(seeds.count) seed candidates across \(self.config.query.genreTags.count) tag(s)")
+
+        // Stage 1b: similar-artist expansion — the discovery multiplier.
+        // Take the artists the user engages with most ON THIS station
+        // (saves + play-throughs), ask Last.fm for their neighbours, and
+        // fold those neighbours' top tracks into the seed pool. Tagged with
+        // the query tags so they flow through the normal precision / era /
+        // region / taste pipeline — only genre-coherent neighbours survive,
+        // which keeps the station on-theme while steadily broadening it
+        // toward "more artists like the ones you love." Hard-bounded so a
+        // refill can't blow the Last.fm rate budget.
+        let seedArtists = (try? await history.topAffinityArtists(forStation: config.id, limit: 3)) ?? []
+        if !seedArtists.isEmpty {
+            var similarSeen = Set<String>()
+            var added = 0
+            for seedArtist in seedArtists {
+                let neighbours = (try? await client.similarArtists(to: seedArtist, limit: 6)) ?? []
+                for neighbour in neighbours {
+                    guard similarSeen.insert(neighbour.lowercased()).inserted else { continue }
+                    let tracks = (try? await client.topTracksForArtist(neighbour, limit: 2)) ?? []
+                    for t in tracks {
+                        let key = DedupKey(artist: t.artist.lowercased(), title: t.title.lowercased())
+                        guard seeds[key] == nil else { continue }
+                        let cand = SourceCandidate(
+                            artist: t.artist,
+                            title: t.title,
+                            resolvedURL: nil,
+                            listenersHint: t.listeners,
+                            matchedTags: requiredTags
+                        )
+                        seeds[key] = SeedRecord(candidate: cand, matchedTags: requiredTags)
+                        added += 1
+                    }
+                }
+            }
+            logger.info("stage1b similar-artist: +\(added) candidates from \(seedArtists.count) seed artist(s)")
+        }
+
         if seeds.isEmpty {
             throw Error.noTracksForTags(config.query.genreTags)
         }
-        logger.info("stage1 fetch: \(seeds.count) seed candidates across \(self.config.query.genreTags.count) tag(s)")
 
         // Stage 2: tag mode (union / intersection) via the shared pipeline.
-        let requiredTags = Set(config.query.genreTags.map { $0.lowercased() })
         let tagModeInput: [(SourceCandidate, Set<String>)] = seeds.values.map { ($0.candidate, $0.matchedTags) }
         var candidates: [SourceCandidate] = FacetedPipeline.applyTagMode(
             tagModeInput,
@@ -333,7 +373,7 @@ public actor LastFMStationController {
         // picks from the rest. Shuffle each half and interleave so the
         // encode loop sees rotating variety instead of a ranked block.
         let wildcardCount = max(1, Int(Double(scored.count) * wildcardFraction))
-        let topCount = max(scored.count - wildcardCount, scored.count - wildcardCount)
+        let topCount = max(0, scored.count - wildcardCount)
         let topSlice = Array(scored.prefix(topCount)).map { $0.cand }
         var wildcardSlice = Array(scored.suffix(wildcardCount)).map { $0.cand }
         wildcardSlice.shuffle()
