@@ -14,24 +14,38 @@ public struct LastFMStationConfig: Identifiable, Hashable, Sendable, Codable {
     public var name: String
     public var query: FacetedQuery
     public var shufflePool: Bool
+    /// Explore ↔ Comfort dial in `[0, 1]`. 0 = comfort: rank hard by taste
+    /// (library / saves / play-throughs dominate, fewer wildcards). 1 =
+    /// explore: flatten the taste ranking and lean on novelty so unfamiliar
+    /// picks compete and the wildcard share grows. Defaults to a gentle
+    /// 0.25 lean toward comfort.
+    public var exploration: Double
 
     public init(
         id: UUID = UUID(),
         name: String,
         query: FacetedQuery,
-        shufflePool: Bool = true
+        shufflePool: Bool = true,
+        exploration: Double = 0.25
     ) {
         self.id = id
         self.name = name
         self.query = query
         self.shufflePool = shufflePool
+        self.exploration = Self.clampExploration(exploration)
+    }
+
+    /// Clamp the dial into `[0, 1]` so a stray config value can't push
+    /// scoring weights negative or past full novelty.
+    static func clampExploration(_ value: Double) -> Double {
+        min(max(value, 0), 1)
     }
 
     // MARK: - Codable with legacy-shape migration
 
     private enum CodingKeys: String, CodingKey {
         // New shape
-        case id, name, query, shufflePool
+        case id, name, query, shufflePool, exploration
         // Legacy keys (decode-only, never written)
         case tags
         case yearMin, yearMax
@@ -45,6 +59,9 @@ public struct LastFMStationConfig: Identifiable, Hashable, Sendable, Codable {
         self.id = try c.decode(UUID.self, forKey: .id)
         self.name = try c.decode(String.self, forKey: .name)
         self.shufflePool = try c.decodeIfPresent(Bool.self, forKey: .shufflePool) ?? true
+        self.exploration = Self.clampExploration(
+            try c.decodeIfPresent(Double.self, forKey: .exploration) ?? 0.25
+        )
 
         if let q = try c.decodeIfPresent(FacetedQuery.self, forKey: .query) {
             self.query = q
@@ -114,5 +131,6 @@ public struct LastFMStationConfig: Identifiable, Hashable, Sendable, Codable {
         try c.encode(name, forKey: .name)
         try c.encode(query, forKey: .query)
         try c.encode(shufflePool, forKey: .shufflePool)
+        try c.encode(exploration, forKey: .exploration)
     }
 }

@@ -126,11 +126,19 @@ public actor TasteProfile {
     /// Callers treat `score < 0` as a filter (drop the candidate) rather
     /// than a sort key — scoring is only meaningful for candidates that
     /// survive the skip blacklist.
+    /// `exploration` is the station's Explore↔Comfort dial in `[0, 1]`.
+    /// It scales the whole familiarity blend by `comfort = 1 - exploration`:
+    /// at 0 the taste ranking is full strength (comfort), at 1 it flattens
+    /// to ~0 so unfamiliar candidates rank alongside favourites and the
+    /// caller's wildcard/shuffle drives variety (explore). The skip penalty
+    /// is never scaled — a 👎 is always a hard veto. Defaults to 0 so
+    /// callers that don't pass a dial keep the full-comfort behavior.
     public func score(
         candidateArtist: String,
         candidateTags: [String],
         stationID: UUID,
-        history: HistoryStore
+        history: HistoryStore,
+        exploration: Double = 0
     ) async -> Double {
         // Skip blacklist is checked first — no point computing weights
         // for a candidate we're about to drop.
@@ -189,10 +197,11 @@ public actor TasteProfile {
             playThroughAffinity = 1.0 - pow(0.5, Double(plays))
         }
 
-        return 0.25 * libraryMatch
-             + 0.20 * tagMatch
-             + 0.30 * saveAffinity
-             + 0.25 * playThroughAffinity
+        let comfort = 1.0 - min(max(exploration, 0), 1)
+        return comfort * (0.25 * libraryMatch
+                        + 0.20 * tagMatch
+                        + 0.30 * saveAffinity
+                        + 0.25 * playThroughAffinity)
     }
     #endif
 }

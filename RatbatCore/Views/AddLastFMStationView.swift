@@ -32,6 +32,9 @@ public struct AddLastFMStationView: View {
     /// come from `FacetedQuery`'s own init: `.any` tagMatch, `.middle`
     /// popularity, `excludeOwnedLibrary = false`.
     @State private var query = FacetedQuery(genreTags: [])
+    /// Explore ↔ Comfort dial for the new station. Mirrors
+    /// ``LastFMStationConfig/exploration``; gentle comfort lean by default.
+    @State private var exploration: Double = 0.25
 
     /// Curated list of popular Last.fm tags. Ordered by rough popularity
     /// and clustered loosely by vibe so the picker reads as a genre
@@ -102,6 +105,18 @@ public struct AddLastFMStationView: View {
                     .pickerStyle(.menu)
 
                     Toggle("Only surprise me — exclude my library", isOn: $query.excludeOwnedLibrary)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack {
+                            Text("Comfort").font(.caption).foregroundStyle(.secondary)
+                            Slider(value: $exploration, in: 0...1)
+                            Text("Explore").font(.caption).foregroundStyle(.secondary)
+                        }
+                        Text("Comfort leans on artists you already love; Explore pushes more unfamiliar picks.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.top, 2)
                 }
                 .padding(.top, 4)
             }
@@ -138,7 +153,7 @@ public struct AddLastFMStationView: View {
         if !trimmedKey.isEmpty {
             preferences.lastFMAPIKey = trimmedKey
         }
-        let config = LastFMStationConfig(name: finalName, query: query)
+        let config = LastFMStationConfig(name: finalName, query: query, exploration: exploration)
         stations.createLastFM(config)
         dismiss()
     }

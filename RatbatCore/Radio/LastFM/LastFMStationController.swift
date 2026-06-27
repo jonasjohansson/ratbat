@@ -354,7 +354,8 @@ public actor LastFMStationController {
                 candidateArtist: c.artist,
                 candidateTags: Array(c.matchedTags),
                 stationID: config.id,
-                history: history
+                history: history,
+                exploration: config.exploration
             )
             if s < 0 { continue }     // skip blacklist hit
             scored.append((c, s))
@@ -372,7 +373,10 @@ public actor LastFMStationController {
         // wildcardFraction) by score, then (wildcardFraction) random
         // picks from the rest. Shuffle each half and interleave so the
         // encode loop sees rotating variety instead of a ranked block.
-        let wildcardCount = max(1, Int(Double(scored.count) * wildcardFraction))
+        // Explore dial widens the wildcard share: comfort (0) keeps the
+        // baseline 20%, full explore (1) pushes it to 60% so novelty leads.
+        let effectiveWildcard = min(0.8, wildcardFraction + config.exploration * 0.4)
+        let wildcardCount = max(1, Int(Double(scored.count) * effectiveWildcard))
         let topCount = max(0, scored.count - wildcardCount)
         let topSlice = Array(scored.prefix(topCount)).map { $0.cand }
         var wildcardSlice = Array(scored.suffix(wildcardCount)).map { $0.cand }
