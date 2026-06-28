@@ -44,6 +44,15 @@ public actor TrackResolver {
     /// Base cache dir. Transient — safe to nuke anytime.
     public let cacheRoot: URL
 
+    /// Soft ceiling on the on-disk cache. After each resolve we trim the
+    /// oldest files back under this. An always-on station downloads a new
+    /// track every few minutes (~50 MB/hr at 128 kbps) and nothing else
+    /// reclaims the space, so without this the cache grows until the disk
+    /// fills and writes start failing. 10 GB ≈ a couple hundred tracks of
+    /// runway, which is plenty given we only ever replay from history, not
+    /// from this transient cache.
+    public let cacheCapBytes: Int64
+
     private let venvPython: URL
     private let wrapperScript: URL
     private let logger = Logger(subsystem: "se.jonasjohansson.ratbat", category: "resolver")
@@ -51,10 +60,12 @@ public actor TrackResolver {
     public init(
         venvPython: URL,
         wrapperScript: URL,
-        cacheRoot: URL? = nil
+        cacheRoot: URL? = nil,
+        cacheCapBytes: Int64 = 10 * 1024 * 1024 * 1024
     ) throws {
         self.venvPython = venvPython
         self.wrapperScript = wrapperScript
+        self.cacheCapBytes = cacheCapBytes
 
         let root: URL
         if let cacheRoot {
@@ -201,6 +212,11 @@ public actor TrackResolver {
         let size = (try? FileManager.default.attributesOfItem(atPath: outURL.path)[.size] as? Int64) ?? 0
         logger.info("resolved \(artist, privacy: .public) — \(title, privacy: .public) → \(parsed.youtube_id, privacy: .public) (\(size) bytes)")
 
+        // Trim the cache back under its cap now that we've added a file.
+        // Best-effort: a pruning hiccup must never fail an otherwise-good
+        // resolve, and we never evict the file we just wrote.
+        enforceCacheCap(keeping: outURL)
+
         return Resolution(
             cachedURL: outURL,
             youtubeID: parsed.youtube_id,
@@ -253,6 +269,43 @@ public actor TrackResolver {
         }
         entries.sort { $0.1 < $1.1 }
         return entries.map { $0.0 }
+    }
+
+    /// Evict oldest files until the cache is back under `cacheCapBytes`.
+    /// Best-effort and non-throwing: any enumeration/delete error is logged
+    /// and swallowed so it can't break a resolve. `keeping` (the file we
+    /// just wrote) is never evicted, even though oldest-first ordering
+    /// already protects it — belt and suspenders for tiny-cap configs.
+    private func enforceCacheCap(keeping: URL) {
+        do {
+            var total = try cacheSize()
+            guard total > cacheCapBytes else { return }
+
+            let fm = FileManager.default
+            let keepPath = keeping.standardizedFileURL.path
+            var evicted = 0
+            var freed: Int64 = 0
+            for url in try cachedFilesOldestFirst() {
+                // Stop once we're comfortably under the cap (10% headroom)
+                // so we don't evict one file per resolve at the boundary.
+                if total <= cacheCapBytes - cacheCapBytes / 10 { break }
+                if url.standardizedFileURL.path == keepPath { continue }
+                let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap { $0 } ?? 0
+                do {
+                    try fm.removeItem(at: url)
+                    total -= Int64(size)
+                    freed += Int64(size)
+                    evicted += 1
+                } catch {
+                    logger.error("cache evict failed for \(url.lastPathComponent, privacy: .public): \(String(describing: error), privacy: .public)")
+                }
+            }
+            if evicted > 0 {
+                logger.info("cache trim: evicted \(evicted) file(s), freed \(freed) bytes, now \(total)/\(self.cacheCapBytes)")
+            }
+        } catch {
+            logger.error("cache trim failed: \(String(describing: error), privacy: .public)")
+        }
     }
 
     // MARK: - Private
