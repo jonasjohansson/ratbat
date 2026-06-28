@@ -1588,6 +1588,16 @@ public final class RadioBroadcaster: ObservableObject {
         // tracks only resolve while at least one listener is connected.
         var trackIndex = 0
 
+        // One-track-ahead prefetch. Generative sources resolve + download
+        // via yt-dlp inside `nextURL()` (and occasionally run a slow pool
+        // refill); doing that inline at the track boundary stalled the
+        // encode loop and drained the ring buffer, so listeners heard a
+        // gap every few tracks. We instead kick off the NEXT track's
+        // resolve while the CURRENT one plays out, hiding the latency
+        // behind ~minutes of audio. At most one fetch is ever in flight;
+        // it's cancelled on loop exit.
+        var prefetch: Task<TrackSourceItem?, Error>?
+
         // Outer loop: pull items until the source is exhausted or the
         // task is cancelled. Inner loop: pump PCM → AAC → ring buffer
         // for the currently open item.
@@ -1602,13 +1612,21 @@ public final class RadioBroadcaster: ObservableObject {
                 if Task.isCancelled { break }
             }
 
+            // Take the prefetched item if one's in flight; otherwise
+            // (first track only) resolve synchronously — the user just hit
+            // play and expects the station to come alive promptly.
             let nextItem: TrackSourceItem?
             do {
-                nextItem = try await source.nextURL()
+                if let prefetch {
+                    nextItem = try await prefetch.value
+                } else {
+                    nextItem = try await source.nextURL()
+                }
             } catch {
                 log.error("source error: \(String(describing: error), privacy: .public)")
                 break
             }
+            prefetch = nil
 
             guard let item = nextItem else {
                 log.info("source exhausted for \(stationName, privacy: .public)")
@@ -1628,6 +1646,14 @@ public final class RadioBroadcaster: ObservableObject {
                 log.error("open failed for \(label, privacy: .public) at \(item.url.path, privacy: .public): \(String(describing: error), privacy: .public)")
                 continue outer
             }
+
+            // Resolve the NEXT track now, concurrently with this track's
+            // playout (~minutes), so its yt-dlp download or pool refill is
+            // already done by the time the inner loop drains — no boundary
+            // stall. The `awaitListener` gate at the top of the loop still
+            // bounds us to at most one track prefetched while nobody's
+            // tuned in, preserving the data-conscious idle.
+            prefetch = Task { try await source.nextURL() }
 
             var playedThrough = false
             while !Task.isCancelled {
@@ -1672,6 +1698,9 @@ public final class RadioBroadcaster: ObservableObject {
             }
         }
 
+        // Drop any in-flight prefetch so a dangling resolve (and its
+        // yt-dlp subprocess await) doesn't outlive the loop.
+        prefetch?.cancel()
         decoder.close()
         if let owner {
             await MainActor.run {
