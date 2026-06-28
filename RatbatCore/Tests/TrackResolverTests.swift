@@ -214,6 +214,74 @@ final class TrackResolverTests: XCTestCase {
         try? FileManager.default.removeItem(at: tempRoot)
     }
 
+    /// After a resolve, the cache is trimmed back under `cacheCapBytes`:
+    /// the oldest files are evicted while the freshly-written file (and
+    /// enough recent runway) survives. Uses the same bash stub as the
+    /// other resolve tests, with the cache pre-seeded with old files that
+    /// blow past a deliberately tiny cap.
+    func testResolveEvictsOldestOverCacheCap() async throws {
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tr-\(UUID())", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+
+        let stub = tempRoot.appendingPathComponent("fake-python.sh")
+        let script = """
+        #!/bin/bash
+        shift
+        out=""
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --output) out="$2"; shift 2;;
+            *) shift;;
+          esac
+        done
+        if [ -n "$out" ]; then
+          printf 'x' > "$out"
+        fi
+        printf '{"youtube_id": "ytid123", "matched_title": "Match"}'
+        exit 0
+        """
+        try script.write(to: stub, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stub.path)
+
+        let wrapper = tempRoot.appendingPathComponent("resolve_track.py")
+        try Data().write(to: wrapper)
+
+        let cacheRoot = tempRoot.appendingPathComponent("cache", isDirectory: true)
+        try FileManager.default.createDirectory(at: cacheRoot, withIntermediateDirectories: true)
+
+        // Seed five 100-byte "old" files, well over a 100-byte cap.
+        var oldFiles: [URL] = []
+        for i in 0..<5 {
+            let f = cacheRoot.appendingPathComponent("old-\(i).m4a")
+            try Data(repeating: 0xA5, count: 100).write(to: f)
+            // Push their mod dates into the past so they sort oldest-first.
+            let date = Date(timeIntervalSince1970: TimeInterval(1_000_000 + i))
+            try FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: f.path)
+            oldFiles.append(f)
+        }
+
+        let resolver = try TrackResolver(
+            venvPython: stub,
+            wrapperScript: wrapper,
+            cacheRoot: cacheRoot,
+            cacheCapBytes: 100
+        )
+
+        let resolution = try await resolver.resolve(artist: "A", title: "B")
+
+        // The just-written file survives, the cache is back under cap, and
+        // the seeded old files were the ones evicted.
+        XCTAssertTrue(FileManager.default.fileExists(atPath: resolution.cachedURL.path))
+        let size = try await resolver.cacheSize()
+        XCTAssertLessThanOrEqual(size, 100)
+        for f in oldFiles {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: f.path), "old file not evicted: \(f.lastPathComponent)")
+        }
+
+        try? FileManager.default.removeItem(at: tempRoot)
+    }
+
     /// Candidate without a ``resolvedURL`` should route through the
     /// existing search path — no `--source-url` argument on the wrapper.
     func testResolveWithCandidateFallsBackToSearchPath() async throws {
