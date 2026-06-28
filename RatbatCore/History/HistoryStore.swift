@@ -342,6 +342,53 @@ public actor HistoryStore {
         throw Error.queryFailed(lastError())
     }
 
+    /// Recency-weighted play-through signal for `artist` on this station.
+    /// Like ``playThroughCount(forStation:artist:)`` but each row's
+    /// `play_count` is multiplied by an exponential decay of its age, so a
+    /// track enjoyed last week pulls far harder than one from months ago.
+    /// `halfLifeDays` is the age at which a play's weight halves (30d =
+    /// noticeable mood drift). Computed in Swift rather than SQL so we
+    /// don't depend on SQLite being built with the math extension.
+    ///
+    /// Note: `play_count` accumulates on the row created at the track's
+    /// first play, so `played_at` is the *first*-play time — an
+    /// approximation of when the listens happened, but the strongest
+    /// recency anchor the schema records. `now` is injectable for tests.
+    public func playThroughRecencyWeight(
+        forStation station: UUID,
+        artist: String,
+        halfLifeDays: Double,
+        now: Date = Date()
+    ) throws -> Double {
+        let sql = """
+            SELECT play_count, played_at FROM history
+            WHERE station_id = ? AND artist_norm = ? AND play_count > 0;
+            """
+        let stmt = try prepare(sql)
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, station.uuidString, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, Self.normalize(artist), -1, SQLITE_TRANSIENT)
+
+        let nowEpoch = now.timeIntervalSince1970
+        let halfLifeSeconds = max(halfLifeDays, 0.0001) * 86_400
+        var weighted = 0.0
+        while true {
+            let rc = sqlite3_step(stmt)
+            if rc == SQLITE_ROW {
+                let plays = Double(sqlite3_column_int64(stmt, 0))
+                let playedAt = sqlite3_column_double(stmt, 1)
+                let ageSeconds = max(0, nowEpoch - playedAt)
+                let decay = pow(0.5, ageSeconds / halfLifeSeconds)
+                weighted += plays * decay
+            } else if rc == SQLITE_DONE {
+                break
+            } else {
+                throw Error.queryFailed(lastError())
+            }
+        }
+        return weighted
+    }
+
     /// Artists the user engages with most on this station, ranked by a
     /// blend of ♥-saves (weighted heavier) and full play-throughs. These
     /// are the seeds for similar-artist discovery — "find more like the

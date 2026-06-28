@@ -35,6 +35,12 @@ public struct TasteProfileSnapshot: Codable, Sendable, Hashable {
 /// profile fetching. Everything derives from what Ratbat can see on
 /// disk + what the user does inside the app.
 public actor TasteProfile {
+    /// Age at which a play-through's contribution to taste halves. 30 days
+    /// gives a station noticeable mood drift while staying recognisably
+    /// itself week to week. Lower = chases recent listening harder (more
+    /// discovery, twitchier identity); higher = steadier, slower to adapt.
+    static let playThroughHalfLifeDays: Double = 30
+
     private var snapshot: TasteProfileSnapshot = TasteProfileSnapshot()
 
     public init(snapshot: TasteProfileSnapshot = TasteProfileSnapshot()) {
@@ -186,15 +192,23 @@ public actor TasteProfile {
             saveAffinity = weight > 0 ? 1.0 - pow(0.5, weight) : 0.0
         }
 
-        // Play-through affinity: how many times has the user let a track
-        // from this artist run to the end on THIS station? A full listen is
-        // a quieter signal than a deliberate ♥, but it accumulates — an
-        // artist the user never skips earns its place. Same saturating
-        // shape as save-affinity. 1 play → 0.5, 2 → 0.75, asymptote 1.0.
+        // Play-through affinity: how strongly, and how RECENTLY, has the
+        // user let tracks from this artist run to the end on THIS station?
+        // A full listen is a quieter signal than a deliberate ♥, but it
+        // accumulates — an artist the user never skips earns its place.
+        // The signal is recency-weighted (30-day half-life) so a station
+        // drifts with current taste instead of petrifying around whatever
+        // was played when it was created: an artist enjoyed last week pulls
+        // hard, one last enjoyed months ago has mostly decayed away. The
+        // decayed weight feeds the same saturating curve as save-affinity:
+        // weight 1 → 0.5, 2 → 0.75, asymptote 1.0.
         var playThroughAffinity: Double = 0
-        if let plays = try? await history.playThroughCount(forStation: stationID, artist: candidateArtist),
-           plays > 0 {
-            playThroughAffinity = 1.0 - pow(0.5, Double(plays))
+        if let weight = try? await history.playThroughRecencyWeight(
+            forStation: stationID,
+            artist: candidateArtist,
+            halfLifeDays: Self.playThroughHalfLifeDays
+        ), weight > 0 {
+            playThroughAffinity = 1.0 - pow(0.5, weight)
         }
 
         let comfort = 1.0 - min(max(exploration, 0), 1)
