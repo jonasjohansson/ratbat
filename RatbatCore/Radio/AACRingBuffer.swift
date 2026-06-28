@@ -43,13 +43,16 @@ final class AACRingBuffer: @unchecked Sendable {
     /// the reader decides what to do on wake-up).
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
-    init(capacity: Int = 48 * 1024) {
-        // Default ~48KB. At 128 kbps that's roughly 3s of AAC — small
-        // enough that UI-vs-audio sync is within a few seconds, big enough
-        // that a listener hitting a momentary jitter spike still has some
-        // runway before stuttering. Clients do their own buffering on top
-        // (browsers 5-30s, AVPlayer 3-10s), so the server ring is the
-        // cheapest place to minimise contribution to the total desync.
+    init(capacity: Int = 128 * 1024) {
+        // Default ~128KB. At 128 kbps that's roughly 8s of AAC. The
+        // one-track-ahead prefetch in the encode loop now hides the big
+        // per-track resolve/decode-open gaps, so this ring no longer has
+        // to cover a track boundary — it's purely jitter insurance for
+        // mid-track read hiccups (e.g. a slow Drive block fetch). A few
+        // extra seconds of runway is a cheap trade against the ~8s it
+        // adds between the broadcaster's "Now:" UI and what the listener
+        // hears; clients buffer 5-30s on top of this anyway, so the ring
+        // is a minor contributor to total desync.
         self.capacity = max(capacity, 1024)
         self.storage = [UInt8](repeating: 0, count: self.capacity)
     }
