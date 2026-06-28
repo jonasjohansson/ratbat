@@ -116,6 +116,45 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertTrue(lower.contains("access-control-allow-headers: content-type"), "Missing allow-headers: \(response)")
     }
 
+    /// Skip bridge bails 404 when there's no pipeline for the station —
+    /// same "nothing to act on" path as the like bridge.
+    @MainActor
+    func testSkipOnIdleStationReturns404() async throws {
+        let radio = RadioBroadcaster(port: 18_033)
+        defer { radio.stopAll() }
+        let (status, _) = await radio.performSkipAsync(stationID: UUID())
+        XCTAssertEqual(status, 404)
+    }
+
+    /// CORS preflight: OPTIONS /skip returns 204 with the standard
+    /// Access-Control-* headers, same as /like, so the web player can POST
+    /// a thumbs-down cross-origin.
+    @MainActor
+    func testOptionsSkipReturnsCORSHeaders() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let port: UInt16 = 18_034
+        let radio = RadioBroadcaster(port: port)
+        let filler = Station(name: "CORS Filler", kind: .playlist(queue: tracks))
+        await radio.startBroadcast(station: filler)
+        defer { radio.stopAll() }
+
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        let response = try await Self.fetchRawResponse(
+            port: port,
+            path: "/skip",
+            requestHeaders: ["Access-Control-Request-Method: POST"],
+            maxBytes: 1_024,
+            method: "OPTIONS"
+        )
+        XCTAssertTrue(response.contains("HTTP/1.1 204"), "Expected 204: \(response)")
+        let lower = response.lowercased()
+        XCTAssertTrue(lower.contains("access-control-allow-origin: *"), "Missing allow-origin: \(response)")
+        XCTAssertTrue(lower.contains("access-control-allow-methods: post, options"), "Missing allow-methods: \(response)")
+    }
+
     func testRequestPathParsesCommonShapes() {
         let raw = Data("GET /stream/my-fm.aac HTTP/1.1\r\nHost: x\r\n\r\n".utf8)
         XCTAssertEqual(RadioBroadcaster.requestPath(from: raw), "/stream/my-fm.aac")
