@@ -154,6 +154,12 @@ public final class RadioBroadcaster: ObservableObject {
     private var clients: [ObjectIdentifier: (connection: NWConnection, stationID: Station.ID)] = [:]
     private var clientTasks: [ObjectIdentifier: Task<Void, Never>] = [:]
 
+    /// Server-Sent Events subscribers — clients on `GET /events` that want
+    /// a live push of the now-playing snapshot whenever a track changes or
+    /// the listener count moves, instead of polling `/now.json`. Keyed by
+    /// connection identity so a disconnect drops the right one.
+    private var sseSubscribers: [ObjectIdentifier: NWConnection] = [:]
+
     /// Construct a broadcaster bound to a specific port. Primarily for
     /// tests that need deterministic ports without trampling the
     /// user-facing preferences — production callers should prefer
@@ -665,6 +671,8 @@ public final class RadioBroadcaster: ObservableObject {
         clientTasks.removeAll()
         for (_, entry) in clients { entry.connection.cancel() }
         clients.removeAll()
+        for (_, conn) in sseSubscribers { conn.cancel() }
+        sseSubscribers.removeAll()
 
         listener?.cancel()
         listener = nil
@@ -679,6 +687,9 @@ public final class RadioBroadcaster: ObservableObject {
         } else {
             currentItemByStation.removeValue(forKey: stationID)
         }
+        // A track change is exactly what /events subscribers are waiting
+        // for — push the fresh now-playing snapshot.
+        pushSSE()
     }
 
     /// Snapshot of the current item for a detached serve loop. Lets a
@@ -894,6 +905,42 @@ public final class RadioBroadcaster: ObservableObject {
                 return
             }
 
+            // Live now-playing push (Server-Sent Events). Holds the
+            // connection open and streams a fresh /now.json snapshot on
+            // every track change and listener-count move, so clients that
+            // want it can drop polling. A periodic heartbeat keeps idle
+            // intermediaries from timing the connection out.
+            if path == "/events" {
+                let sseHeader = """
+                HTTP/1.1 200 OK\r
+                Content-Type: text/event-stream\r
+                Cache-Control: no-cache\r
+                Connection: keep-alive\r
+                Access-Control-Allow-Origin: *\r
+                \r
+
+                """
+                guard await Self.send(data: Data(sseHeader.utf8), on: connection) else {
+                    connection.cancel()
+                    return
+                }
+                await MainActor.run { [weak self] in self?.registerSSE(connection) }
+                // Initial snapshot so the client renders immediately rather
+                // than waiting for the first track change.
+                _ = await Self.send(data: Self.sseEvent(await nowPayload()), on: connection)
+                // Heartbeat loop. Pushes are driven from the broadcaster;
+                // this only keeps the pipe warm and notices a dead peer.
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 30_000_000_000)
+                    if Task.isCancelled { break }
+                    let alive = await Self.send(data: Data(": heartbeat\n\n".utf8), on: connection)
+                    if !alive { break }
+                }
+                await MainActor.run { [weak self] in self?.removeSSE(ObjectIdentifier(connection)) }
+                connection.cancel()
+                return
+            }
+
             // Legacy endpoint: redirect to the first broadcasting station
             // so existing bookmarks keep working. 404 when nothing's live.
             if path == "/stream.aac" || path == "/stream" {
@@ -966,6 +1013,10 @@ public final class RadioBroadcaster: ObservableObject {
                 break
             }
         }
+
+        // Listener count changed — let /events subscribers update their
+        // "N listening" badge live.
+        pushSSE()
     }
 
     private func removeClient(_ id: ObjectIdentifier) {
@@ -976,8 +1027,58 @@ public final class RadioBroadcaster: ObservableObject {
             logger.info(
                 "client disconnected, remaining \(self.listenerCount[entry.stationID] ?? 0, privacy: .public)"
             )
+            pushSSE()
         }
         clientTasks.removeValue(forKey: id)
+    }
+
+    // MARK: - Server-Sent Events
+
+    /// Register a `/events` subscriber and wire its disconnect cleanup.
+    private func registerSSE(_ connection: NWConnection) {
+        let id = ObjectIdentifier(connection)
+        sseSubscribers[id] = connection
+        connection.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .failed, .cancelled:
+                Task { @MainActor in self.removeSSE(id) }
+            default:
+                break
+            }
+        }
+        logger.info("SSE subscriber connected, total \(self.sseSubscribers.count, privacy: .public)")
+    }
+
+    private func removeSSE(_ id: ObjectIdentifier) {
+        if sseSubscribers.removeValue(forKey: id) != nil {
+            logger.info("SSE subscriber disconnected, remaining \(self.sseSubscribers.count, privacy: .public)")
+        }
+    }
+
+    /// Push the current now-playing snapshot to every `/events` subscriber.
+    /// Fire-and-forget per connection; a failed send drops that subscriber.
+    /// Snapshots are last-write-wins, so the rare out-of-order delivery
+    /// under rapid changes is harmless.
+    private func pushSSE() {
+        guard !sseSubscribers.isEmpty else { return }
+        let event = Self.sseEvent(buildNowPayload())
+        for (id, conn) in sseSubscribers {
+            Task { [weak self] in
+                let ok = await Self.send(data: event, on: conn)
+                if !ok { await MainActor.run { self?.removeSSE(id) } }
+            }
+        }
+    }
+
+    /// Frame a JSON payload as a single SSE `data:` event. SSE is
+    /// line-oriented and terminates an event with a blank line; our payload
+    /// is single-line JSON so one `data:` line suffices.
+    nonisolated static func sseEvent(_ json: Data) -> Data {
+        var out = Data("data: ".utf8)
+        out.append(json)
+        out.append(Data("\n\n".utf8))
+        return out
     }
 
     // MARK: - Request parsing

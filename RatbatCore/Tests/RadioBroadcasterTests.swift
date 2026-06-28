@@ -155,6 +155,41 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertTrue(lower.contains("access-control-allow-methods: post, options"), "Missing allow-methods: \(response)")
     }
 
+    /// SSE framing: a payload becomes a single `data:` line terminated by
+    /// a blank line, with the JSON bytes passed through verbatim.
+    func testSSEEventFraming() {
+        let json = Data("{\"stations\":[]}".utf8)
+        let framed = RadioBroadcaster.sseEvent(json)
+        XCTAssertEqual(String(data: framed, encoding: .utf8), "data: {\"stations\":[]}\n\n")
+    }
+
+    /// GET /events opens a Server-Sent Events stream — the response head
+    /// must advertise text/event-stream so browsers treat it as one.
+    @MainActor
+    func testEventsEndpointSendsSSEHeaders() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let port: UInt16 = 18_035
+        let radio = RadioBroadcaster(port: port)
+        let station = Station(name: "SSE Test", kind: .playlist(queue: tracks))
+        await radio.startBroadcast(station: station)
+        defer { radio.stopAll() }
+
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        let response = try await Self.fetchRawResponse(
+            port: port,
+            path: "/events",
+            requestHeaders: [],
+            maxBytes: 512
+        )
+        XCTAssertTrue(response.contains("HTTP/1.1 200"), "Expected 200: \(response)")
+        let lower = response.lowercased()
+        XCTAssertTrue(lower.contains("content-type: text/event-stream"), "Missing event-stream content type: \(response)")
+        XCTAssertTrue(lower.contains("access-control-allow-origin: *"), "Missing allow-origin: \(response)")
+    }
+
     func testRequestPathParsesCommonShapes() {
         let raw = Data("GET /stream/my-fm.aac HTTP/1.1\r\nHost: x\r\n\r\n".utf8)
         XCTAssertEqual(RadioBroadcaster.requestPath(from: raw), "/stream/my-fm.aac")
