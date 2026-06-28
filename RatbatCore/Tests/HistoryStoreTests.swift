@@ -52,6 +52,37 @@ final class HistoryStoreTests: XCTestCase {
         XCTAssertEqual(unknown, 0)
     }
 
+    func testPlayThroughRecencyWeight_decaysWithAge() async throws {
+        let store = try await HistoryStore(databaseURL: tempURL)
+        let s = UUID()
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let day = 86_400.0
+
+        // Same artist, three play-throughs at increasing age.
+        let recent = try await store.record(station: s, artist: "Boards of Canada", title: "Roygbiv", playedAt: now)
+        let mid = try await store.record(station: s, artist: "Boards of Canada", title: "Telephasic", playedAt: now.addingTimeInterval(-30 * day))
+        let old = try await store.record(station: s, artist: "Boards of Canada", title: "Olson", playedAt: now.addingTimeInterval(-60 * day))
+        try await store.incrementPlayCount(id: recent)
+        try await store.incrementPlayCount(id: mid)
+        try await store.incrementPlayCount(id: old)
+
+        // With a 30-day half-life: 1.0 (today) + 0.5 (30d) + 0.25 (60d).
+        let weighted = try await store.playThroughRecencyWeight(
+            forStation: s, artist: "boards of canada", halfLifeDays: 30, now: now
+        )
+        XCTAssertEqual(weighted, 1.75, accuracy: 0.01)
+
+        // The un-decayed count still sees all three equally.
+        let raw = try await store.playThroughCount(forStation: s, artist: "Boards of Canada")
+        XCTAssertEqual(raw, 3)
+
+        // Unknown artist → 0.
+        let none = try await store.playThroughRecencyWeight(
+            forStation: s, artist: "Nobody", halfLifeDays: 30, now: now
+        )
+        XCTAssertEqual(none, 0)
+    }
+
     func testTopAffinityArtists_ranksBySavesAndPlays() async throws {
         let store = try await HistoryStore(databaseURL: tempURL)
         let station = UUID()
