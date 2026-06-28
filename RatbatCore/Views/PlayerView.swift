@@ -17,16 +17,34 @@ public struct PlayerView: View {
     }
 
     public var body: some View {
-        HStack(spacing: 16) {
-            trackInfo
-            Spacer(minLength: 20)
-            transportControls
-            progressControls
+        VStack(spacing: 0) {
+            if let error = player.error {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.primary)
+                        .textSelection(.enabled)
+                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 6)
+                .background(.orange.opacity(0.12))
+            }
+            HStack(spacing: 16) {
+                trackInfo
+                Spacer(minLength: 20)
+                transportControls
+                progressControls
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
+            .frame(maxWidth: .infinity)
+            .background(.ultraThinMaterial)
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 12)
-        .frame(maxWidth: .infinity)
-        .background(.ultraThinMaterial)
     }
 
     @ViewBuilder private var trackInfo: some View {

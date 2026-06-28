@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import Combine
 import SwiftUI
+import OSLog
 
 /// Plays audio tracks from a queue and publishes playback state for the UI.
 ///
@@ -25,13 +26,29 @@ public final class AudioPlayer: ObservableObject {
     /// Current playback time in seconds. Updated ~2x per second while playing.
     @Published public private(set) var progress: TimeInterval = 0
     @Published public private(set) var queue: [Track] = []
+    /// Last playback error, surfaced as a string so the UI can render it
+    /// without knowing about `NSError`. Cleared on a successful load or on
+    /// the next user-initiated play. Used by ``PlayerView`` to render a
+    /// banner when AVPlayer can't open a file — replaces the silent-fail
+    /// behaviour that used to leave the UI stuck at "No track" with no hint
+    /// why.
+    @Published public private(set) var error: String?
 
     // MARK: - Internals
 
     private let player: AVPlayer
+    private let logger = Logger(
+        subsystem: "se.jonasjohansson.ratbat",
+        category: "player"
+    )
 
     /// Index into `queue` of the currently-loaded track, or `nil` if idle.
     private var currentIndex: Int?
+
+    /// KVO token for the currently-loaded `AVPlayerItem.status`. Replaced
+    /// on every `loadTrack` so each item gets its own observer; dropped
+    /// when the player goes idle.
+    private var itemStatusObserver: NSKeyValueObservation?
 
     /// Token returned by `addPeriodicTimeObserver`. We mark it
     /// `nonisolated(unsafe)` so `deinit` (which is nonisolated) can read it
@@ -140,11 +157,62 @@ public final class AudioPlayer: ObservableObject {
     private func loadTrack(at index: Int) {
         guard queue.indices.contains(index) else { return }
         let track = queue[index]
-        let item = AVPlayerItem(url: track.url)
+        let url = track.url
+
+        // Pre-flight filesystem checks. When macOS TCC silently blocks a
+        // path (e.g. the music folder lives in `~/Library/CloudStorage/`
+        // and the app's code hash changed since the user last granted
+        // access), `AVPlayer` returns the opaque `-11800 AVErrorUnknown`
+        // and the UI sits at "No track" forever. Checking existence +
+        // readability up front lets us surface a specific, actionable
+        // message so the user knows where to look.
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: url.path) {
+            let msg = "File not found on disk. Cloud file not materialized, or Ratbat lacks permission to see this folder (Privacy & Security → Full Disk Access). Path: \(url.path)"
+            self.error = msg
+            self.logger.error("loadTrack: not found — \(url.path, privacy: .public)")
+            return
+        }
+        if !fm.isReadableFile(atPath: url.path) {
+            let msg = "File exists but isn't readable. Check Privacy & Security → Full Disk Access for Ratbat. Path: \(url.path)"
+            self.error = msg
+            self.logger.error("loadTrack: unreadable — \(url.path, privacy: .public)")
+            return
+        }
+
+        let item = AVPlayerItem(url: url)
+
+        // Observe `status` so AVPlayer failures surface as a visible
+        // error instead of a silent stall. Replace any prior observer —
+        // each `AVPlayerItem` has its own token and we only care about
+        // the currently-loaded one.
+        itemStatusObserver = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                switch item.status {
+                case .readyToPlay:
+                    self.error = nil
+                case .failed:
+                    let desc = item.error?.localizedDescription
+                        ?? String(describing: item.error)
+                    self.error = "AVPlayer couldn't load: \(desc)"
+                    self.logger.error(
+                        "AVPlayerItem failed for \(url.path, privacy: .public): \(desc, privacy: .public)"
+                    )
+                case .unknown:
+                    break
+                @unknown default:
+                    break
+                }
+            }
+        }
+
         player.replaceCurrentItem(with: item)
         currentIndex = index
         currentTrack = track
         progress = 0
+        error = nil
+        logger.info("loadTrack: \(url.path, privacy: .public)")
     }
 
     private func observeProgress() {
