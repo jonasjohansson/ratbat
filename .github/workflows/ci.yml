@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build + test
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      # Ratbat.xcodeproj is gitignored — project.yml is the source of truth.
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: RatbatCore — macOS tests
+        run: |
+          set -o pipefail
+          xcodebuild -project Ratbat.xcodeproj \
+            -scheme RatbatCore \
+            -destination 'platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            test
+
+      - name: RatbatMac — build
+        run: |
+          set -o pipefail
+          xcodebuild -project Ratbat.xcodeproj \
+            -target RatbatMac \
+            -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      # The step this workflow exists for. RatbatCore carries macOS-only
+      # pieces behind `#if os(macOS)` and RatbatCoreTests is a macOS-only
+      # target, so a fully green macOS run says nothing about whether the
+      # iOS listener still compiles. It shipped broken once already.
+      - name: RatbatIOS — build
+        run: |
+          set -o pipefail
+          xcodebuild -project Ratbat.xcodeproj \
+            -target RatbatIOS \
+            -sdk iphonesimulator \
+            -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO \
+            build
