@@ -547,8 +547,25 @@ public final class RadioBroadcaster: ObservableObject {
         let buffer = pipeline.buffer
         let stationID = station.id
         let stationName = station.name
-        let history = self.history
-        pipeline.encodeTask = Task.detached { [weak self, buffer, history] in
+        // Play-through recording needs HistoryStore, which is macOS-only.
+        // Hand the encode loop a platform-neutral closure rather than the
+        // store itself so its signature stays cross-platform; on iOS the
+        // signal is simply never recorded. Keeping this a closure (instead
+        // of routing through `owner`) preserves the direct actor hop — the
+        // reason the store was captured here in the first place.
+        let recordPlayThrough: (@Sendable (Int64) async -> Void)?
+        #if os(macOS)
+        if let store = self.history {
+            recordPlayThrough = { (id: Int64) async in
+                _ = try? await store.incrementPlayCount(id: id)
+            }
+        } else {
+            recordPlayThrough = nil
+        }
+        #else
+        recordPlayThrough = nil
+        #endif
+        pipeline.encodeTask = Task.detached { [weak self, buffer, recordPlayThrough] in
             await Self.runEncodeLoop(
                 source: source,
                 stationID: stationID,
@@ -556,7 +573,7 @@ public final class RadioBroadcaster: ObservableObject {
                 buffer: buffer,
                 bitrate: bitrate,
                 sampleRate: sampleRate,
-                history: history,
+                recordPlayThrough: recordPlayThrough,
                 owner: self
             )
         }
@@ -1722,7 +1739,7 @@ public final class RadioBroadcaster: ObservableObject {
         buffer: AACRingBuffer,
         bitrate: Int,
         sampleRate: Double,
-        history: HistoryStore?,
+        recordPlayThrough: (@Sendable (Int64) async -> Void)?,
         owner: RadioBroadcaster?
     ) async {
         let decoder = AudioDecoder()
@@ -1860,7 +1877,7 @@ public final class RadioBroadcaster: ObservableObject {
             // run against ones they skip. Playlist items carry no historyID,
             // so this is naturally a no-op for non-generative stations.
             if playedThrough, let historyID = item.historyID {
-                try? await history?.incrementPlayCount(id: historyID)
+                await recordPlayThrough?(historyID)
             }
         }
 
