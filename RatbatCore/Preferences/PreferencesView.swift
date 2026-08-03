@@ -75,6 +75,21 @@ public struct PreferencesView: View {
                 }
                 Toggle("Include track info (ICY metadata)", isOn: $preferences.icyMetadataEnabled)
             }
+            Section("Auto-start") {
+                if preferences.autoStartSlugs.isEmpty {
+                    Text("No stations auto-start. Right-click a station in the sidebar → “Auto-start on Launch”.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(preferences.autoStartSlugs, id: \.self) { slug in
+                        Text(slug)
+                            .font(.caption.monospaced())
+                    }
+                    Text("These stations go live at launch. Idle stations cost nothing — the encoder sleeps until someone tunes in.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
             if needsRestart {
                 Section {
                     Label(

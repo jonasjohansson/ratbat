@@ -79,6 +79,20 @@ public final class BroadcastPreferences: ObservableObject {
     @AppStorage("ratbat.lastfm.apiKey")
     public var lastFMAPIKey: String = ""
 
+    /// Slugs of stations to broadcast automatically at launch. Slugs, not
+    /// ``Station/ID``s: stations persist next to the library and sync
+    /// across machines via the shared drive, while preferences are
+    /// per-machine `UserDefaults` — the slug is the identifier stable
+    /// across both stores (and readable in `defaults read`). Stored
+    /// comma-joined; slugs are URL-safe so the separator can't collide.
+    /// A slug with no matching station is skipped silently at launch —
+    /// the station may live in another machine's library, or the station
+    /// was renamed (slugs derive from names, so a rename orphans the
+    /// entry; per-machine prefs make cross-machine migration impossible,
+    /// so silent-skip is the designed behavior, not an oversight).
+    @AppStorage("ratbat.broadcast.autoStartSlugs")
+    private var autoStartSlugsRaw: String = ""
+
     /// Republishes whenever any stored setting changes so Combine observers
     /// (notably ``RadioBroadcaster``) can mark themselves "needs restart".
     /// `@AppStorage` doesn't expose a publisher we can subscribe to, so we
@@ -101,6 +115,31 @@ public final class BroadcastPreferences: ObservableObject {
         }
     }
 
+    /// Ordered list of auto-start slugs. Note: does NOT tick ``revision``
+    /// — toggling auto-start has no effect on a running pipeline, so it
+    /// must not raise the "needs restart" nag the way quality/port do.
+    public var autoStartSlugs: [String] {
+        get { autoStartSlugsRaw.split(separator: ",").map(String.init) }
+        set { autoStartSlugsRaw = newValue.joined(separator: ",") }
+    }
+
+    public func isAutoStart(slug: String) -> Bool {
+        autoStartSlugs.contains(slug)
+    }
+
+    /// Add or remove `slug` from the auto-start list. Idempotent in both
+    /// directions so a double-toggle can't duplicate an entry.
+    public func setAutoStart(_ enabled: Bool, slug: String) {
+        var slugs = autoStartSlugs
+        if enabled {
+            guard !slugs.contains(slug) else { return }
+            slugs.append(slug)
+        } else {
+            slugs.removeAll { $0 == slug }
+        }
+        autoStartSlugs = slugs
+    }
+
     /// Process-wide shared instance. UI surfaces and the broadcaster read
     /// from the same store so changing a value in one place shows up
     /// everywhere without plumbing.
@@ -118,6 +157,7 @@ public final class BroadcastPreferences: ObservableObject {
         defaults.removeObject(forKey: "ratbat.broadcast.sampleRate")
         defaults.removeObject(forKey: "ratbat.broadcast.port")
         defaults.removeObject(forKey: "ratbat.broadcast.icyMetadata")
+        defaults.removeObject(forKey: "ratbat.broadcast.autoStartSlugs")
         revision &+= 1
     }
 }
