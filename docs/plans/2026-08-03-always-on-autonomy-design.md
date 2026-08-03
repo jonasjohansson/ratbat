@@ -69,6 +69,8 @@ The first `startBroadcast` brings up the HTTP listener and the tunnel exactly as
 
 ### 2. Channel picker page (goal 2's "like NTS")
 
+> **Revision (2026-08-03, same day):** this section was written in ignorance of `ratbat.fm` — a separate repo already deployed at `ratbat.jonasjohansson.se` (GitHub Pages) that does the picking and playing: station cards as mini-players off `/now.json`, one-at-a-time playback, an API-base resolver mapping `ratbat.<domain>` → `radio.<domain>`. The gap was only ♥/skip, which shipped to it the same day (`ratbat.fm` commit `069b788`). The embedded-page idea below is superseded; it survives only as a possible LAN-fallback "nothing on air" page, which is optional. Phase B is effectively done.
+
 The data plane already exists and needs **zero new endpoints**: `/now.json` returns *all* currently-broadcasting stations with current track and listener counts, `/events` (SSE) pushes a fresh snapshot on every track change, and each station streams at `/stream/<slug>.aac`. What's missing is only a face: `GET /` currently falls through to 404.
 
 Add one route to the broadcaster's HTTP server: `GET /` serves a single static HTML page (embedded in the binary as a Swift string constant, same pattern as the SSE header block — no resource-bundle loading, nothing to misplace in the app copy step).
