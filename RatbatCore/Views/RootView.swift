@@ -51,6 +51,12 @@ public struct RootView: View {
     /// is guaranteed to exist (first `onAppear`).
     @State private var nowPlaying: NowPlayingController?
 
+    /// Auto-start must fire exactly once per launch, but the library-load
+    /// `.task` re-fires on folder change and "Reload Library" — this
+    /// latches after the first pass so a mid-session reload doesn't
+    /// resurrect stations the user has since stopped.
+    @State private var didAutoStart = false
+
     public init(config: LibraryConfig = LibraryConfig()) {
         self.config = config
 
@@ -145,6 +151,20 @@ public struct RootView: View {
                         if let snapshotURL = try? TasteProfileStore.defaultURL() {
                             let snapshot = await tasteProfile.currentSnapshot()
                             try? TasteProfileStore.save(snapshot, to: snapshotURL)
+                        }
+                        // Auto-start flagged stations now that the station
+                        // list is loaded and the first library index is
+                        // done (generative stations don't need the index,
+                        // but playlist stations shouldn't race a cloud
+                        // mount that's still hydrating after a reboot).
+                        // Runs once per launch; `startBroadcast` is
+                        // additionally a no-op for anything already live.
+                        if !didAutoStart {
+                            didAutoStart = true
+                            for station in stations.stations
+                            where preferences.autoStartSlugs.contains(station.slug) {
+                                await radio.startBroadcast(station: station)
+                            }
                         }
                     }
                     // Mirror the unified sidebar selection back into the

@@ -41,6 +41,12 @@ public struct PlaylistsSidebarView: View {
     @ObservedObject public var downloadService: DownloadService
     @Binding public var selection: SidebarSelection?
 
+    /// Shared prefs for the auto-start toggle in the station context
+    /// menu. Read from the singleton rather than injected — the sidebar
+    /// already has five injected dependencies and this one is genuinely
+    /// process-global.
+    @ObservedObject private var preferences: BroadcastPreferences = .shared
+
     /// Local UI state for the rename dialog. Nil when no dialog is up.
     @State private var renameTarget: Station?
     @State private var renameText: String = ""
@@ -275,6 +281,10 @@ public struct PlaylistsSidebarView: View {
             }
         }
         .disabled(!isLive)
+        Toggle("Auto-start on Launch", isOn: Binding(
+            get: { preferences.isAutoStart(slug: station.slug) },
+            set: { preferences.setAutoStart($0, slug: station.slug) }
+        ))
         Divider()
         Button("Rename…") {
             renameText = station.name

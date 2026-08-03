@@ -86,6 +86,61 @@ final class BroadcastPreferencesTests: XCTestCase {
         }
     }
 
+    func testAutoStartSlugsDefaultsEmpty() {
+        XCTAssertEqual(BroadcastPreferences().autoStartSlugs, [])
+    }
+
+    func testAutoStartSlugsRoundTrip() {
+        let first = BroadcastPreferences()
+        first.autoStartSlugs = ["techno-90s", "dungeon-synth"]
+
+        let second = BroadcastPreferences()
+        XCTAssertEqual(second.autoStartSlugs, ["techno-90s", "dungeon-synth"])
+        XCTAssertTrue(second.isAutoStart(slug: "techno-90s"))
+        XCTAssertFalse(second.isAutoStart(slug: "ambient"))
+    }
+
+    func testSetAutoStartIsIdempotentBothDirections() {
+        let prefs = BroadcastPreferences()
+        prefs.setAutoStart(true, slug: "techno-90s")
+        prefs.setAutoStart(true, slug: "techno-90s")
+        XCTAssertEqual(prefs.autoStartSlugs, ["techno-90s"], "double-enable must not duplicate")
+
+        prefs.setAutoStart(false, slug: "techno-90s")
+        prefs.setAutoStart(false, slug: "techno-90s")
+        XCTAssertEqual(prefs.autoStartSlugs, [], "double-disable must be a no-op")
+    }
+
+    func testSetAutoStartPreservesOrder() {
+        let prefs = BroadcastPreferences()
+        prefs.setAutoStart(true, slug: "a")
+        prefs.setAutoStart(true, slug: "b")
+        prefs.setAutoStart(true, slug: "c")
+        prefs.setAutoStart(false, slug: "b")
+        XCTAssertEqual(prefs.autoStartSlugs, ["a", "c"])
+    }
+
+    /// Auto-start has no effect on a running pipeline, so toggling it must
+    /// NOT tick `revision` — otherwise flipping a toggle mid-broadcast
+    /// raises a spurious "restart to apply" banner.
+    func testAutoStartDoesNotTickRevision() {
+        let prefs = BroadcastPreferences()
+        let start = prefs.revision
+        prefs.setAutoStart(true, slug: "techno-90s")
+        prefs.setAutoStart(false, slug: "techno-90s")
+        XCTAssertEqual(prefs.revision, start)
+    }
+
+    func testResetToDefaultsClearsAutoStart() {
+        let prefs = BroadcastPreferences()
+        prefs.setAutoStart(true, slug: "techno-90s")
+        prefs.resetToDefaults()
+        // `@AppStorage` wrappers cache per-instance — reset clears the
+        // backing defaults, so read through a fresh instance (same
+        // pattern as `testPersistenceViaUserDefaults`).
+        XCTAssertEqual(BroadcastPreferences().autoStartSlugs, [])
+    }
+
     /// Changing preferences while at least one station is live must flip
     /// `needsRestart` on the broadcaster so the UI can surface a banner.
     func testBroadcasterFlagsNeedsRestartOnPreferenceChange() async throws {
