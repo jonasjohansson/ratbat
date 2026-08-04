@@ -86,7 +86,9 @@ final class TasteProfileTests: XCTestCase {
             stationID: stationID,
             history: history
         )
-        XCTAssertGreaterThan(score, 0.2)
+        // Library-match weighs 0.15 since the boost term joined the
+        // formula (was 0.25) — the assertion tracks the weight table.
+        XCTAssertGreaterThan(score, 0.1)
     }
 
     func testScore_skippedArtist_isHardBlacklist() async throws {

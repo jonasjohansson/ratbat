@@ -211,11 +211,30 @@ public actor TasteProfile {
             playThroughAffinity = 1.0 - pow(0.5, weight)
         }
 
+        // Boost-affinity: the deliberate "more of this" — the strongest
+        // signal there is, weighted above ♥-saves (a save is archival,
+        // a boost is navigational). Same harmonic + saturating shape as
+        // save-affinity, keyed on boosted rows newest-first.
+        var boostAffinity: Double = 0
+        if let boosted = try? await history.boostedEntries(forStation: stationID, limit: 200) {
+            let normalized = candidateArtist
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            var weight = 0.0
+            var rank = 0
+            for entry in boosted where entry.artist.lowercased() == normalized {
+                rank += 1
+                weight += 1.0 / Double(rank)
+            }
+            boostAffinity = weight > 0 ? 1.0 - pow(0.5, weight) : 0.0
+        }
+
         let comfort = 1.0 - min(max(exploration, 0), 1)
-        return comfort * (0.25 * libraryMatch
-                        + 0.20 * tagMatch
-                        + 0.30 * saveAffinity
-                        + 0.25 * playThroughAffinity)
+        return comfort * (0.15 * libraryMatch
+                        + 0.10 * tagMatch
+                        + 0.20 * saveAffinity
+                        + 0.20 * playThroughAffinity
+                        + 0.35 * boostAffinity)
     }
     #endif
 }

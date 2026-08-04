@@ -97,6 +97,11 @@ public actor HistoryStore {
             try Self.execRaw("PRAGMA user_version = 2;", on: handle)
             logger.info("history.db migrated to v2 at \(self.dbURL.path, privacy: .public)")
         }
+        if Self.userVersion(on: handle) < 3 {
+            try Self.migrateToV3(on: handle)
+            try Self.execRaw("PRAGMA user_version = 3;", on: handle)
+            logger.info("history.db migrated to v3 at \(self.dbURL.path, privacy: .public)")
+        }
     }
 
     deinit {
@@ -412,8 +417,13 @@ public actor HistoryStore {
     /// ones I love here." Returns distinct artist display names, strongest
     /// affinity first; artists with no positive signal are excluded.
     public func topAffinityArtists(forStation station: UUID, limit: Int = 5) throws -> [String] {
+        // Boost dominates (10) over save (3) over play-through (1): a
+        // boosted artist should lead the next similar-artist expansion —
+        // that's the whole point of the steering signal.
         let sql = """
-            SELECT artist, (SUM(saved) * 3 + SUM(play_count)) AS affinity
+            SELECT artist,
+                   (SUM(CASE WHEN boosted_at IS NOT NULL THEN 1 ELSE 0 END) * 10
+                    + SUM(saved) * 3 + SUM(play_count)) AS affinity
             FROM history
             WHERE station_id = ?
             GROUP BY artist_norm
@@ -488,6 +498,95 @@ public actor HistoryStore {
         )
         try execRaw(
             "CREATE INDEX IF NOT EXISTS history_skipped ON history(station_id, skipped, artist_norm);",
+            on: handle
+        )
+    }
+
+    // MARK: - v3: boost / un-♥ API (keep vs steer)
+
+    /// Stamp an entry as boosted — "more of this". The strong steering
+    /// signal: outweighs saves in ``topAffinityArtists`` so the boosted
+    /// artist leads the next similar-artist expansion, and feeds its own
+    /// scoring term above save-affinity.
+    public func markBoosted(id: Int64) throws {
+        let sql = "UPDATE history SET boosted_at = ? WHERE id = ?;"
+        let stmt = try prepare(sql)
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_double(stmt, 1, Date().timeIntervalSince1970)
+        sqlite3_bind_int64(stmt, 2, id)
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw Error.queryFailed(lastError())
+        }
+    }
+
+    /// Boosted entries for a station, newest boost first — the boost
+    /// counterpart of ``savedEntries(forStation:limit:)``.
+    public func boostedEntries(forStation station: UUID, limit: Int = 100) throws -> [Entry] {
+        let sql = """
+            SELECT id, station_id, artist, title, played_at,
+                   source_show_url, youtube_id, saved, cached_path
+            FROM history
+            WHERE station_id = ? AND boosted_at IS NOT NULL
+            ORDER BY boosted_at DESC
+            LIMIT ?;
+            """
+        let stmt = try prepare(sql)
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, station.uuidString, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(stmt, 2, Int64(limit))
+        return collectRows(stmt)
+    }
+
+    /// The newest saved row matching a station + artist + title — how
+    /// un-♥ finds the row a just-pressed heart created, since playlist
+    /// items don't carry the row's id.
+    public func newestSavedEntry(station: UUID, artist: String, title: String) throws -> Entry? {
+        let sql = """
+            SELECT id, station_id, artist, title, played_at,
+                   source_show_url, youtube_id, saved, cached_path
+            FROM history
+            WHERE station_id = ? AND saved = 1
+              AND artist_norm = ? AND title_norm = ?
+            ORDER BY played_at DESC
+            LIMIT 1;
+            """
+        let stmt = try prepare(sql)
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, station.uuidString, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, Self.normalize(artist), -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 3, Self.normalize(title), -1, SQLITE_TRANSIENT)
+        return collectRows(stmt).first
+    }
+
+    /// Un-♥ a generative save: the row stays (it's still play history),
+    /// only the save flag and the copied file's path are cleared.
+    public func unmarkSaved(id: Int64) throws {
+        let sql = "UPDATE history SET saved = 0, cached_path = NULL WHERE id = ?;"
+        let stmt = try prepare(sql)
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, id)
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw Error.queryFailed(lastError())
+        }
+    }
+
+    /// Un-♥ an affinity-only row (owned/playlist ♥): the row exists ONLY
+    /// as the signal, so undo means deleting it outright.
+    public func deleteEntry(id: Int64) throws {
+        let sql = "DELETE FROM history WHERE id = ?;"
+        let stmt = try prepare(sql)
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, id)
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw Error.queryFailed(lastError())
+        }
+    }
+
+    /// v3: the boost signal — "more of this", the strong steering ♥.
+    /// NULL = never boosted. Same idempotent-ALTER pattern as v2.
+    private static func migrateToV3(on handle: OpaquePointer) throws {
+        try execRaw(
+            "ALTER TABLE history ADD COLUMN boosted_at REAL;",
             on: handle
         )
     }
