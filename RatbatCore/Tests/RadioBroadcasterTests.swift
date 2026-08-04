@@ -190,6 +190,54 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertTrue(lower.contains("access-control-allow-origin: *"), "Missing allow-origin: \(response)")
     }
 
+    // MARK: - Coalesced POST parsing
+    //
+    // Regression suite for the bug that hung every real-world POST:
+    // browsers (and Cloudflare's tunnel) send headers + body in one TCP
+    // segment. `readUntilHeaderEnd` used to truncate that buffer at the
+    // header terminator, silently discarding the body, and `readBody`
+    // then blocked on a receive that could never fire.
+
+    private static let coalescedPost = Data("""
+    POST /like HTTP/1.1\r
+    Host: radio.example.com\r
+    Content-Type: application/json\r
+    Content-Length: 50\r
+    \r
+    {"station":"B8157CF6-56D6-463F-85FB-5569493459FC"}
+    """.utf8)
+
+    func testBodyBytesPeelsCoalescedBody() {
+        let body = RadioBroadcaster.bodyBytes(after: Self.coalescedPost)
+        XCTAssertEqual(
+            String(data: body, encoding: .utf8),
+            #"{"station":"B8157CF6-56D6-463F-85FB-5569493459FC"}"#
+        )
+        XCTAssertEqual(body.count, 50, "must match the declared Content-Length")
+    }
+
+    func testBodyBytesEmptyWhenNoBodyCoalesced() {
+        let headersOnly = Data("GET /now.json HTTP/1.1\r\nHost: x\r\n\r\n".utf8)
+        XCTAssertEqual(RadioBroadcaster.bodyBytes(after: headersOnly), Data())
+    }
+
+    func testContentLengthReadsHeaderWithTrailingBody() {
+        XCTAssertEqual(RadioBroadcaster.contentLength(from: Self.coalescedPost), 50)
+    }
+
+    func testContentLengthIgnoresSpoofInBody() {
+        // A body line must not be able to masquerade as a header.
+        let sneaky = Data(
+            "POST /like HTTP/1.1\r\nHost: x\r\n\r\ncontent-length: 9999".utf8
+        )
+        XCTAssertNil(RadioBroadcaster.contentLength(from: sneaky))
+    }
+
+    func testRequestParsingToleratesCoalescedBody() {
+        XCTAssertEqual(RadioBroadcaster.requestPath(from: Self.coalescedPost), "/like")
+        XCTAssertEqual(RadioBroadcaster.requestMethod(from: Self.coalescedPost), "POST")
+    }
+
     func testRequestPathParsesCommonShapes() {
         let raw = Data("GET /stream/my-fm.aac HTTP/1.1\r\nHost: x\r\n\r\n".utf8)
         XCTAssertEqual(RadioBroadcaster.requestPath(from: raw), "/stream/my-fm.aac")
