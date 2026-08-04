@@ -52,6 +52,31 @@ public final class RadioBroadcaster: ObservableObject {
     /// (not `Track`) so NTS-backed stations — which don't have a full
     /// library ``Track`` — can publish the same way as playlist stations.
     @Published public private(set) var currentItemByStation: [Station.ID: TrackSourceItem] = [:]
+    /// Per-station prefetched next track. The encode loop resolves one
+    /// track ahead (the dropout fix); publishing it lets /now.json show
+    /// a truthful "next" — the only future track that's actually certain.
+    @Published public private(set) var upcomingByStation: [Station.ID: TrackSourceItem] = [:]
+
+    /// A just-finished track, retired into the per-station recent ring.
+    /// `entryID` gives the web player a stable handle for retro-♥ ("the
+    /// one that got away, two tracks back").
+    struct RecentTrack: Sendable {
+        let entryID: UUID
+        let item: TrackSourceItem
+        let playedAt: Date
+        let youtubeURL: String?
+        let sourceURL: String?
+    }
+    /// Newest-first, capped at 5. In-memory on purpose: uniform across
+    /// station kinds (playlist tracks have no history rows) and reset on
+    /// restart, which is the honest lifetime for "what just played".
+    private(set) var recentByStation: [Station.ID: [RecentTrack]] = [:]
+
+    /// Provenance for the CURRENT track, resolved once per track change
+    /// from its history row (YouTube id → watch URL; Bandcamp release /
+    /// NTS show URL). nil for playlist tracks and while the lookup runs.
+    private var provenanceByStation: [Station.ID: (youtube: String?, source: String?)] = [:]
+
     /// Last error surfaced by the listener or any encode/decode loop.
     /// String-typed so the UI can just render it; OSLog has the details.
     @Published public private(set) var error: String?
@@ -605,6 +630,9 @@ public final class RadioBroadcaster: ObservableObject {
         broadcasting.remove(stationID)
         listenerCount.removeValue(forKey: stationID)
         currentItemByStation.removeValue(forKey: stationID)
+        upcomingByStation.removeValue(forKey: stationID)
+        recentByStation.removeValue(forKey: stationID)
+        provenanceByStation.removeValue(forKey: stationID)
 
         // Boot any clients still attached to this station.
         let toRemove = clients.filter { $0.value.stationID == stationID }
@@ -699,6 +727,25 @@ public final class RadioBroadcaster: ObservableObject {
     /// new track. Drives the ICY metadata surfaced to clients at the next
     /// block boundary.
     fileprivate func updateCurrentItem(_ item: TrackSourceItem?, stationID: Station.ID) {
+        // Retire the outgoing track into the recent ring, carrying
+        // whatever provenance had resolved for it. Newest first, cap 5.
+        if let outgoing = currentItemByStation[stationID] {
+            let prov = provenanceByStation[stationID]
+            var ring = recentByStation[stationID] ?? []
+            ring.insert(RecentTrack(
+                entryID: UUID(),
+                item: outgoing,
+                playedAt: Date(),
+                youtubeURL: prov?.youtube,
+                sourceURL: prov?.source
+            ), at: 0)
+            if ring.count > 5 { ring.removeLast(ring.count - 5) }
+            recentByStation[stationID] = ring
+        }
+        provenanceByStation.removeValue(forKey: stationID)
+        // The prefetched "next" either just became current or was skipped
+        // past — either way it's stale until the loop re-publishes.
+        upcomingByStation.removeValue(forKey: stationID)
         if let item {
             currentItemByStation[stationID] = item
         } else {
@@ -706,6 +753,34 @@ public final class RadioBroadcaster: ObservableObject {
         }
         // A track change is exactly what /events subscribers are waiting
         // for — push the fresh now-playing snapshot.
+        pushSSE()
+
+        #if os(macOS)
+        // Resolve the incoming track's provenance from its history row —
+        // one actor hop per track change, cached until the next change,
+        // re-pushed over SSE when it lands.
+        if let item, let historyID = item.historyID, let history {
+            Task { [weak self] in
+                guard let entry = try? await history.entry(id: historyID) else { return }
+                await MainActor.run { [weak self] in
+                    guard let self,
+                          self.currentItemByStation[stationID]?.historyID == historyID else { return }
+                    self.provenanceByStation[stationID] = (
+                        entry.youtubeID.map { "https://www.youtube.com/watch?v=\($0)" },
+                        entry.sourceShowURL?.absoluteString
+                    )
+                    self.pushSSE()
+                }
+            }
+        }
+        #endif
+    }
+
+    /// The encode loop's prefetch resolved — publish it as the certain
+    /// next track. Only meaningful while its station still broadcasts.
+    fileprivate func updateUpcoming(_ item: TrackSourceItem, stationID: Station.ID) {
+        guard pipelines[stationID] != nil else { return }
+        upcomingByStation[stationID] = item
         pushSSE()
     }
 
@@ -795,6 +870,10 @@ public final class RadioBroadcaster: ObservableObject {
             await self?.performLikeAsync(stationID: stationID, token: token)
                 ?? (500, Data("{\"status\":\"error\",\"message\":\"no broadcaster\"}".utf8))
         }
+        let retroLikeHandler: @Sendable (UUID, String, String?) async -> (Int, Data) = { [weak self] stationID, entryID, token in
+            await self?.performRetroLikeAsync(stationID: stationID, entryID: entryID, token: token)
+                ?? (500, Data("{\"status\":\"error\",\"message\":\"no broadcaster\"}".utf8))
+        }
         let skipHandler: @Sendable (UUID, String?) async -> (Int, Data) = { [weak self] stationID, token in
             // 👎 from a listener — mark the current track skipped and nudge
             // the encode loop. `performSkipAsync` is the main-actor bridge.
@@ -859,7 +938,11 @@ public final class RadioBroadcaster: ObservableObject {
                     return
                 }
 
-                let (status, payload) = await likeHandler(stationID, req.token)
+                let (status, payload) = if let entry = req.entry {
+                    await retroLikeHandler(stationID, entry, req.token)
+                } else {
+                    await likeHandler(stationID, req.token)
+                }
                 var headers = Self.corsHeaders()
                 headers["Content-Type"] = "application/json"
                 _ = await Self.send(
@@ -1340,6 +1423,10 @@ public final class RadioBroadcaster: ObservableObject {
         /// public surface is listen-only. Optional so old clients decode;
         /// they just get 403 now.
         let token: String?
+        /// Retro-♥: an `entryID` from the station's `recent` list saves
+        /// that just-played track instead of the current one — "the one
+        /// that got away, two tracks back". nil = like the current track.
+        let entry: String?
     }
 
     /// JSON body emitted by `POST /like` (and surfaced from
@@ -1561,6 +1648,89 @@ public final class RadioBroadcaster: ObservableObject {
         logger.info("⏭ next requested for \(stationID.uuidString.prefix(8), privacy: .public)")
     }
 
+    /// Retro-♥ — save a track from the recent ring instead of the current
+    /// one. Owned tracks (no historyID) get the affinity treatment; cached
+    /// tracks get the normal copy, unless the transient cache's LRU cap
+    /// already evicted the file — then 410, honestly gone.
+    func performRetroLikeAsync(stationID: UUID, entryID: String, token: String?) async -> (Int, Data) {
+        guard preferences.isOwner(token: token) else { return Self.guestRejection() }
+        guard let uuid = UUID(uuidString: entryID),
+              let rec = (recentByStation[stationID] ?? []).first(where: { $0.entryID == uuid }) else {
+            return (404, Self.encodeLikeResponse(LikeResponse(
+                status: "error", path: nil, message: "not in recent history"
+            )))
+        }
+        guard let history else {
+            return (500, Self.encodeLikeResponse(LikeResponse(
+                status: "error", path: nil, message: "history unavailable"
+            )))
+        }
+        let item = rec.item
+
+        // Owned/playlist track — record affinity, nothing to copy.
+        guard let historyID = item.historyID else {
+            guard let artist = item.artist,
+                  !artist.trimmingCharacters(in: .whitespaces).isEmpty else {
+                return (422, Self.encodeLikeResponse(LikeResponse(
+                    status: "error", path: nil, message: "track has no artist metadata"
+                )))
+            }
+            do {
+                let id = try await history.record(
+                    station: stationID,
+                    artist: artist,
+                    title: item.title ?? "Unknown",
+                    cachedPath: item.url.path
+                )
+                try await history.markSaved(id: id, cachedPath: item.url.path)
+                return (200, Self.encodeLikeResponse(LikeResponse(
+                    status: "noted", path: item.url.path, message: nil
+                )))
+            } catch {
+                return (500, Self.encodeLikeResponse(LikeResponse(
+                    status: "error", path: nil, message: "could not record"
+                )))
+            }
+        }
+
+        // Generative track — the cached file may have been LRU-evicted
+        // since it played.
+        guard let musicFolder = libraryConfig?.musicFolder else {
+            return (500, Self.encodeLikeResponse(LikeResponse(
+                status: "error", path: nil, message: "music folder not set"
+            )))
+        }
+        guard FileManager.default.fileExists(atPath: item.url.path) else {
+            return (410, Self.encodeLikeResponse(LikeResponse(
+                status: "error", path: nil, message: "no longer cached"
+            )))
+        }
+        let stationName = pipelines[stationID]?.stationName ?? "Radio"
+        let cachedURL = item.url
+        let artist = item.artist ?? "Unknown"
+        let title = item.title ?? "Unknown"
+        do {
+            let destinationPath = try await Task.detached(priority: .userInitiated) {
+                try Self.saveCached(
+                    cachedURL: cachedURL,
+                    artist: artist,
+                    title: title,
+                    stationName: stationName,
+                    musicFolder: musicFolder
+                )
+            }.value
+            try await history.markSaved(id: historyID, cachedPath: destinationPath)
+            logger.info("♥ retro-saved \(artist, privacy: .public) — \(title, privacy: .public)")
+            return (200, Self.encodeLikeResponse(LikeResponse(
+                status: "saved", path: destinationPath, message: nil
+            )))
+        } catch {
+            return (500, Self.encodeLikeResponse(LikeResponse(
+                status: "error", path: nil, message: "save failed"
+            )))
+        }
+    }
+
     /// Public in-app entry point for the Mac UI's ♥ button. Thin async
     /// wrapper over ``performLikeAsync(stationID:token:)`` that hands back
     /// the decoded response so callers can render state directly. The Mac
@@ -1662,6 +1832,11 @@ public final class RadioBroadcaster: ObservableObject {
         (500, Data("{\"status\":\"error\",\"message\":\"unavailable\"}".utf8))
     }
 
+    /// iOS stub — same rationale as the other action stubs.
+    func performRetroLikeAsync(stationID: UUID, entryID: String, token: String?) async -> (Int, Data) {
+        (500, Data("{\"status\":\"error\",\"message\":\"unavailable\"}".utf8))
+    }
+
     @discardableResult
     public func likeCurrent(stationID: Station.ID) async -> LikeResponse {
         LikeResponse(status: "error", path: nil, message: "unavailable")
@@ -1683,11 +1858,27 @@ public final class RadioBroadcaster: ObservableObject {
             let streamURL: String?
             let listeners: Int
             let currentTrack: NowTrack?
+            let recent: [RecentPayload]
+            let nextTrack: NextPayload?
         }
         struct NowTrack: Encodable {
             let title: String
             let artist: String
             let album: String
+            let youtubeURL: String?
+            let sourceURL: String?
+        }
+        struct RecentPayload: Encodable {
+            let entryID: String
+            let title: String
+            let artist: String
+            let playedAt: Double
+            let youtubeURL: String?
+            let sourceURL: String?
+        }
+        struct NextPayload: Encodable {
+            let title: String
+            let artist: String
         }
         struct NowResponse: Encodable {
             let stations: [NowStation]
@@ -1697,12 +1888,14 @@ public final class RadioBroadcaster: ObservableObject {
         // polls. Dictionary iteration isn't deterministic in Swift.
         let ordered = pipelines.values.sorted { $0.station.name < $1.station.name }
         let stations: [NowStation] = ordered.map { pipeline in
-            let item = currentItemByStation[pipeline.station.id]
-            let listeners = listenerCount[pipeline.station.id] ?? 0
+            let stationID = pipeline.station.id
+            let item = currentItemByStation[stationID]
+            let listeners = listenerCount[stationID] ?? 0
+            let prov = provenanceByStation[stationID]
             // `NowTrack.album` kept for UI backwards compat, but TrackSource
             // items don't carry album metadata — empty string is fine.
             return NowStation(
-                id: pipeline.station.id.uuidString,
+                id: stationID.uuidString,
                 name: pipeline.station.name,
                 slug: pipeline.station.slug,
                 broadcasting: true,
@@ -1712,8 +1905,23 @@ public final class RadioBroadcaster: ObservableObject {
                     NowTrack(
                         title: $0.title ?? "",
                         artist: $0.artist ?? "",
-                        album: ""
+                        album: "",
+                        youtubeURL: prov?.youtube,
+                        sourceURL: prov?.source
                     )
+                },
+                recent: (recentByStation[stationID] ?? []).map {
+                    RecentPayload(
+                        entryID: $0.entryID.uuidString,
+                        title: $0.item.title ?? "",
+                        artist: $0.item.artist ?? "",
+                        playedAt: $0.playedAt.timeIntervalSince1970,
+                        youtubeURL: $0.youtubeURL,
+                        sourceURL: $0.sourceURL
+                    )
+                },
+                nextTrack: upcomingByStation[stationID].map {
+                    NextPayload(title: $0.title ?? "", artist: $0.artist ?? "")
                 }
             )
         }
@@ -2001,6 +2209,19 @@ public final class RadioBroadcaster: ObservableObject {
             // bounds us to at most one track prefetched while nobody's
             // tuned in, preserving the data-conscious idle.
             prefetch = Task { try await source.nextURL() }
+            // Publish the resolved next track for /now.json — Task.value
+            // is multi-awaitable, so this observer doesn't consume the
+            // result the loop itself will take at the boundary.
+            if let owner, let watchedPrefetch = prefetch {
+                Task { [weak owner] in
+                    // `try?` flattens the Task's `TrackSourceItem?` success
+                    // value with its own optionality (SE-0230) — one bind.
+                    guard let upcoming = try? await watchedPrefetch.value else { return }
+                    await MainActor.run { [weak owner] in
+                        owner?.updateUpcoming(upcoming, stationID: stationID)
+                    }
+                }
+            }
 
             var playedThrough = false
             while !Task.isCancelled {

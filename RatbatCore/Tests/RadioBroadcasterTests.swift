@@ -257,6 +257,81 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertTrue(response.contains("history unavailable"), "Expected message: \(response)")
     }
 
+    // MARK: - Timeline (recent ring + upcoming + retro-♥)
+
+    /// Advancing a station must retire the outgoing track into the recent
+    /// ring, publish the prefetched next track, and let a retro-♥ save a
+    /// ring entry — the "track two songs ago" flow, end to end.
+    @MainActor
+    func testTimelineRingUpcomingAndRetroLike() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        guard tracks.count >= 2 else { throw XCTSkip("Need 2+ fixtures") }
+        let tempDB = FileManager.default.temporaryDirectory
+            .appendingPathComponent("timeline-\(UUID().uuidString).sqlite")
+        let store = try await HistoryStore(databaseURL: tempDB)
+        let prefs = BroadcastPreferences()
+        prefs.port = 18_043
+        defer { prefs.port = 18_000 }
+        let radio = RadioBroadcaster(preferences: prefs, history: store)
+        let station = Station(name: "Timeline Test", kind: .playlist(queue: tracks))
+        await radio.startBroadcast(station: station)
+        defer { radio.stopAll() }
+
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+        let firstTitle = radio.currentItemByStation[station.id]?.title
+
+        // The prefetched next track should surface once resolved —
+        // playlist sources resolve instantly.
+        XCTAssertNotNil(radio.upcomingByStation[station.id], "prefetched next should publish")
+
+        // A parked encode loop won't advance without an audience — the
+        // data-conscious idle holds after track one, so the ring would
+        // stay empty forever. Attach a real stream listener.
+        let streamPath = "/stream/\(station.slug).aac"
+        let listener = Task {
+            _ = try? await Self.fetchStream(
+                port: 18_043, path: streamPath, maxBytes: 4_000_000
+            )
+        }
+        defer { listener.cancel() }
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+
+        radio.nextTrack(stationID: station.id)
+        // Skip lands on the next loop iteration; the idle gate polls
+        // every 5s before the next track opens — budget generously.
+        try await Task.sleep(nanoseconds: 8_000_000_000)
+
+        let ring = radio.recentByStation[station.id] ?? []
+        guard let retired = ring.first else {
+            XCTFail("one advance → one retired track; ring is empty")
+            return
+        }
+        XCTAssertEqual(retired.item.title, firstTitle, "ring holds the outgoing track")
+
+        // Retro-♥ the retired track. Playlist items carry no historyID →
+        // the affinity path answers "noted" and writes a saved row.
+        let entryID = retired.entryID.uuidString
+        let (status, body) = await radio.performRetroLikeAsync(
+            stationID: station.id, entryID: entryID, token: prefs.ownerToken
+        )
+        XCTAssertEqual(status, 200, String(data: body, encoding: .utf8) ?? "")
+        XCTAssertTrue(String(data: body, encoding: .utf8)!.contains("noted"))
+        let saved = try await store.savedEntries(forStation: station.id, limit: 10)
+        XCTAssertEqual(saved.count, 1)
+
+        // Unknown entry → 404, and guests → 403 regardless.
+        let (missStatus, _) = await radio.performRetroLikeAsync(
+            stationID: station.id, entryID: UUID().uuidString, token: prefs.ownerToken
+        )
+        XCTAssertEqual(missStatus, 404)
+        let (guestStatus, _) = await radio.performRetroLikeAsync(
+            stationID: station.id, entryID: entryID, token: "wrong"
+        )
+        XCTAssertEqual(guestStatus, 403)
+    }
+
     // MARK: - Owner key
 
     /// Without a valid owner token every action endpoint answers 403 —

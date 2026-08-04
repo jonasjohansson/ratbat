@@ -257,6 +257,23 @@ public actor HistoryStore {
         return collectRows(stmt)
     }
 
+    /// Single entry by rowid — the broadcaster resolves a playing track's
+    /// provenance (YouTube id, source show/release URL) from its history
+    /// row once per track change, for /now.json.
+    public func entry(id: Int64) throws -> Entry? {
+        let sql = """
+            SELECT id, station_id, artist, title, played_at,
+                   source_show_url, youtube_id, saved, cached_path
+            FROM history
+            WHERE id = ?
+            LIMIT 1;
+            """
+        let stmt = try prepare(sql)
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, id)
+        return collectRows(stmt).first
+    }
+
     // MARK: - v2: skip / play-count API (taste intelligence)
 
     /// Mark an entry as explicitly skipped. The station-scoped blacklist
