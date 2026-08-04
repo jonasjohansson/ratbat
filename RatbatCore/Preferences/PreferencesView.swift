@@ -75,6 +75,24 @@ public struct PreferencesView: View {
                 }
                 Toggle("Include track info (ICY metadata)", isOn: $preferences.icyMetadataEnabled)
             }
+            Section("Owner Key") {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        Text(preferences.ownerToken)
+                            .font(.caption.monospaced())
+                            .textSelection(.enabled)
+                            .lineLimit(1)
+                        Button("Copy") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(preferences.ownerToken, forType: .string)
+                        }
+                    }
+                    Text("♥ / skip / next on the web player require this key — open ratbat.jonasjohansson.se#key=<key> once per device to unlock. Without it, listeners get a radio, not a mixer.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
             Section("Auto-start") {
                 if preferences.autoStartSlugs.isEmpty {
                     Text("No stations auto-start. Right-click a station in the sidebar → “Auto-start on Launch”.")

@@ -788,24 +788,24 @@ public final class RadioBroadcaster: ObservableObject {
                 self?.buildNowPayload() ?? Data("{\"stations\":[]}".utf8)
             }
         }
-        let likeHandler: @Sendable (UUID) async -> (Int, Data) = { [weak self] stationID in
+        let likeHandler: @Sendable (UUID, String?) async -> (Int, Data) = { [weak self] stationID, token in
             // Hop to the main actor to resolve the pipeline snapshot,
             // then do the copy + history mark off-main without pinning
             // the UI thread. `performLikeAsync` is the async bridge.
-            await self?.performLikeAsync(stationID: stationID)
+            await self?.performLikeAsync(stationID: stationID, token: token)
                 ?? (500, Data("{\"status\":\"error\",\"message\":\"no broadcaster\"}".utf8))
         }
-        let skipHandler: @Sendable (UUID) async -> (Int, Data) = { [weak self] stationID in
+        let skipHandler: @Sendable (UUID, String?) async -> (Int, Data) = { [weak self] stationID, token in
             // 👎 from a listener — mark the current track skipped and nudge
             // the encode loop. `performSkipAsync` is the main-actor bridge.
-            await self?.performSkipAsync(stationID: stationID)
+            await self?.performSkipAsync(stationID: stationID, token: token)
                 ?? (500, Data("{\"status\":\"error\",\"message\":\"no broadcaster\"}".utf8))
         }
-        let nextHandler: @Sendable (UUID) async -> (Int, Data) = { [weak self] stationID in
+        let nextHandler: @Sendable (UUID, String?) async -> (Int, Data) = { [weak self] stationID, token in
             // ⏭ — advance without judging. No taste signal, no history
             // mark; "not right now" mustn't poison the profile the way
             // 👎 deliberately does.
-            await self?.performNextAsync(stationID: stationID)
+            await self?.performNextAsync(stationID: stationID, token: token)
                 ?? (500, Data("{\"status\":\"error\",\"message\":\"no broadcaster\"}".utf8))
         }
 
@@ -859,7 +859,7 @@ public final class RadioBroadcaster: ObservableObject {
                     return
                 }
 
-                let (status, payload) = await likeHandler(stationID)
+                let (status, payload) = await likeHandler(stationID, req.token)
                 var headers = Self.corsHeaders()
                 headers["Content-Type"] = "application/json"
                 _ = await Self.send(
@@ -896,7 +896,7 @@ public final class RadioBroadcaster: ObservableObject {
                     return
                 }
 
-                let (status, payload) = await skipHandler(stationID)
+                let (status, payload) = await skipHandler(stationID, req.token)
                 var headers = Self.corsHeaders()
                 headers["Content-Type"] = "application/json"
                 _ = await Self.send(
@@ -932,7 +932,7 @@ public final class RadioBroadcaster: ObservableObject {
                     return
                 }
 
-                let (status, payload) = await nextHandler(stationID)
+                let (status, payload) = await nextHandler(stationID, req.token)
                 var headers = Self.corsHeaders()
                 headers["Content-Type"] = "application/json"
                 _ = await Self.send(
@@ -1336,6 +1336,10 @@ public final class RadioBroadcaster: ObservableObject {
     /// since no caller outside this file assembles one manually.
     struct LikeRequest: Decodable {
         let station: String
+        /// Owner token — actions are owner-only; without a valid token the
+        /// public surface is listen-only. Optional so old clients decode;
+        /// they just get 403 now.
+        let token: String?
     }
 
     /// JSON body emitted by `POST /like` (and surfaced from
@@ -1440,7 +1444,14 @@ public final class RadioBroadcaster: ObservableObject {
     ///    profile too. Wire status: "noted".
     /// 3. Otherwise: file copy + `history.markSaved` off the main actor.
     ///    Wire status: "saved".
-    func performLikeAsync(stationID: UUID) async -> (Int, Data) {
+    /// Rejection payload for guest requests. 403, not 401: there is no
+    /// login to attempt — the public surface is listen-only by design.
+    private static func guestRejection() -> (Int, Data) {
+        (403, Data("{\"status\":\"error\",\"message\":\"listener mode\"}".utf8))
+    }
+
+    func performLikeAsync(stationID: UUID, token: String?) async -> (Int, Data) {
+        guard preferences.isOwner(token: token) else { return Self.guestRejection() }
         let snapshot: LikeSnapshot
         switch likePreflight(stationID: stationID) {
         case .early(let status, let data):
@@ -1514,7 +1525,8 @@ public final class RadioBroadcaster: ObservableObject {
     /// status. 404 when nothing's skippable (no pipeline / no current item /
     /// playlist track with no historyID), 200 on success — mirroring the
     /// shape `/like` returns.
-    func performSkipAsync(stationID: UUID) async -> (Int, Data) {
+    func performSkipAsync(stationID: UUID, token: String?) async -> (Int, Data) {
+        guard preferences.isOwner(token: token) else { return Self.guestRejection() }
         guard pipelines[stationID] != nil,
               let item = currentItemByStation[stationID],
               item.historyID != nil else {
@@ -1529,7 +1541,8 @@ public final class RadioBroadcaster: ObservableObject {
     /// now" applies to playlist-backed stations too (their tracks carry
     /// no history row, which is exactly why 👎 refuses them — a neutral
     /// advance records nothing, so it has nothing to refuse).
-    func performNextAsync(stationID: UUID) async -> (Int, Data) {
+    func performNextAsync(stationID: UUID, token: String?) async -> (Int, Data) {
+        guard preferences.isOwner(token: token) else { return Self.guestRejection() }
         guard pipelines[stationID] != nil,
               currentItemByStation[stationID] != nil else {
             return (404, Data("{\"status\":\"error\",\"message\":\"no current track\"}".utf8))
@@ -1549,11 +1562,12 @@ public final class RadioBroadcaster: ObservableObject {
     }
 
     /// Public in-app entry point for the Mac UI's ♥ button. Thin async
-    /// wrapper over ``performLikeAsync(stationID:)`` that hands back the
-    /// decoded response so callers can render state directly.
+    /// wrapper over ``performLikeAsync(stationID:token:)`` that hands back
+    /// the decoded response so callers can render state directly. The Mac
+    /// UI is the owner by definition, so it self-authorizes.
     @discardableResult
     public func likeCurrent(stationID: Station.ID) async -> LikeResponse {
-        let (_, data) = await performLikeAsync(stationID: stationID)
+        let (_, data) = await performLikeAsync(stationID: stationID, token: preferences.ownerToken)
         if let decoded = try? JSONDecoder().decode(LikeResponse.self, from: data) {
             return decoded
         }
@@ -1632,19 +1646,19 @@ public final class RadioBroadcaster: ObservableObject {
     /// iOS stub — broadcaster isn't wired for NTS / library on iOS, so a
     /// like always reports "unavailable". Kept so cross-platform code
     /// compiles without `#if` at every call site.
-    func performLikeAsync(stationID: UUID) async -> (Int, Data) {
+    func performLikeAsync(stationID: UUID, token: String?) async -> (Int, Data) {
         let payload = Data("{\"message\":\"unavailable\",\"path\":null,\"status\":\"error\"}".utf8)
         return (500, payload)
     }
 
     /// iOS stub — skip needs the macOS encode pipeline, so report
     /// unavailable. Kept so cross-platform call sites compile without `#if`.
-    func performSkipAsync(stationID: UUID) async -> (Int, Data) {
+    func performSkipAsync(stationID: UUID, token: String?) async -> (Int, Data) {
         (500, Data("{\"status\":\"error\",\"message\":\"unavailable\"}".utf8))
     }
 
     /// iOS stub — same rationale as ``performSkipAsync(stationID:)``.
-    func performNextAsync(stationID: UUID) async -> (Int, Data) {
+    func performNextAsync(stationID: UUID, token: String?) async -> (Int, Data) {
         (500, Data("{\"status\":\"error\",\"message\":\"unavailable\"}".utf8))
     }
 
