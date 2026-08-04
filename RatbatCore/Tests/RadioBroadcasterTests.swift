@@ -155,6 +155,94 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertTrue(lower.contains("access-control-allow-methods: post, options"), "Missing allow-methods: \(response)")
     }
 
+    /// Next bridge bails 404 with no pipeline — same "nothing to act on"
+    /// path as like and skip.
+    @MainActor
+    func testNextOnIdleStationReturns404() async throws {
+        let radio = RadioBroadcaster(port: 18_039)
+        defer { radio.stopAll() }
+        let (status, _) = await radio.performNextAsync(stationID: UUID())
+        XCTAssertEqual(status, 404)
+    }
+
+    /// The point of /next vs /skip: playlist tracks carry no historyID,
+    /// so 👎 refuses them (404) — but a neutral advance records nothing
+    /// and must succeed.
+    @MainActor
+    func testNextOnPlaylistStationReturns200WhereSkipRefuses() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let radio = RadioBroadcaster(port: 18_036)
+        let station = Station(name: "Next Test", kind: .playlist(queue: tracks))
+        await radio.startBroadcast(station: station)
+        defer { radio.stopAll() }
+
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+
+        let (skipStatus, _) = await radio.performSkipAsync(stationID: station.id)
+        XCTAssertEqual(skipStatus, 404, "👎 must refuse history-less playlist tracks")
+
+        let (nextStatus, body) = await radio.performNextAsync(stationID: station.id)
+        XCTAssertEqual(nextStatus, 200, "⏭ must advance them: \(String(data: body, encoding: .utf8) ?? "")")
+    }
+
+    /// End-to-end over a real TCP socket, body coalesced into the same
+    /// send as the headers — the exact shape every browser produces and
+    /// the one that used to park the server forever. This is the
+    /// integration test whose absence let that bug ship green.
+    @MainActor
+    func testPostNextOverSocketWithCoalescedBody() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let port: UInt16 = 18_037
+        let radio = RadioBroadcaster(port: port)
+        let station = Station(name: "Socket Next", kind: .playlist(queue: tracks))
+        await radio.startBroadcast(station: station)
+        defer { radio.stopAll() }
+
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+
+        let response = try await Self.fetchRawResponse(
+            port: port,
+            path: "/next",
+            requestHeaders: ["Content-Type: application/json"],
+            maxBytes: 1_024,
+            method: "POST",
+            body: "{\"station\":\"\(station.id.uuidString)\"}"
+        )
+        XCTAssertTrue(response.contains("HTTP/1.1 200"), "Expected 200: \(response)")
+        XCTAssertTrue(response.contains("\"status\":\"next\""), "Expected next status: \(response)")
+    }
+
+    /// Same socket-level coalesced shape against /like — the playlist
+    /// station must answer 409 (not hang, not 400).
+    @MainActor
+    func testPostLikeOverSocketWithCoalescedBody() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let port: UInt16 = 18_038
+        let radio = RadioBroadcaster(port: port)
+        let station = Station(name: "Socket Like", kind: .playlist(queue: tracks))
+        await radio.startBroadcast(station: station)
+        defer { radio.stopAll() }
+
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+
+        let response = try await Self.fetchRawResponse(
+            port: port,
+            path: "/like",
+            requestHeaders: ["Content-Type: application/json"],
+            maxBytes: 1_024,
+            method: "POST",
+            body: "{\"station\":\"\(station.id.uuidString)\"}"
+        )
+        XCTAssertTrue(response.contains("HTTP/1.1 409"), "Expected 409: \(response)")
+        XCTAssertTrue(response.contains("track already in library"), "Expected message: \(response)")
+    }
+
     /// SSE framing: a payload becomes a single `data:` line terminated by
     /// a blank line, with the JSON bytes passed through verbatim.
     func testSSEEventFraming() {
@@ -575,8 +663,12 @@ final class RadioBroadcasterTests: XCTestCase {
     ) async throws -> (Data, URLResponse) {
         let url = URL(string: "http://127.0.0.1:\(port)\(path)")!
         let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 5
-        config.timeoutIntervalForResource = 5
+        // 15s, not 5: the suite now runs several real encoder pipelines
+        // before this test, and first-byte latency under that load blew a
+        // 5s budget intermittently. This test asserts the bytes are AAC,
+        // not how fast they arrive.
+        config.timeoutIntervalForRequest = 15
+        config.timeoutIntervalForResource = 15
         let session = URLSession(configuration: config)
         let (bytes, response) = try await session.bytes(from: url)
 
@@ -603,7 +695,8 @@ final class RadioBroadcasterTests: XCTestCase {
         path: String,
         requestHeaders: [String],
         maxBytes: Int = 2_048,
-        method: String = "GET"
+        method: String = "GET",
+        body: String? = nil
     ) async throws -> String {
         let connection = NWConnection(
             host: NWEndpoint.Host("127.0.0.1"),
@@ -630,7 +723,14 @@ final class RadioBroadcasterTests: XCTestCase {
 
         var request = "\(method) \(path) HTTP/1.1\r\nHost: 127.0.0.1\r\n"
         for header in requestHeaders { request += "\(header)\r\n" }
+        if let body {
+            request += "Content-Length: \(body.utf8.count)\r\n"
+        }
         request += "\r\n"
+        // Body rides in the SAME send as the headers — the coalesced
+        // segment shape every browser produces, and the one that used to
+        // hang the server (see the coalesced-POST regression suite).
+        if let body { request += body }
 
         let sendLatch = OnceLatch()
         let sent: Bool = await withCheckedContinuation { cont in

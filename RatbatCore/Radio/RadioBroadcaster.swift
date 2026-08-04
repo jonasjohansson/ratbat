@@ -801,6 +801,13 @@ public final class RadioBroadcaster: ObservableObject {
             await self?.performSkipAsync(stationID: stationID)
                 ?? (500, Data("{\"status\":\"error\",\"message\":\"no broadcaster\"}".utf8))
         }
+        let nextHandler: @Sendable (UUID) async -> (Int, Data) = { [weak self] stationID in
+            // ⏭ — advance without judging. No taste signal, no history
+            // mark; "not right now" mustn't poison the profile the way
+            // 👎 deliberately does.
+            await self?.performNextAsync(stationID: stationID)
+                ?? (500, Data("{\"status\":\"error\",\"message\":\"no broadcaster\"}".utf8))
+        }
 
         let task = Task.detached { [weak self] in
             // Read headers to learn both the request path and whether the
@@ -811,9 +818,9 @@ public final class RadioBroadcaster: ObservableObject {
             let method = Self.requestMethod(from: headerBytes) ?? "GET"
             let wantsMetadata = Self.headerRequestsICYMetadata(headerBytes)
 
-            // CORS preflight for /like and /skip — browsers send OPTIONS
+            // CORS preflight for the action POSTs — browsers send OPTIONS
             // before the real POST because we use Content-Type: application/json.
-            if method == "OPTIONS" && (path == "/like" || path == "/skip") {
+            if method == "OPTIONS" && (path == "/like" || path == "/skip" || path == "/next") {
                 _ = await Self.send(
                     data: Self.buildHTTPResponse(
                         status: 204,
@@ -890,6 +897,42 @@ public final class RadioBroadcaster: ObservableObject {
                 }
 
                 let (status, payload) = await skipHandler(stationID)
+                var headers = Self.corsHeaders()
+                headers["Content-Type"] = "application/json"
+                _ = await Self.send(
+                    data: Self.buildHTTPResponse(status: status, headers: headers, body: payload),
+                    on: connection
+                )
+                connection.cancel()
+                return
+            }
+
+            // ⏭ next — advance the station without recording any taste
+            // signal. Same request shape and CORS handling as /like.
+            if method == "POST" && path == "/next" {
+                let contentLength = Self.contentLength(from: headerBytes) ?? 0
+                let body = await Self.readBody(
+                    connection: connection,
+                    alreadyRead: Self.bodyBytes(after: headerBytes),
+                    expected: contentLength
+                )
+                guard let req = try? JSONDecoder().decode(LikeRequest.self, from: body),
+                      let stationID = UUID(uuidString: req.station) else {
+                    var headers = Self.corsHeaders()
+                    headers["Content-Type"] = "application/json"
+                    _ = await Self.send(
+                        data: Self.buildHTTPResponse(
+                            status: 400,
+                            headers: headers,
+                            body: Data("{\"status\":\"error\",\"message\":\"bad request\"}".utf8)
+                        ),
+                        on: connection
+                    )
+                    connection.cancel()
+                    return
+                }
+
+                let (status, payload) = await nextHandler(stationID)
                 var headers = Self.corsHeaders()
                 headers["Content-Type"] = "application/json"
                 _ = await Self.send(
@@ -1425,6 +1468,30 @@ public final class RadioBroadcaster: ObservableObject {
         return (200, Data("{\"status\":\"skipped\"}".utf8))
     }
 
+    /// Async bridge for `POST /next` — advance without judging. Unlike
+    /// `performSkipAsync` there's no `historyID` requirement: "not right
+    /// now" applies to playlist-backed stations too (their tracks carry
+    /// no history row, which is exactly why 👎 refuses them — a neutral
+    /// advance records nothing, so it has nothing to refuse).
+    func performNextAsync(stationID: UUID) async -> (Int, Data) {
+        guard pipelines[stationID] != nil,
+              currentItemByStation[stationID] != nil else {
+            return (404, Data("{\"status\":\"error\",\"message\":\"no current track\"}".utf8))
+        }
+        nextTrack(stationID: stationID)
+        return (200, Data("{\"status\":\"next\"}".utf8))
+    }
+
+    /// Advance to the next track with no taste signal recorded — the
+    /// listener-neutral counterpart of ``skipCurrent(stationID:)``. Same
+    /// encode-loop nudge, none of the history/blacklist side effects.
+    public func nextTrack(stationID: Station.ID) {
+        guard pipelines[stationID] != nil,
+              currentItemByStation[stationID] != nil else { return }
+        pipelines[stationID]?.skipRequested = true
+        logger.info("⏭ next requested for \(stationID.uuidString.prefix(8), privacy: .public)")
+    }
+
     /// Public in-app entry point for the Mac UI's ♥ button. Thin async
     /// wrapper over ``performLikeAsync(stationID:)`` that hands back the
     /// decoded response so callers can render state directly.
@@ -1517,6 +1584,11 @@ public final class RadioBroadcaster: ObservableObject {
     /// iOS stub — skip needs the macOS encode pipeline, so report
     /// unavailable. Kept so cross-platform call sites compile without `#if`.
     func performSkipAsync(stationID: UUID) async -> (Int, Data) {
+        (500, Data("{\"status\":\"error\",\"message\":\"unavailable\"}".utf8))
+    }
+
+    /// iOS stub — same rationale as ``performSkipAsync(stationID:)``.
+    func performNextAsync(stationID: UUID) async -> (Int, Data) {
         (500, Data("{\"status\":\"error\",\"message\":\"unavailable\"}".utf8))
     }
 
