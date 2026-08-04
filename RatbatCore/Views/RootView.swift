@@ -152,17 +152,23 @@ public struct RootView: View {
                             let snapshot = await tasteProfile.currentSnapshot()
                             try? TasteProfileStore.save(snapshot, to: snapshotURL)
                         }
-                        // Auto-start flagged stations now that the station
-                        // list is loaded and the first library index is
-                        // done (generative stations don't need the index,
-                        // but playlist stations shouldn't race a cloud
-                        // mount that's still hydrating after a reboot).
-                        // Runs once per launch; `startBroadcast` is
-                        // additionally a no-op for anything already live.
+                        // Resume broadcasting now that the station list is
+                        // loaded and the first library index is done
+                        // (generative stations don't need the index, but
+                        // playlist stations shouldn't race a cloud mount
+                        // that's still hydrating after a reboot). Two
+                        // sources of truth, unioned: the auto-start flags
+                        // (always-on intent) and whatever was live when the
+                        // app last ran (restart resilience — a deploy or
+                        // crash mustn't silently drop a hand-started
+                        // station). Runs once per launch; `startBroadcast`
+                        // is additionally a no-op for anything already live.
                         if !didAutoStart {
                             didAutoStart = true
+                            let resume = Set(preferences.autoStartSlugs)
+                                .union(preferences.lastLiveSlugs)
                             for station in stations.stations
-                            where preferences.autoStartSlugs.contains(station.slug) {
+                            where resume.contains(station.slug) {
                                 await radio.startBroadcast(station: station)
                             }
                         }

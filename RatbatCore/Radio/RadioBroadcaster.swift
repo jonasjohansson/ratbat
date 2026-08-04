@@ -568,6 +568,9 @@ public final class RadioBroadcaster: ObservableObject {
         pipelines[station.id] = pipeline
         broadcasting.insert(station.id)
         listenerCount[station.id] = 0
+        // Restart resilience: remember what's live so the next launch can
+        // resume where it was, not just what's auto-start-flagged.
+        preferences.rememberLive(slug: station.slug)
 
         let buffer = pipeline.buffer
         let stationID = station.id
@@ -623,7 +626,18 @@ public final class RadioBroadcaster: ObservableObject {
     /// disconnects clients bound to it, and drops the pipeline. If it was
     /// the last live station, the shared listener and tunnel come down too.
     public func stopBroadcast(stationID: Station.ID) {
+        stopBroadcast(stationID: stationID, forgetLive: true)
+    }
+
+    /// `forgetLive: false` is the shutdown path — ``stopAll()`` tears
+    /// pipelines down without erasing the "was live" record, so the next
+    /// launch resumes them. A user stopping ONE station is intent; an app
+    /// stopping ALL of them is lifecycle.
+    private func stopBroadcast(stationID: Station.ID, forgetLive: Bool) {
         guard let pipeline = pipelines[stationID] else { return }
+        if forgetLive {
+            preferences.forgetLive(slug: pipeline.station.slug)
+        }
 
         pipeline.encodeTask?.cancel()
         pipelines.removeValue(forKey: stationID)
@@ -651,9 +665,11 @@ public final class RadioBroadcaster: ObservableObject {
     }
 
     /// Stop every running broadcast and tear the listener down. Idempotent.
+    /// Keeps the last-live record intact — this is the shutdown/restart-all
+    /// gesture, and the next launch should resume what was playing.
     public func stopAll() {
         for id in Array(pipelines.keys) {
-            stopBroadcast(stationID: id)
+            stopBroadcast(stationID: id, forgetLive: false)
         }
         // A full stop resets the "needs restart" banner — the next start
         // will pick up current preferences as its fresh baseline.

@@ -338,6 +338,41 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertEqual(guestStatus, 403)
     }
 
+    // MARK: - Resume last-live
+
+    /// The broadcaster maintains the last-live record: starting remembers
+    /// the slug, a deliberate single stop forgets it, and stopAll (the
+    /// shutdown path) leaves it intact so the next launch resumes.
+    @MainActor
+    func testLastLiveRememberedForgottenAndSurvivesStopAll() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let prefs = BroadcastPreferences()
+        prefs.port = 18_045
+        defer {
+            prefs.port = 18_000
+            prefs.lastLiveSlugs = []
+        }
+        prefs.lastLiveSlugs = []
+        let radio = RadioBroadcaster(preferences: prefs)
+        let station = Station(name: "Resume Test", kind: .playlist(queue: tracks))
+
+        await radio.startBroadcast(station: station)
+        XCTAssertEqual(prefs.lastLiveSlugs, [station.slug], "start remembers")
+
+        radio.stopBroadcast(stationID: station.id)
+        XCTAssertEqual(prefs.lastLiveSlugs, [], "deliberate stop forgets")
+
+        await radio.startBroadcast(station: station)
+        XCTAssertEqual(prefs.lastLiveSlugs, [station.slug])
+        radio.stopAll()
+        XCTAssertEqual(
+            prefs.lastLiveSlugs, [station.slug],
+            "stopAll is lifecycle, not intent — the record survives for resume"
+        )
+    }
+
     // MARK: - Boost + un-♥ (keep vs steer)
 
     /// The signal-model arc on an owned track: ♥ records affinity, un-♥

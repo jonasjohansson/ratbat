@@ -166,6 +166,30 @@ public final class BroadcastPreferences: ObservableObject {
         autoStartSlugs = slugs
     }
 
+    /// Slugs of the stations that were live at last observation — the
+    /// broadcaster maintains this on every start/stop so a restart can
+    /// resume where it was. Deliberate stops forget the slug; stopAll
+    /// (the shutdown/restart-all path) and crashes leave it intact.
+    /// Same storage rationale as ``autoStartSlugs``; no revision tick.
+    @AppStorage("ratbat.broadcast.lastLiveSlugs")
+    private var lastLiveSlugsRaw: String = ""
+
+    public var lastLiveSlugs: [String] {
+        get { lastLiveSlugsRaw.split(separator: ",").map(String.init) }
+        set { lastLiveSlugsRaw = newValue.joined(separator: ",") }
+    }
+
+    public func rememberLive(slug: String) {
+        var slugs = lastLiveSlugs
+        guard !slugs.contains(slug) else { return }
+        slugs.append(slug)
+        lastLiveSlugs = slugs
+    }
+
+    public func forgetLive(slug: String) {
+        lastLiveSlugs = lastLiveSlugs.filter { $0 != slug }
+    }
+
     /// Process-wide shared instance. UI surfaces and the broadcaster read
     /// from the same store so changing a value in one place shows up
     /// everywhere without plumbing.
@@ -185,6 +209,7 @@ public final class BroadcastPreferences: ObservableObject {
         defaults.removeObject(forKey: "ratbat.broadcast.icyMetadata")
         defaults.removeObject(forKey: "ratbat.broadcast.autoStartSlugs")
         defaults.removeObject(forKey: "ratbat.broadcast.ownerToken")
+        defaults.removeObject(forKey: "ratbat.broadcast.lastLiveSlugs")
         revision &+= 1
     }
 }
