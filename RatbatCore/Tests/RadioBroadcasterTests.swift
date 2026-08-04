@@ -53,7 +53,7 @@ final class RadioBroadcasterTests: XCTestCase {
     func testLikeOnIdleStationReturns404() async throws {
         let radio = RadioBroadcaster(port: 18_030)
         defer { radio.stopAll() }
-        let (status, _) = await radio.performLikeAsync(stationID: UUID())
+        let (status, _) = await radio.performLikeAsync(stationID: UUID(), token: BroadcastPreferences.shared.ownerToken)
         XCTAssertEqual(status, 404)
     }
 
@@ -82,7 +82,7 @@ final class RadioBroadcasterTests: XCTestCase {
         // 404 "no current track" path.
         try await Task.sleep(nanoseconds: 1_500_000_000)
 
-        let (status, body) = await radio.performLikeAsync(stationID: station.id)
+        let (status, body) = await radio.performLikeAsync(stationID: station.id, token: prefs.ownerToken)
         XCTAssertEqual(status, 200, "Expected 200, got \(status): \(String(data: body, encoding: .utf8) ?? "")")
 
         struct Response: Decodable { let status: String; let path: String? }
@@ -133,7 +133,7 @@ final class RadioBroadcasterTests: XCTestCase {
     func testSkipOnIdleStationReturns404() async throws {
         let radio = RadioBroadcaster(port: 18_033)
         defer { radio.stopAll() }
-        let (status, _) = await radio.performSkipAsync(stationID: UUID())
+        let (status, _) = await radio.performSkipAsync(stationID: UUID(), token: BroadcastPreferences.shared.ownerToken)
         XCTAssertEqual(status, 404)
     }
 
@@ -172,7 +172,7 @@ final class RadioBroadcasterTests: XCTestCase {
     func testNextOnIdleStationReturns404() async throws {
         let radio = RadioBroadcaster(port: 18_039)
         defer { radio.stopAll() }
-        let (status, _) = await radio.performNextAsync(stationID: UUID())
+        let (status, _) = await radio.performNextAsync(stationID: UUID(), token: BroadcastPreferences.shared.ownerToken)
         XCTAssertEqual(status, 404)
     }
 
@@ -191,10 +191,10 @@ final class RadioBroadcasterTests: XCTestCase {
 
         try await Task.sleep(nanoseconds: 1_500_000_000)
 
-        let (skipStatus, _) = await radio.performSkipAsync(stationID: station.id)
+        let (skipStatus, _) = await radio.performSkipAsync(stationID: station.id, token: BroadcastPreferences.shared.ownerToken)
         XCTAssertEqual(skipStatus, 404, "👎 must refuse history-less playlist tracks")
 
-        let (nextStatus, body) = await radio.performNextAsync(stationID: station.id)
+        let (nextStatus, body) = await radio.performNextAsync(stationID: station.id, token: BroadcastPreferences.shared.ownerToken)
         XCTAssertEqual(nextStatus, 200, "⏭ must advance them: \(String(data: body, encoding: .utf8) ?? "")")
     }
 
@@ -221,7 +221,7 @@ final class RadioBroadcasterTests: XCTestCase {
             requestHeaders: ["Content-Type: application/json"],
             maxBytes: 1_024,
             method: "POST",
-            body: "{\"station\":\"\(station.id.uuidString)\"}"
+            body: "{\"station\":\"\(station.id.uuidString)\",\"token\":\"\(BroadcastPreferences.shared.ownerToken)\"}"
         )
         XCTAssertTrue(response.contains("HTTP/1.1 200"), "Expected 200: \(response)")
         XCTAssertTrue(response.contains("\"status\":\"next\""), "Expected next status: \(response)")
@@ -251,10 +251,55 @@ final class RadioBroadcasterTests: XCTestCase {
             requestHeaders: ["Content-Type: application/json"],
             maxBytes: 1_024,
             method: "POST",
-            body: "{\"station\":\"\(station.id.uuidString)\"}"
+            body: "{\"station\":\"\(station.id.uuidString)\",\"token\":\"\(BroadcastPreferences.shared.ownerToken)\"}"
         )
         XCTAssertTrue(response.contains("HTTP/1.1 500"), "Expected 500: \(response)")
         XCTAssertTrue(response.contains("history unavailable"), "Expected message: \(response)")
+    }
+
+    // MARK: - Owner key
+
+    /// Without a valid owner token every action endpoint answers 403 —
+    /// the public surface is listen-only, "a radio, not a mixer".
+    @MainActor
+    func testActionsRejectGuestsWith403() async throws {
+        let radio = RadioBroadcaster(port: 18_041)
+        defer { radio.stopAll() }
+        for token in [nil, "", "wrong-token"] as [String?] {
+            let (likeStatus, likeBody) = await radio.performLikeAsync(stationID: UUID(), token: token)
+            XCTAssertEqual(likeStatus, 403, "like with token \(token ?? "nil")")
+            XCTAssertTrue(String(data: likeBody, encoding: .utf8)!.contains("listener mode"))
+            let (skipStatus, _) = await radio.performSkipAsync(stationID: UUID(), token: token)
+            XCTAssertEqual(skipStatus, 403, "skip with token \(token ?? "nil")")
+            let (nextStatus, _) = await radio.performNextAsync(stationID: UUID(), token: token)
+            XCTAssertEqual(nextStatus, 403, "next with token \(token ?? "nil")")
+        }
+    }
+
+    /// Socket-level guest POST (no token in body) → 403 over the wire.
+    @MainActor
+    func testPostWithoutTokenOverSocketReturns403() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let port: UInt16 = 18_042
+        let radio = RadioBroadcaster(port: port)
+        let station = Station(name: "Guest Test", kind: .playlist(queue: tracks))
+        await radio.startBroadcast(station: station)
+        defer { radio.stopAll() }
+
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+
+        let response = try await Self.fetchRawResponse(
+            port: port,
+            path: "/next",
+            requestHeaders: ["Content-Type: application/json"],
+            maxBytes: 1_024,
+            method: "POST",
+            body: "{\"station\":\"\(station.id.uuidString)\"}"
+        )
+        XCTAssertTrue(response.contains("HTTP/1.1 403"), "Expected 403: \(response)")
+        XCTAssertTrue(response.contains("listener mode"), "Expected guest message: \(response)")
     }
 
     /// SSE framing: a payload becomes a single `data:` line terminated by

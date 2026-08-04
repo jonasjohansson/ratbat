@@ -93,6 +93,16 @@ public final class BroadcastPreferences: ObservableObject {
     @AppStorage("ratbat.broadcast.autoStartSlugs")
     private var autoStartSlugsRaw: String = ""
 
+    /// Shared secret that separates the owner from guest listeners on the
+    /// public HTTP surface. Requests to /like, /skip, /next must carry it;
+    /// without it the radio is listen-only — guests get a radio, not a
+    /// mixer. Generated on first read (empty = never generated). Shown in
+    /// Settings → Broadcast for copying into the web player once per
+    /// device. UserDefaults, not Keychain — same threat model note as the
+    /// Last.fm key above.
+    @AppStorage("ratbat.broadcast.ownerToken")
+    private var ownerTokenRaw: String = ""
+
     /// Republishes whenever any stored setting changes so Combine observers
     /// (notably ``RadioBroadcaster``) can mark themselves "needs restart".
     /// `@AppStorage` doesn't expose a publisher we can subscribe to, so we
@@ -127,6 +137,22 @@ public final class BroadcastPreferences: ObservableObject {
         autoStartSlugs.contains(slug)
     }
 
+    /// The owner token, generating one on first access. Does not tick
+    /// ``revision`` — the token never affects a running pipeline.
+    public var ownerToken: String {
+        if ownerTokenRaw.isEmpty {
+            ownerTokenRaw = UUID().uuidString.lowercased()
+        }
+        return ownerTokenRaw
+    }
+
+    /// Constant-time-ish check is overkill here (UUID guessing over a
+    /// rate-limited home tunnel isn't the threat model); plain equality.
+    public func isOwner(token: String?) -> Bool {
+        guard let token, !token.isEmpty else { return false }
+        return token == ownerToken
+    }
+
     /// Add or remove `slug` from the auto-start list. Idempotent in both
     /// directions so a double-toggle can't duplicate an entry.
     public func setAutoStart(_ enabled: Bool, slug: String) {
@@ -158,6 +184,7 @@ public final class BroadcastPreferences: ObservableObject {
         defaults.removeObject(forKey: "ratbat.broadcast.port")
         defaults.removeObject(forKey: "ratbat.broadcast.icyMetadata")
         defaults.removeObject(forKey: "ratbat.broadcast.autoStartSlugs")
+        defaults.removeObject(forKey: "ratbat.broadcast.ownerToken")
         revision &+= 1
     }
 }
