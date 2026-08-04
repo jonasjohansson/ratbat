@@ -887,6 +887,17 @@ public final class RadioBroadcaster: ObservableObject {
             await self?.performNextAsync(stationID: stationID, token: token)
                 ?? (500, Data("{\"status\":\"error\",\"message\":\"no broadcaster\"}".utf8))
         }
+        let boostHandler: @Sendable (UUID, String?) async -> (Int, Data) = { [weak self] stationID, token in
+            // Boost — "more of this": the strong steering signal, above ♥.
+            await self?.performBoostAsync(stationID: stationID, token: token)
+                ?? (500, Data("{\"status\":\"error\",\"message\":\"no broadcaster\"}".utf8))
+        }
+        let unlikeHandler: @Sendable (UUID, String?) async -> (Int, Data) = { [weak self] stationID, token in
+            // Un-♥ — a mis-tap shouldn't be forever: clears the signal and
+            // removes the file the ♥ copied (never a library original).
+            await self?.performUnlikeAsync(stationID: stationID, token: token)
+                ?? (500, Data("{\"status\":\"error\",\"message\":\"no broadcaster\"}".utf8))
+        }
 
         let task = Task.detached { [weak self] in
             // Read headers to learn both the request path and whether the
@@ -899,7 +910,7 @@ public final class RadioBroadcaster: ObservableObject {
 
             // CORS preflight for the action POSTs — browsers send OPTIONS
             // before the real POST because we use Content-Type: application/json.
-            if method == "OPTIONS" && (path == "/like" || path == "/skip" || path == "/next") {
+            if method == "OPTIONS" && (path == "/like" || path == "/skip" || path == "/next" || path == "/boost" || path == "/unlike") {
                 _ = await Self.send(
                     data: Self.buildHTTPResponse(
                         status: 204,
@@ -1016,6 +1027,43 @@ public final class RadioBroadcaster: ObservableObject {
                 }
 
                 let (status, payload) = await nextHandler(stationID, req.token)
+                var headers = Self.corsHeaders()
+                headers["Content-Type"] = "application/json"
+                _ = await Self.send(
+                    data: Self.buildHTTPResponse(status: status, headers: headers, body: payload),
+                    on: connection
+                )
+                connection.cancel()
+                return
+            }
+
+            // Boost / un-♥ — same request shape and CORS handling as /like.
+            if method == "POST" && (path == "/boost" || path == "/unlike") {
+                let contentLength = Self.contentLength(from: headerBytes) ?? 0
+                let body = await Self.readBody(
+                    connection: connection,
+                    alreadyRead: Self.bodyBytes(after: headerBytes),
+                    expected: contentLength
+                )
+                guard let req = try? JSONDecoder().decode(LikeRequest.self, from: body),
+                      let stationID = UUID(uuidString: req.station) else {
+                    var headers = Self.corsHeaders()
+                    headers["Content-Type"] = "application/json"
+                    _ = await Self.send(
+                        data: Self.buildHTTPResponse(
+                            status: 400,
+                            headers: headers,
+                            body: Data("{\"status\":\"error\",\"message\":\"bad request\"}".utf8)
+                        ),
+                        on: connection
+                    )
+                    connection.cancel()
+                    return
+                }
+
+                let (status, payload) = path == "/boost"
+                    ? await boostHandler(stationID, req.token)
+                    : await unlikeHandler(stationID, req.token)
                 var headers = Self.corsHeaders()
                 headers["Content-Type"] = "application/json"
                 _ = await Self.send(
@@ -1731,6 +1779,106 @@ public final class RadioBroadcaster: ObservableObject {
         }
     }
 
+    /// Boost the current track — "more of this". Stamps `boosted_at` on
+    /// its history row (creating one for owned tracks, same as affinity-♥),
+    /// which puts the artist at the front of the next similar-artist
+    /// expansion via ``HistoryStore/topAffinityArtists`` and feeds the
+    /// scoring term weighted above ♥-saves. No refill is forced: the next
+    /// natural refill steers, which also debounces rapid boosts for free.
+    func performBoostAsync(stationID: UUID, token: String?) async -> (Int, Data) {
+        guard preferences.isOwner(token: token) else { return Self.guestRejection() }
+        guard pipelines[stationID] != nil,
+              let item = currentItemByStation[stationID] else {
+            return (404, Data("{\"status\":\"error\",\"message\":\"no current track\"}".utf8))
+        }
+        guard let history else {
+            return (500, Data("{\"status\":\"error\",\"message\":\"history unavailable\"}".utf8))
+        }
+        do {
+            if let historyID = item.historyID {
+                try await history.markBoosted(id: historyID)
+            } else {
+                guard let artist = item.artist,
+                      !artist.trimmingCharacters(in: .whitespaces).isEmpty else {
+                    return (422, Data("{\"status\":\"error\",\"message\":\"track has no artist metadata\"}".utf8))
+                }
+                let id = try await history.record(
+                    station: stationID,
+                    artist: artist,
+                    title: item.title ?? "Unknown",
+                    cachedPath: item.url.path
+                )
+                try await history.markBoosted(id: id)
+            }
+            logger.info("boost: \(item.artist ?? "?", privacy: .public) — \(item.title ?? "?", privacy: .public)")
+            return (200, Data("{\"status\":\"boosted\"}".utf8))
+        } catch {
+            return (500, Data("{\"status\":\"error\",\"message\":\"could not record\"}".utf8))
+        }
+    }
+
+    /// Un-♥ the current track. Finds the save row (by id for generative
+    /// tracks, by newest station+artist+title match for owned ones, whose
+    /// items don't carry a row id) and undoes what ♥ did:
+    /// - generative save → clear the flag, delete the COPIED file
+    /// - owned/affinity ♥ → delete the row (it exists only as the signal)
+    ///
+    /// File deletion is allowed ONLY for paths inside the music folder
+    /// whose parent is a dated radio-save folder (`YYMMDD …`) — a library
+    /// original can never match, so un-♥ can never delete your own record.
+    func performUnlikeAsync(stationID: UUID, token: String?) async -> (Int, Data) {
+        guard preferences.isOwner(token: token) else { return Self.guestRejection() }
+        guard pipelines[stationID] != nil,
+              let item = currentItemByStation[stationID] else {
+            return (404, Data("{\"status\":\"error\",\"message\":\"no current track\"}".utf8))
+        }
+        guard let history else {
+            return (500, Data("{\"status\":\"error\",\"message\":\"history unavailable\"}".utf8))
+        }
+        do {
+            let row: HistoryStore.Entry?
+            if let historyID = item.historyID {
+                row = try await history.entry(id: historyID)
+            } else if let artist = item.artist, let title = item.title {
+                row = try await history.newestSavedEntry(
+                    station: stationID, artist: artist, title: title
+                )
+            } else {
+                row = nil
+            }
+            guard let row, row.saved else {
+                return (404, Data("{\"status\":\"error\",\"message\":\"not liked\"}".utf8))
+            }
+
+            var deletedFile = false
+            if let cachedPath = row.cachedPath,
+               let musicFolder = libraryConfig?.musicFolder {
+                let url = URL(fileURLWithPath: cachedPath)
+                let parent = url.deletingLastPathComponent().lastPathComponent
+                let inLibrary = url.path.hasPrefix(musicFolder.path)
+                let isDatedRadioFolder = parent.count > 6
+                    && parent.prefix(6).allSatisfy(\.isNumber)
+                    && parent[parent.index(parent.startIndex, offsetBy: 6)] == " "
+                if inLibrary && isDatedRadioFolder {
+                    try? FileManager.default.removeItem(at: url)
+                    deletedFile = true
+                }
+            }
+
+            if deletedFile {
+                // A real save: the row remains as play history.
+                try await history.unmarkSaved(id: row.id)
+            } else {
+                // Affinity-only ♥ (owned track): the row IS the signal.
+                try await history.deleteEntry(id: row.id)
+            }
+            logger.info("un-♥: \(row.artist, privacy: .public) — \(row.title, privacy: .public) (file deleted: \(deletedFile))")
+            return (200, Data("{\"status\":\"unliked\"}".utf8))
+        } catch {
+            return (500, Data("{\"status\":\"error\",\"message\":\"could not undo\"}".utf8))
+        }
+    }
+
     /// Public in-app entry point for the Mac UI's ♥ button. Thin async
     /// wrapper over ``performLikeAsync(stationID:token:)`` that hands back
     /// the decoded response so callers can render state directly. The Mac
@@ -1834,6 +1982,16 @@ public final class RadioBroadcaster: ObservableObject {
 
     /// iOS stub — same rationale as the other action stubs.
     func performRetroLikeAsync(stationID: UUID, entryID: String, token: String?) async -> (Int, Data) {
+        (500, Data("{\"status\":\"error\",\"message\":\"unavailable\"}".utf8))
+    }
+
+    /// iOS stub — same rationale as the other action stubs.
+    func performBoostAsync(stationID: UUID, token: String?) async -> (Int, Data) {
+        (500, Data("{\"status\":\"error\",\"message\":\"unavailable\"}".utf8))
+    }
+
+    /// iOS stub — same rationale as the other action stubs.
+    func performUnlikeAsync(stationID: UUID, token: String?) async -> (Int, Data) {
         (500, Data("{\"status\":\"error\",\"message\":\"unavailable\"}".utf8))
     }
 

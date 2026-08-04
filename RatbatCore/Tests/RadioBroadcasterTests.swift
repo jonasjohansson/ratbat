@@ -304,11 +304,17 @@ final class RadioBroadcasterTests: XCTestCase {
         try await Task.sleep(nanoseconds: 8_000_000_000)
 
         let ring = radio.recentByStation[station.id] ?? []
-        guard let retired = ring.first else {
-            XCTFail("one advance → one retired track; ring is empty")
+        // Short fixture tracks can also END naturally while the listener
+        // is attached, retiring extra entries — assert containment, not
+        // head position.
+        guard let retired = ring.first(where: { $0.item.title == firstTitle }) ?? ring.first else {
+            XCTFail("advance → retired track; ring is empty")
             return
         }
-        XCTAssertEqual(retired.item.title, firstTitle, "ring holds the outgoing track")
+        XCTAssertTrue(
+            ring.contains { $0.item.title == firstTitle },
+            "ring holds the track that was playing at capture time"
+        )
 
         // Retro-♥ the retired track. Playlist items carry no historyID →
         // the affinity path answers "noted" and writes a saved row.
@@ -330,6 +336,68 @@ final class RadioBroadcasterTests: XCTestCase {
             stationID: station.id, entryID: entryID, token: "wrong"
         )
         XCTAssertEqual(guestStatus, 403)
+    }
+
+    // MARK: - Boost + un-♥ (keep vs steer)
+
+    /// The signal-model arc on an owned track: ♥ records affinity, un-♥
+    /// deletes the affinity row (never the library file), boost stamps a
+    /// row that dominates the expansion seeding.
+    @MainActor
+    func testBoostAndUnlikeOnOwnedTrack() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let tempDB = FileManager.default.temporaryDirectory
+            .appendingPathComponent("boost-\(UUID().uuidString).sqlite")
+        let store = try await HistoryStore(databaseURL: tempDB)
+        let prefs = BroadcastPreferences()
+        prefs.port = 18_044
+        defer { prefs.port = 18_000 }
+        let radio = RadioBroadcaster(preferences: prefs, history: store)
+        let station = Station(name: "Boost Test", kind: .playlist(queue: tracks))
+        await radio.startBroadcast(station: station)
+        defer { radio.stopAll() }
+
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+        let playing = radio.currentItemByStation[station.id]
+        let ownedPath = playing?.url.path
+
+        // ♥ → affinity row exists.
+        let (likeStatus, _) = await radio.performLikeAsync(stationID: station.id, token: prefs.ownerToken)
+        XCTAssertEqual(likeStatus, 200)
+        var saved = try await store.savedEntries(forStation: station.id, limit: 10)
+        XCTAssertEqual(saved.count, 1)
+
+        // Un-♥ → row deleted, the LIBRARY FILE untouched.
+        let (unlikeStatus, _) = await radio.performUnlikeAsync(stationID: station.id, token: prefs.ownerToken)
+        XCTAssertEqual(unlikeStatus, 200)
+        saved = try await store.savedEntries(forStation: station.id, limit: 10)
+        XCTAssertEqual(saved.count, 0, "affinity row is the signal — undo deletes it")
+        if let ownedPath {
+            XCTAssertTrue(
+                FileManager.default.fileExists(atPath: ownedPath),
+                "un-♥ must never delete a library original"
+            )
+        }
+
+        // Un-♥ again → nothing left to undo.
+        let (again, _) = await radio.performUnlikeAsync(stationID: station.id, token: prefs.ownerToken)
+        XCTAssertEqual(again, 404)
+
+        // Boost → boosted row exists and dominates expansion seeding.
+        let (boostStatus, body) = await radio.performBoostAsync(stationID: station.id, token: prefs.ownerToken)
+        XCTAssertEqual(boostStatus, 200, String(data: body, encoding: .utf8) ?? "")
+        let boosted = try await store.boostedEntries(forStation: station.id, limit: 10)
+        XCTAssertEqual(boosted.count, 1)
+        let seeds = try await store.topAffinityArtists(forStation: station.id, limit: 3)
+        XCTAssertEqual(seeds.first, playing?.artist, "boosted artist leads the seeding")
+
+        // Guests: 403 on both.
+        let (g1, _) = await radio.performBoostAsync(stationID: station.id, token: nil)
+        XCTAssertEqual(g1, 403)
+        let (g2, _) = await radio.performUnlikeAsync(stationID: station.id, token: "wrong")
+        XCTAssertEqual(g2, 403)
     }
 
     // MARK: - Owner key
