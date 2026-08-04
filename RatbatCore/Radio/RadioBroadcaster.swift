@@ -1133,7 +1133,12 @@ public final class RadioBroadcaster: ObservableObject {
     /// Returns nil when the header is missing or unparseable — callers
     /// should treat that as zero-length body.
     nonisolated static func contentLength(from bytes: Data) -> Int? {
-        guard let text = String(data: bytes, encoding: .utf8) else { return nil }
+        // The buffer may carry coalesced body bytes past the header
+        // terminator (see `readUntilHeaderEnd`) — scan headers only, so
+        // a body line can't spoof a header.
+        let headerEnd = bytes.range(of: Data("\r\n\r\n".utf8))?.lowerBound ?? bytes.endIndex
+        let headerBytes = bytes.subdata(in: bytes.startIndex..<headerEnd)
+        guard let text = String(data: headerBytes, encoding: .utf8) else { return nil }
         let normalised = text.replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
         for line in normalised.split(separator: "\n") {
@@ -1147,14 +1152,11 @@ public final class RadioBroadcaster: ObservableObject {
         return nil
     }
 
-    /// Any body bytes that came along in the same packet as the headers.
-    /// `readUntilHeaderEnd` returns the header block including the
-    /// terminating `\r\n\r\n`, but if the client bundled the body into the
-    /// same read it's also sitting in the buffer — this peels that off.
+    /// Any body bytes that came along in the same segment as the headers.
+    /// `readUntilHeaderEnd` returns its full receive buffer, so whatever
+    /// sits past the `\r\n\r\n` terminator is the start of the body — this
+    /// peels it off so `readBody` only waits for the remainder.
     nonisolated static func bodyBytes(after headerBytes: Data) -> Data {
-        // Technically the helper stops at the end of the header block, so
-        // this is always empty. Kept for symmetry with `readBody` if we
-        // ever switch to a more lenient reader.
         guard let range = headerBytes.range(of: Data("\r\n\r\n".utf8)) else {
             return Data()
         }
@@ -1174,6 +1176,18 @@ public final class RadioBroadcaster: ObservableObject {
         let deadline = Date().addingTimeInterval(3)
         while acc.count < expected, Date() < deadline {
             let needed = expected - acc.count
+            // The deadline above only bounds the loop BETWEEN receives —
+            // `connection.receive` itself never times out, so a client
+            // that promises Content-Length bytes and goes quiet would
+            // park this task forever. The watchdog cancels the connection
+            // instead, which forces the pending receive to complete.
+            let watchdog = Task {
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                // try? swallows the CancellationError a normal receive
+                // triggers — re-check so the happy path can't kill a
+                // healthy connection.
+                if !Task.isCancelled { connection.cancel() }
+            }
             let chunk: Data? = await withCheckedContinuation { cont in
                 connection.receive(
                     minimumIncompleteLength: 1,
@@ -1182,6 +1196,7 @@ public final class RadioBroadcaster: ObservableObject {
                     cont.resume(returning: data)
                 }
             }
+            watchdog.cancel()
             guard let chunk, !chunk.isEmpty else { break }
             acc.append(chunk)
         }
@@ -1696,6 +1711,13 @@ public final class RadioBroadcaster: ObservableObject {
         }
     }
 
+    /// Read until the `\r\n\r\n` header terminator and return EVERYTHING
+    /// received — including any body bytes the client coalesced into the
+    /// same segment (browsers and Cloudflare's tunnel do this routinely).
+    /// Truncating at the terminator here silently discarded those bytes,
+    /// which left `readBody` blocking on a receive that never fired: every
+    /// real-world `POST /like` and `/skip` hung forever. `bodyBytes(after:)`
+    /// is the designated way to peel the body back off this buffer.
     nonisolated static func readUntilHeaderEnd(
         connection: NWConnection,
         cap: Int = 4096
@@ -1712,8 +1734,8 @@ public final class RadioBroadcaster: ObservableObject {
             }
             guard let chunk, !chunk.isEmpty else { return acc }
             acc.append(chunk)
-            if let range = acc.range(of: Data("\r\n\r\n".utf8)) {
-                return acc[..<range.upperBound]
+            if acc.range(of: Data("\r\n\r\n".utf8)) != nil {
+                return acc
             }
         }
         return acc
