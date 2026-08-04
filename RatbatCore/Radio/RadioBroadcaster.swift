@@ -1359,10 +1359,13 @@ public final class RadioBroadcaster: ObservableObject {
         let musicFolder: URL
     }
 
-    /// Outcome of the main-actor preflight: either a ready-to-execute
-    /// snapshot, or an early-exit HTTP status + JSON payload.
+    /// Outcome of the main-actor preflight: a ready-to-execute save
+    /// snapshot, an affinity-only mark (track already owned — nothing to
+    /// copy, but "♥ = more like this" must still reach the taste
+    /// profile), or an early-exit HTTP status + JSON payload.
     private enum LikePreflight {
         case ready(LikeSnapshot)
+        case affinity(station: UUID, artist: String, title: String, path: String)
         case early(Int, Data)
     }
 
@@ -1381,9 +1384,29 @@ public final class RadioBroadcaster: ObservableObject {
             )))
         }
         guard let historyID = item.historyID else {
-            return .early(409, Self.encodeLikeResponse(LikeResponse(
-                status: "error", path: nil, message: "track already in library"
-            )))
+            // Playlist-backed track: the file already lives in the
+            // library, so there's nothing to acquire — but ♥ still means
+            // "more like this". Record it as affinity instead of
+            // refusing, so the user's own collection can feed the taste
+            // profile. Artist is the key the profile matches on; without
+            // one the signal is meaningless, so that case stays an error.
+            guard history != nil else {
+                return .early(500, Self.encodeLikeResponse(LikeResponse(
+                    status: "error", path: nil, message: "history unavailable"
+                )))
+            }
+            guard let artist = item.artist,
+                  !artist.trimmingCharacters(in: .whitespaces).isEmpty else {
+                return .early(422, Self.encodeLikeResponse(LikeResponse(
+                    status: "error", path: nil, message: "track has no artist metadata"
+                )))
+            }
+            return .affinity(
+                station: stationID,
+                artist: artist,
+                title: item.title ?? "Unknown",
+                path: item.url.path
+            )
         }
         guard history != nil else {
             return .early(500, Self.encodeLikeResponse(LikeResponse(
@@ -1411,14 +1434,47 @@ public final class RadioBroadcaster: ObservableObject {
     ///
     /// Steps:
     /// 1. Find the pipeline + current item for `stationID`.
-    /// 2. Bail 409 if the item has no `historyID` (playlist tracks are
-    ///    already in the user's library, not in the transient cache).
-    /// 3. File copy + `history.markSaved` off the main actor.
+    /// 2. If the item has no `historyID` (playlist tracks — already in
+    ///    the user's library), record an affinity-only ♥: a saved-flagged
+    ///    history row with no file copy, so owned music feeds the taste
+    ///    profile too. Wire status: "noted".
+    /// 3. Otherwise: file copy + `history.markSaved` off the main actor.
+    ///    Wire status: "saved".
     func performLikeAsync(stationID: UUID) async -> (Int, Data) {
         let snapshot: LikeSnapshot
         switch likePreflight(stationID: stationID) {
         case .early(let status, let data):
             return (status, data)
+        case .affinity(let station, let artist, let title, let path):
+            // Owned track — no copy, just the taste signal. A saved-
+            // flagged history row is exactly what `savedEntries(forStation:)`
+            // feeds into the graduated ♥-affinity, so this rides the same
+            // rails as a real save. Repeat ♥s of the same track on later
+            // plays insert repeat rows deliberately: "I still like this"
+            // is a stronger signal, and the affinity curve saturates.
+            guard let history else {
+                return (500, Self.encodeLikeResponse(LikeResponse(
+                    status: "error", path: nil, message: "history unavailable"
+                )))
+            }
+            do {
+                let id = try await history.record(
+                    station: station,
+                    artist: artist,
+                    title: title,
+                    cachedPath: path
+                )
+                try await history.markSaved(id: id, cachedPath: path)
+                logger.info("♥ noted (owned): \(artist, privacy: .public) — \(title, privacy: .public)")
+                return (200, Self.encodeLikeResponse(LikeResponse(
+                    status: "noted", path: path, message: nil
+                )))
+            } catch {
+                logger.error("♥ affinity mark failed: \(String(describing: error), privacy: .public)")
+                return (500, Self.encodeLikeResponse(LikeResponse(
+                    status: "error", path: nil, message: "could not record"
+                )))
+            }
         case .ready(let ok):
             snapshot = ok
         }

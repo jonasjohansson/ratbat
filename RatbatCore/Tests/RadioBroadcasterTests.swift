@@ -57,17 +57,23 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertEqual(status, 404)
     }
 
-    /// Playlist stations produce items with `historyID == nil` — those
-    /// live in the user's library already, so ♥ should 409 with a
-    /// "already saved" message rather than copying anything.
+    /// Playlist stations produce items with `historyID == nil` — the
+    /// files are already owned, so ♥ copies nothing but must still record
+    /// the taste signal: "noted", plus a saved-flagged history row that
+    /// `savedEntries(forStation:)` feeds into ♥-affinity.
     @MainActor
-    func testLikeOnPlaylistStationReturns409() async throws {
+    func testLikeOnPlaylistStationRecordsAffinity() async throws {
         guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
             throw XCTSkip("Fixtures missing")
         }
-        let port: UInt16 = 18_031
-        let radio = RadioBroadcaster(port: port)
-        let station = Station(name: "Like Test", kind: .playlist(queue: tracks))
+        let tempDB = FileManager.default.temporaryDirectory
+            .appendingPathComponent("affinity-\(UUID().uuidString).sqlite")
+        let store = try await HistoryStore(databaseURL: tempDB)
+        let prefs = BroadcastPreferences()
+        prefs.port = 18_031
+        defer { prefs.port = 18_000 }
+        let radio = RadioBroadcaster(preferences: prefs, history: store)
+        let station = Station(name: "Affinity Test", kind: .playlist(queue: tracks))
         await radio.startBroadcast(station: station)
         defer { radio.stopAll() }
 
@@ -77,12 +83,17 @@ final class RadioBroadcasterTests: XCTestCase {
         try await Task.sleep(nanoseconds: 1_500_000_000)
 
         let (status, body) = await radio.performLikeAsync(stationID: station.id)
-        XCTAssertEqual(status, 409, "Expected 409, got \(status): \(String(data: body, encoding: .utf8) ?? "")")
+        XCTAssertEqual(status, 200, "Expected 200, got \(status): \(String(data: body, encoding: .utf8) ?? "")")
 
-        struct Response: Decodable { let status: String; let message: String? }
+        struct Response: Decodable { let status: String; let path: String? }
         let decoded = try JSONDecoder().decode(Response.self, from: body)
-        XCTAssertEqual(decoded.status, "error")
-        XCTAssertEqual(decoded.message, "track already in library")
+        XCTAssertEqual(decoded.status, "noted")
+        XCTAssertNotNil(decoded.path, "affinity response carries the owned file's path")
+
+        // The row must be visible to the taste profile's affinity query.
+        let saved = try await store.savedEntries(forStation: station.id, limit: 10)
+        XCTAssertEqual(saved.count, 1, "one ♥ → one saved-flagged row")
+        XCTAssertFalse(saved[0].artist.isEmpty)
     }
 
     /// CORS preflight: OPTIONS /like returns 204 with the standard
@@ -216,8 +227,11 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertTrue(response.contains("\"status\":\"next\""), "Expected next status: \(response)")
     }
 
-    /// Same socket-level coalesced shape against /like — the playlist
-    /// station must answer 409 (not hang, not 400).
+    /// Same socket-level coalesced shape against /like. This broadcaster
+    /// has NO history store (minimal init), so the owned-track affinity
+    /// path degrades to 500 "history unavailable" — the point here is
+    /// the socket answers at all (not hang, not 400), plus the degraded
+    /// mode's wire shape.
     @MainActor
     func testPostLikeOverSocketWithCoalescedBody() async throws {
         guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
@@ -239,8 +253,8 @@ final class RadioBroadcasterTests: XCTestCase {
             method: "POST",
             body: "{\"station\":\"\(station.id.uuidString)\"}"
         )
-        XCTAssertTrue(response.contains("HTTP/1.1 409"), "Expected 409: \(response)")
-        XCTAssertTrue(response.contains("track already in library"), "Expected message: \(response)")
+        XCTAssertTrue(response.contains("HTTP/1.1 500"), "Expected 500: \(response)")
+        XCTAssertTrue(response.contains("history unavailable"), "Expected message: \(response)")
     }
 
     /// SSE framing: a payload becomes a single `data:` line terminated by
