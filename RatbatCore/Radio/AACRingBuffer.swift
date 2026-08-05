@@ -142,6 +142,15 @@ final class AACRingBuffer: @unchecked Sendable {
     /// data (shouldn't normally happen, but the caller's cancellation
     /// loop will notice).
     func read(from cursor: inout Cursor) async -> Data {
+        // Advance past a discontinuity BEFORE anything else. The slow
+        // path decides whether to suspend by comparing `totalWritten`
+        // against the cursor; leaving a pre-floor position there makes
+        // that check say "data available" while `tryRead` correctly
+        // finds nothing past the floor — so `read` returns empty
+        // immediately and the serve loop busy-spins until the next
+        // write. Clamping here keeps the two views consistent.
+        cursor.position = clampedToFloor(cursor.position)
+
         // Fast path: something's already available.
         if let (data, newPos) = tryRead(from: cursor.position) {
             cursor.position = newPos
@@ -167,6 +176,16 @@ final class AACRingBuffer: @unchecked Sendable {
             return data
         }
         return Data()
+    }
+
+    /// Clamp a stream position forward past any discontinuity floor.
+    /// Synchronous by necessity: `NSLock` can't be taken from an async
+    /// context under Swift 6, so every lock use in this type lives in a
+    /// sync helper like this one.
+    private func clampedToFloor(_ position: UInt64) -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return max(position, liveEdgeFloor)
     }
 
     /// Returns `(data, newPosition)` if there's data past `position`,
