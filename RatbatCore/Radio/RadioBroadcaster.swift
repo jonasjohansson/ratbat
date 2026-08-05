@@ -705,8 +705,8 @@ public final class RadioBroadcaster: ObservableObject {
         }
         // Nudge the encode loop. The inner PCM loop reads this flag on
         // each iteration and breaks out, which advances the outer loop
-        // to the next item. Buffered AAC already written for this track
-        // still plays out; only future bytes come from the new track.
+        // to the next item; the loop also marks a ring-buffer
+        // discontinuity so listeners skip the stale backlog.
         pipelines[stationID]?.skipRequested = true
     }
     #endif
@@ -2400,12 +2400,20 @@ public final class RadioBroadcaster: ObservableObject {
             var playedThrough = false
             while !Task.isCancelled {
                 // User-initiated skip? Break the inner loop so the outer
-                // loop pulls the next item. Already-encoded bytes in the
-                // ring buffer play out for any current listener — the
-                // skip kicks in at the track boundary from their POV.
+                // loop pulls the next item. The discontinuity mark below
+                // cuts the buffered backlog, so listeners hear the switch
+                // within their browser's own buffer (~2-5s), not after
+                // draining the ring.
                 if let owner {
                     let skip = await MainActor.run { owner.consumeSkipRequest(stationID: stationID) }
-                    if skip { break }
+                    if skip {
+                        // Deliberate rejection: cut the buffered backlog so
+                        // listeners jump to the new track in a beat instead
+                        // of draining ~8s of audio they just skipped. The
+                        // browser's own buffer is the only remaining lag.
+                        buffer.markDiscontinuity()
+                        break
+                    }
                 }
                 guard let pcm = decoder.readNextBuffer() else {
                     playedThrough = true

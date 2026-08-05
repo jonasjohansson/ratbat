@@ -43,6 +43,14 @@ final class AACRingBuffer: @unchecked Sendable {
     /// the reader decides what to do on wake-up).
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
+    /// Discontinuity floor: stream positions below this are declared
+    /// stale, and readers behind it jump forward to it. Set by
+    /// ``markDiscontinuity()`` on a deliberate skip so listeners don't
+    /// sit through ~8s of buffered audio from a track the user just
+    /// rejected. Natural track ends never touch it — gapless radio
+    /// stays gapless; only rejection cuts the backlog.
+    private var liveEdgeFloor: UInt64 = 0
+
     init(capacity: Int = 128 * 1024) {
         // Default ~128KB. At 128 kbps that's roughly 8s of AAC. The
         // one-track-ahead prefetch in the encode loop now hides the big
@@ -109,6 +117,17 @@ final class AACRingBuffer: @unchecked Sendable {
         }
     }
 
+    /// Declare everything written so far stale: readers behind this point
+    /// jump straight to the live edge on their next read. Called on a
+    /// deliberate skip, at the old track's final frame boundary (the
+    /// encode loop writes whole encoder chunks, so the floor never lands
+    /// mid-frame — and ADTS resyncs on its sync word regardless).
+    func markDiscontinuity() {
+        lock.lock()
+        liveEdgeFloor = totalWritten
+        lock.unlock()
+    }
+
     /// Cursor for a brand-new listener. Starts at "now" so they don't
     /// have to chew through a stale buffer to catch up.
     func readCursor() -> Cursor {
@@ -160,7 +179,9 @@ final class AACRingBuffer: @unchecked Sendable {
 
         let writable = UInt64(capacity)
         let oldestValid = totalWritten > writable ? totalWritten - writable : 0
-        let effective = max(position, oldestValid)
+        // The discontinuity floor outranks the reader's own position:
+        // audio before it belongs to a skipped track nobody wants.
+        let effective = max(position, oldestValid, liveEdgeFloor)
         let available = Int(totalWritten - effective)
         if available == 0 { return nil }
 

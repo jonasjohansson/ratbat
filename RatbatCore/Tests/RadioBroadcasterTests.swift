@@ -612,6 +612,28 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertEqual(first.first, 0xCD)
     }
 
+    /// A discontinuity mark makes lagging readers jump the stale backlog:
+    /// they miss everything written before the mark and resume at the
+    /// bytes written after it. Caught-up readers and the natural-EOF path
+    /// (which never marks) are unaffected.
+    func testAACRingBufferDiscontinuitySkipsBacklog() async {
+        let buffer = AACRingBuffer(capacity: 4096)
+        var laggard = buffer.readCursor()          // at position 0
+
+        buffer.write(Data(repeating: 0xAA, count: 1000))   // old track
+        buffer.markDiscontinuity()                          // skip!
+        buffer.write(Data(repeating: 0xBB, count: 500))     // new track
+
+        let data = await buffer.read(from: &laggard)
+        XCTAssertEqual(data.count, 500, "backlog before the mark is skipped")
+        XCTAssertTrue(data.allSatisfy { $0 == 0xBB }, "only the new track's bytes arrive")
+
+        // A reader joining after the mark reads normally.
+        buffer.write(Data(repeating: 0xCC, count: 100))
+        let more = await buffer.read(from: &laggard)
+        XCTAssertTrue(more.allSatisfy { $0 == 0xCC })
+    }
+
     func testAACRingBufferCoalescesMultipleWrites() async {
         let buffer = AACRingBuffer(capacity: 1024)
         var cursor = buffer.readCursor()
