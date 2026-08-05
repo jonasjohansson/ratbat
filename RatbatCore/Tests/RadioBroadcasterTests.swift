@@ -634,6 +634,42 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertTrue(more.allSatisfy { $0 == 0xCC })
     }
 
+    /// A discontinuity with nothing written past it must SUSPEND the
+    /// reader, not hand back empty data. The first version of the skip
+    /// fix got this wrong: `read` compared `totalWritten` against the
+    /// pre-floor cursor, concluded data was available, then found none
+    /// past the floor and returned empty — so the serve loop span at
+    /// full tilt until the next write. It pinned a CI runner for 50
+    /// minutes before anyone noticed.
+    func testAACRingBufferDiscontinuityDoesNotBusySpin() async throws {
+        actor Box {
+            var value: Int?
+            func set(_ v: Int) { value = v }
+            func get() -> Int? { value }
+        }
+        let buffer = AACRingBuffer(capacity: 4096)
+        let startCursor = buffer.readCursor()          // position 0
+        buffer.write(Data(repeating: 0xAA, count: 1000))
+        buffer.markDiscontinuity()                     // floor == 1000, cursor behind
+
+        let box = Box()
+        let reader = Task {
+            var c = startCursor
+            let d = await buffer.read(from: &c)
+            await box.set(d.count)
+        }
+        defer { reader.cancel() }
+
+        try await Task.sleep(nanoseconds: 300_000_000)
+        let early = await box.get()
+        XCTAssertNil(early, "read must suspend past the floor, not spin returning empty")
+
+        buffer.write(Data(repeating: 0xBB, count: 500))
+        try await Task.sleep(nanoseconds: 300_000_000)
+        let woken = await box.get()
+        XCTAssertEqual(woken, 500, "reader wakes on the next write and gets the new track")
+    }
+
     func testAACRingBufferCoalescesMultipleWrites() async {
         let buffer = AACRingBuffer(capacity: 1024)
         var cursor = buffer.readCursor()
