@@ -13,10 +13,20 @@ public actor PlaylistSource: TrackSource {
     private let shuffle: Bool
     private var order: [Track]
     private var cursor: Int = 0
+    /// Records a play and hands back its history row id. A closure, not
+    /// a `HistoryStore`: the store is macOS-only and this type is
+    /// cross-platform — passing the store itself is the exact shape that
+    /// broke the iOS build once. nil on iOS and in tests.
+    private let recordPlay: (@Sendable (String, String, URL) async -> Int64?)?
 
-    public init(tracks: [Track], shuffle: Bool = true) {
+    public init(
+        tracks: [Track],
+        shuffle: Bool = true,
+        recordPlay: (@Sendable (String, String, URL) async -> Int64?)? = nil
+    ) {
         self.shuffle = shuffle
         self.order = shuffle ? tracks.shuffled() : tracks
+        self.recordPlay = recordPlay
     }
 
     public func nextURL() async throws -> TrackSourceItem? {
@@ -38,11 +48,21 @@ public actor PlaylistSource: TrackSource {
 
         let track = order[cursor]
         cursor += 1
+        // Record the play so your OWN library feeds the same history and
+        // taste signals as generative stations. Before this, listening to
+        // your own records taught Ratbat nothing and left the history
+        // view blank for the station you play most.
+        let historyID = await recordPlay?(
+            track.artist ?? "Unknown",
+            track.title ?? track.url.lastPathComponent,
+            track.url
+        )
         return TrackSourceItem(
             url: track.url,
             artist: track.artist,
             title: track.title,
-            historyID: nil
+            historyID: historyID,
+            isOwned: true
         )
     }
 }
