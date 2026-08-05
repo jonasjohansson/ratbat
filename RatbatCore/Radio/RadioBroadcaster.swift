@@ -276,7 +276,32 @@ public final class RadioBroadcaster: ObservableObject {
                 error = "Cannot broadcast an empty queue"
                 return
             }
-            let source = PlaylistSource(tracks: queue)
+            // Wire history recording so playlist plays land in the same
+            // store as generative ones (macOS only — the store is
+            // platform-gated, so the closure stays nil on iOS).
+            #if os(macOS)
+            let stationID = station.id
+            // Definite-initialization rather than `history.map { … }`:
+            // a `.map` returning a closure trips a Swift type-inference
+            // bug ("failed to produce diagnostic for expression") — the
+            // same one hit by the play-through hook.
+            let recorder: (@Sendable (String, String, URL) async -> Int64?)?
+            if let store = history {
+                recorder = { (artist: String, title: String, url: URL) async -> Int64? in
+                    try? await store.record(
+                        station: stationID,
+                        artist: artist,
+                        title: title,
+                        cachedPath: url.path
+                    )
+                }
+            } else {
+                recorder = nil
+            }
+            #else
+            let recorder: (@Sendable (String, String, URL) async -> Int64?)? = nil
+            #endif
+            let source = PlaylistSource(tracks: queue, recordPlay: recorder)
             await startBroadcast(station: station, source: source)
 
         case .nts(let config):
@@ -879,6 +904,10 @@ public final class RadioBroadcaster: ObservableObject {
                 self?.buildNowPayload() ?? Data("{\"stations\":[]}".utf8)
             }
         }
+        let historyPayload: @Sendable (String) async -> Data = { [weak self] path in
+            await self?.buildHistoryPayload(path: path)
+                ?? Data("{\"entries\":[]}".utf8)
+        }
         let likeHandler: @Sendable (UUID, String?) async -> (Int, Data) = { [weak self] stationID, token in
             // Hop to the main actor to resolve the pipeline snapshot,
             // then do the copy + history mark off-main without pinning
@@ -1084,6 +1113,28 @@ public final class RadioBroadcaster: ObservableObject {
                 headers["Content-Type"] = "application/json"
                 _ = await Self.send(
                     data: Self.buildHTTPResponse(status: status, headers: headers, body: payload),
+                    on: connection
+                )
+                connection.cancel()
+                return
+            }
+
+            // Persistent play history — the DB-backed counterpart of the
+            // in-memory `recent` ring in /now.json. Survives restarts and
+            // reaches back as far as the store does. Public read, same
+            // posture as /now.json: it only exposes what was broadcast.
+            if path.hasPrefix("/history") {
+                let payload = await historyPayload(path)
+                _ = await Self.send(
+                    data: Self.buildHTTPResponse(
+                        status: 200,
+                        headers: [
+                            "Content-Type": "application/json",
+                            "Access-Control-Allow-Origin": "*",
+                            "Cache-Control": "no-cache"
+                        ],
+                        body: payload
+                    ),
                     on: connection
                 )
                 connection.cancel()
@@ -1520,7 +1571,7 @@ public final class RadioBroadcaster: ObservableObject {
     /// profile), or an early-exit HTTP status + JSON payload.
     private enum LikePreflight {
         case ready(LikeSnapshot)
-        case affinity(station: UUID, artist: String, title: String, path: String)
+        case affinity(station: UUID, artist: String, title: String, path: String, existingID: Int64?)
         case early(Int, Data)
     }
 
@@ -1538,12 +1589,12 @@ public final class RadioBroadcaster: ObservableObject {
                 status: "error", path: nil, message: "no current track"
             )))
         }
-        guard let historyID = item.historyID else {
-            // Playlist-backed track: the file already lives in the
-            // library, so there's nothing to acquire — but ♥ still means
-            // "more like this". Record it as affinity instead of
-            // refusing, so the user's own collection can feed the taste
-            // profile. Artist is the key the profile matches on; without
+        guard !item.isOwned, let historyID = item.historyID else {
+            // Already in the library (or never recorded): nothing to
+            // acquire — but ♥ still means "more like this". Record it as
+            // affinity instead of refusing, so the user's own collection
+            // feeds the taste profile. Gated on `isOwned`, not on a
+            // missing history row: playlist plays are recorded now too. Artist is the key the profile matches on; without
             // one the signal is meaningless, so that case stays an error.
             guard history != nil else {
                 return .early(500, Self.encodeLikeResponse(LikeResponse(
@@ -1560,7 +1611,8 @@ public final class RadioBroadcaster: ObservableObject {
                 station: stationID,
                 artist: artist,
                 title: item.title ?? "Unknown",
-                path: item.url.path
+                path: item.url.path,
+                existingID: item.historyID
             )
         }
         guard history != nil else {
@@ -1607,7 +1659,7 @@ public final class RadioBroadcaster: ObservableObject {
         switch likePreflight(stationID: stationID) {
         case .early(let status, let data):
             return (status, data)
-        case .affinity(let station, let artist, let title, let path):
+        case .affinity(let station, let artist, let title, let path, let existingID):
             // Owned track — no copy, just the taste signal. A saved-
             // flagged history row is exactly what `savedEntries(forStation:)`
             // feeds into the graduated ♥-affinity, so this rides the same
@@ -1620,12 +1672,19 @@ public final class RadioBroadcaster: ObservableObject {
                 )))
             }
             do {
-                let id = try await history.record(
-                    station: station,
-                    artist: artist,
-                    title: title,
-                    cachedPath: path
-                )
+                // The play may already have a row (playlist plays are
+                // recorded); flag that one rather than inserting a twin.
+                let id: Int64
+                if let existingID {
+                    id = existingID
+                } else {
+                    id = try await history.record(
+                        station: station,
+                        artist: artist,
+                        title: title,
+                        cachedPath: path
+                    )
+                }
                 try await history.markSaved(id: id, cachedPath: path)
                 logger.info("♥ noted (owned): \(artist, privacy: .public) — \(title, privacy: .public)")
                 return (200, Self.encodeLikeResponse(LikeResponse(
@@ -1732,7 +1791,7 @@ public final class RadioBroadcaster: ObservableObject {
         let item = rec.item
 
         // Owned/playlist track — record affinity, nothing to copy.
-        guard let historyID = item.historyID else {
+        guard !item.isOwned, let historyID = item.historyID else {
             guard let artist = item.artist,
                   !artist.trimmingCharacters(in: .whitespaces).isEmpty else {
                 return (422, Self.encodeLikeResponse(LikeResponse(
@@ -1881,13 +1940,11 @@ public final class RadioBroadcaster: ObservableObject {
                 }
             }
 
-            if deletedFile {
-                // A real save: the row remains as play history.
-                try await history.unmarkSaved(id: row.id)
-            } else {
-                // Affinity-only ♥ (owned track): the row IS the signal.
-                try await history.deleteEntry(id: row.id)
-            }
+            // Always clear the flag, never drop the row. Since the
+            // history slice every ♥ attaches to a real play record, so
+            // deleting it would erase the fact the track was ever
+            // heard — undoing a save must not rewrite history.
+            try await history.unmarkSaved(id: row.id)
             logger.info("un-♥: \(row.artist, privacy: .public) — \(row.title, privacy: .public) (file deleted: \(deletedFile))")
             return (200, Data("{\"status\":\"unliked\"}".utf8))
         } catch {
@@ -2023,6 +2080,68 @@ public final class RadioBroadcaster: ObservableObject {
     /// stations are included — the broadcaster doesn't know about the
     /// user's wider library, and that's deliberate (no library leakage
     /// over the public endpoint).
+    /// JSON for `/history?limit=&offset=`. Reads the store (not the
+    /// in-memory ring), so it survives restarts. Station names are
+    /// resolved from live pipelines where possible; historical rows from
+    /// stations that aren't currently broadcasting just carry their id.
+    func buildHistoryPayload(path: String) async -> Data {
+        struct HistoryEntry: Encodable {
+            let id: Int64
+            let artist: String
+            let title: String
+            let playedAt: Double
+            let station: String
+            let saved: Bool
+            let youtubeURL: String?
+            let sourceURL: String?
+        }
+        struct HistoryResponse: Encodable {
+            let entries: [HistoryEntry]
+        }
+
+        // Tiny query parse — the router keeps the query string on `path`.
+        var limit = 50
+        var offset = 0
+        if let q = path.split(separator: "?", maxSplits: 1).dropFirst().first {
+            for pair in q.split(separator: "&") {
+                let kv = pair.split(separator: "=", maxSplits: 1)
+                guard kv.count == 2, let value = Int(kv[1]) else { continue }
+                if kv[0] == "limit" { limit = min(max(value, 1), 200) }
+                if kv[0] == "offset" { offset = max(value, 0) }
+            }
+        }
+
+        #if os(macOS)
+        guard let history,
+              let rows = try? await history.recentEntries(limit: limit, offset: offset) else {
+            return Data("{\"entries\":[]}".utf8)
+        }
+        let names: [String: String] = Dictionary(
+            uniqueKeysWithValues: pipelines.values.map {
+                ($0.station.id.uuidString, $0.station.name)
+            }
+        )
+        let entries = rows.map { row in
+            HistoryEntry(
+                id: row.id,
+                artist: row.artist,
+                title: row.title,
+                playedAt: row.playedAt.timeIntervalSince1970,
+                station: names[row.stationID.uuidString] ?? "",
+                saved: row.saved,
+                youtubeURL: row.youtubeID.map { "https://www.youtube.com/watch?v=\($0)" },
+                sourceURL: row.sourceShowURL?.absoluteString
+            )
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return (try? encoder.encode(HistoryResponse(entries: entries)))
+            ?? Data("{\"entries\":[]}".utf8)
+        #else
+        return Data("{\"entries\":[]}".utf8)
+        #endif
+    }
+
     private func buildNowPayload() -> Data {
         struct NowStation: Encodable {
             let id: String

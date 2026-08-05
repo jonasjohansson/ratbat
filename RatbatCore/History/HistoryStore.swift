@@ -502,6 +502,25 @@ public actor HistoryStore {
         )
     }
 
+    /// Recent plays across every station, newest first — what the public
+    /// `/history` endpoint and the Mac history view read. Unlike the
+    /// broadcaster's in-memory ring this survives restarts and reaches
+    /// back as far as the database goes.
+    public func recentEntries(limit: Int = 50, offset: Int = 0) throws -> [Entry] {
+        let sql = """
+            SELECT id, station_id, artist, title, played_at,
+                   source_show_url, youtube_id, saved, cached_path
+            FROM history
+            ORDER BY played_at DESC
+            LIMIT ? OFFSET ?;
+            """
+        let stmt = try prepare(sql)
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, Int64(limit))
+        sqlite3_bind_int64(stmt, 2, Int64(offset))
+        return collectRows(stmt)
+    }
+
     // MARK: - v3: boost / un-♥ API (keep vs steer)
 
     /// Stamp an entry as boosted — "more of this". The strong steering

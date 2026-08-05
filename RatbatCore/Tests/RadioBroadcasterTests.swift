@@ -408,7 +408,14 @@ final class RadioBroadcasterTests: XCTestCase {
         let (unlikeStatus, _) = await radio.performUnlikeAsync(stationID: station.id, token: prefs.ownerToken)
         XCTAssertEqual(unlikeStatus, 200)
         saved = try await store.savedEntries(forStation: station.id, limit: 10)
-        XCTAssertEqual(saved.count, 0, "affinity row is the signal — undo deletes it")
+        XCTAssertEqual(saved.count, 0, "un-♥ clears the saved flag")
+        // …but the PLAY record survives: undoing a save must not erase
+        // the fact the track was heard.
+        let stillInHistory = try await store.recentEntries(limit: 10)
+        XCTAssertTrue(
+            stillInHistory.contains { $0.title == playing?.title },
+            "un-♥ must not delete play history"
+        )
         if let ownedPath {
             XCTAssertTrue(
                 FileManager.default.fileExists(atPath: ownedPath),

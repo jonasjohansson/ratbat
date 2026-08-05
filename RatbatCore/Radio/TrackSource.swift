@@ -24,19 +24,28 @@ public struct TrackSourceItem: Sendable {
     /// Human-readable metadata for ICY and logs. `nil` fields are fine.
     public let artist: String?
     public let title: String?
-    /// History row id if this came from an NTS source and was recorded.
-    /// `nil` for playlist sources.
+    /// History row id, when the play was recorded. Since the history
+    /// slice this is populated for playlist sources too, so it no longer
+    /// doubles as "is this a transient download?" — see ``isOwned``.
     public let historyID: Int64?
+    /// True when `url` points at a file already in the user's library
+    /// (playlist sources), false for transient cache downloads awaiting
+    /// a ♥. Decides whether ♥ copies a file or just records affinity;
+    /// previously inferred from `historyID == nil`, which stopped being
+    /// true once playlist plays started being recorded.
+    public let isOwned: Bool
 
     public init(
         url: URL,
         artist: String? = nil,
         title: String? = nil,
-        historyID: Int64? = nil
+        historyID: Int64? = nil,
+        isOwned: Bool = false
     ) {
         self.url = url
         self.artist = artist
         self.title = title
         self.historyID = historyID
+        self.isOwned = isOwned
     }
 }
