@@ -867,10 +867,44 @@ final class RadioBroadcasterTests: XCTestCase {
             response.contains("HTTP/1.1 302"),
             "Expected 302 redirect, got: \(response)"
         )
+        // Relative, NOT absolute. An absolute `http://localhost:<port>/…`
+        // Location resolves against the *listener's* machine, so every
+        // listener who isn't on the mac-mini follows it into a dead end.
+        // A relative Location resolves against whatever host the request
+        // arrived on — localhost locally, radio.jonasjohansson.se through
+        // the tunnel. Matches the shape `/now.json` already emits.
         XCTAssertTrue(
-            response.lowercased().contains("location: http://localhost:\(port)/stream/legacy-test.aac"),
-            "Missing Location header: \(response)"
+            response.lowercased().contains("location: /stream/legacy-test.aac"),
+            "Missing relative Location header: \(response)"
         )
+        XCTAssertFalse(
+            response.lowercased().contains("location: http://"),
+            "Location must not be an absolute URL: \(response)"
+        )
+    }
+
+    /// The legacy redirect must never bake a host or port into `Location`.
+    ///
+    /// This is the regression guard for the outage where the public
+    /// `/stream.aac` answered `302 Location: http://localhost:18000/…`.
+    /// It looked healthy from the mac-mini — where `localhost` *is* the
+    /// origin — and was broken for everyone else.
+    func testRedirectResponseLocationIsHostRelative() {
+        let response = RadioBroadcaster.redirectResponse(slug: "techno-2")
+
+        // Split on CRLF rather than substring-matching a trailing "\r":
+        // Swift fuses CR+LF into a single grapheme cluster, so a needle
+        // ending in a lone "\r" never matches a real header line.
+        let lines = response.components(separatedBy: "\r\n")
+
+        XCTAssertEqual(lines.first, "HTTP/1.1 302 Found")
+        XCTAssertTrue(
+            lines.contains("Location: /stream/techno-2.aac"),
+            "Expected host-relative Location, got lines: \(lines)"
+        )
+        XCTAssertFalse(response.contains("localhost"))
+        XCTAssertFalse(response.contains("http://"))
+        XCTAssertFalse(response.contains("https://"))
     }
 
     /// Legacy `/stream.aac` 404s when there's nothing to redirect to.

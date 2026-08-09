@@ -1227,7 +1227,7 @@ public final class RadioBroadcaster: ObservableObject {
             if path == "/stream.aac" || path == "/stream" {
                 if let slug = await legacyRedirectSlug() {
                     _ = await Self.send(
-                        data: Data(Self.redirectResponse(slug: slug, port: port).utf8),
+                        data: Data(Self.redirectResponse(slug: slug).utf8),
                         on: connection
                     )
                 } else {
@@ -1493,8 +1493,23 @@ public final class RadioBroadcaster: ObservableObject {
 
     // MARK: - Response builders
 
-    nonisolated static func redirectResponse(slug: String, port: UInt16) -> String {
-        let target = "http://localhost:\(port)/stream/\(slug).aac"
+    /// 302 for the legacy `/stream.aac` bookmark, pointing at the
+    /// slug-specific path.
+    ///
+    /// The `Location` is deliberately **host-relative**. RFC 7231 §7.1.2
+    /// allows a relative reference and every client resolves it against
+    /// the URI the request was made to — so a listener on
+    /// `https://radio.jonasjohansson.se` is sent to
+    /// `https://radio.jonasjohansson.se/stream/<slug>.aac`, and a local
+    /// listener on `localhost:18000` stays local.
+    ///
+    /// This used to emit an absolute `http://localhost:<port>/…`, which
+    /// resolved against the *listener's* machine. It tested green and
+    /// curled green from the mac-mini — where `localhost` really is the
+    /// origin — and was a dead end for every remote listener. Keep it
+    /// relative. `/now.json` already reports `streamURL` the same way.
+    nonisolated static func redirectResponse(slug: String) -> String {
+        let target = "/stream/\(slug).aac"
         return """
         HTTP/1.1 302 Found\r
         Location: \(target)\r
