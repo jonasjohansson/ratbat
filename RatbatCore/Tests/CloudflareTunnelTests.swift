@@ -25,6 +25,333 @@ final class CloudflareTunnelTests: XCTestCase {
         XCTAssertEqual(tunnel.mode, .idle)
     }
 
+    // MARK: - Supervision
+    //
+    // These are the tests that were missing when the radio went dark for
+    // days: cloudflared exited, `isRunning` stayed true, nothing relaunched
+    // it and nothing recorded why. Reproduced by SIGKILLing the real
+    // process — the public URL went 200 → 502 → 530 and stayed at 530.
+
+    /// A machine that definitely has cloudflared and definitely has no
+    /// named-tunnel config, regardless of the machine actually running the
+    /// test.
+    ///
+    /// Without this the supervision tests were environment-dependent in a
+    /// way that hid them exactly where they mattered: they passed on a dev
+    /// Mac (bundled cloudflared present) and failed on the CI runner, where
+    /// `start()` hit the "binary not found" guard and returned before the
+    /// fake launcher was ever called. The path under test is the
+    /// supervisor, not the host's `/opt/homebrew`.
+    @MainActor
+    private static func fakeEnvironment(
+        binary: URL? = URL(fileURLWithPath: "/nonexistent/cloudflared"),
+        named: Bool = false,
+        hostname: URL? = nil
+    ) -> CloudflareTunnel.Environment {
+        CloudflareTunnel.Environment(
+            locateBinary: { binary },
+            namedTunnelConfigured: { named },
+            namedTunnelHostname: { hostname }
+        )
+    }
+
+    /// A fake launcher so the lifecycle is testable without spawning a
+    /// real cloudflared (network, binary availability and timing make that
+    /// hopeless in a unit test).
+    @MainActor
+    private final class FakeLauncher {
+        private(set) var launches: [[String]] = []
+        private(set) var terminateCount = 0
+        var onExit: ((Int32) -> Void)?
+        var emitLine: ((String) -> Void)?
+
+        func launcher() -> CloudflareTunnel.Launcher {
+            { [self] _, args, lineSink, exitSink in
+                launches.append(args)
+                onExit = { code in exitSink(code) }
+                emitLine = { line in lineSink(line) }
+                return CloudflareTunnel.ProcessHandle(
+                    terminate: { [self] in terminateCount += 1 }
+                )
+            }
+        }
+    }
+
+    // MARK: - The real subprocess path
+    //
+    // Everything above drives a fake launcher, which proves the policy but
+    // not the plumbing — and the plumbing is exactly what was missing.
+    // These two use the production `spawnProcess` against harmless
+    // binaries, so the real `terminationHandler` and the real pipe reader
+    // are the things under test.
+
+    /// The production launcher must report a real process's exit. This is
+    /// the line whose absence made the outage invisible.
+    @MainActor
+    func testRealSpawnReportsProcessExit() async throws {
+        let exited = expectation(description: "terminationHandler fires")
+        let status = UncheckedBox<Int32>(-1)
+
+        _ = try CloudflareTunnel.spawnProcess(
+            binary: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", "exit 7"],
+            onOutputLine: { _ in },
+            onExit: { code in
+                status.value = code
+                exited.fulfill()
+            }
+        )
+
+        await fulfillment(of: [exited], timeout: 10)
+        XCTAssertEqual(status.value, 7, "exit status must be reported, not swallowed")
+    }
+
+    /// The production launcher must stream the child's stderr — that's how
+    /// cloudflared's reason-for-dying reaches the log.
+    @MainActor
+    func testRealSpawnStreamsStderrLines() async throws {
+        let sawLine = expectation(description: "stderr line observed")
+        let seen = UncheckedBox<[String]>([])
+
+        _ = try CloudflareTunnel.spawnProcess(
+            binary: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", "echo 'ERR something broke' 1>&2; sleep 0.2"],
+            onOutputLine: { line in
+                seen.value.append(line)
+                if line.contains("something broke") { sawLine.fulfill() }
+            },
+            onExit: { _ in }
+        )
+
+        await fulfillment(of: [sawLine], timeout: 10)
+        XCTAssertTrue(
+            seen.value.contains(where: { CloudflareTunnel.looksLikeError($0) }),
+            "an ERR line must be classified as an error so it is logged at a persisted level"
+        )
+    }
+
+    /// Minimal mutable box for values crossing the launcher's `@Sendable`
+    /// callbacks in tests.
+    private final class UncheckedBox<T>: @unchecked Sendable {
+        var value: T
+        init(_ value: T) { self.value = value }
+    }
+
+    /// Backoff must grow so a hard-down Cloudflare isn't hammered, and cap
+    /// so recovery after a long outage is still prompt.
+    func testRestartBackoffGrowsAndCaps() {
+        XCTAssertEqual(CloudflareTunnel.restartDelay(forAttempt: 1), 1)
+        XCTAssertEqual(CloudflareTunnel.restartDelay(forAttempt: 2), 2)
+        XCTAssertEqual(CloudflareTunnel.restartDelay(forAttempt: 3), 4)
+        XCTAssertEqual(CloudflareTunnel.restartDelay(forAttempt: 4), 8)
+        XCTAssertEqual(CloudflareTunnel.restartDelay(forAttempt: 10), 30, "capped")
+        XCTAssertEqual(CloudflareTunnel.restartDelay(forAttempt: 999), 30, "still capped")
+    }
+
+    /// A tunnel that ran healthily for a long time and then died is a
+    /// fresh incident, not an escalation — its retry starts from 1 again.
+    /// A crash-loop keeps escalating.
+    func testAttemptCounterResetsAfterAStableRun() {
+        XCTAssertEqual(CloudflareTunnel.nextAttempt(previous: 5, uptime: 600), 1, "stable run resets")
+        XCTAssertEqual(CloudflareTunnel.nextAttempt(previous: 5, uptime: 0.5), 6, "crash loop escalates")
+        XCTAssertEqual(CloudflareTunnel.nextAttempt(previous: 0, uptime: 0), 1)
+    }
+
+    /// The core regression: when cloudflared exits on its own, the tunnel
+    /// must notice, drop `isRunning`, and relaunch.
+    @MainActor
+    func testUnexpectedExitRelaunchesCloudflared() async throws {
+        let fake = FakeLauncher()
+        let tunnel = CloudflareTunnel(
+            launcher: fake.launcher(),
+            environment: Self.fakeEnvironment(),
+            restartDelayOverride: 0
+        )
+        await tunnel.start(forwardingTo: 18_000)
+
+        XCTAssertTrue(tunnel.isRunning)
+        XCTAssertEqual(fake.launches.count, 1)
+
+        fake.onExit?(137)  // SIGKILL, exactly what we did to the real one
+
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        XCTAssertEqual(fake.launches.count, 2, "cloudflared must be relaunched after an unexpected exit")
+        XCTAssertTrue(tunnel.isRunning, "isRunning must reflect the relaunched process")
+    }
+
+    /// `isRunning` must never claim a dead process is alive — that lie is
+    /// what made the outage invisible from inside the app.
+    @MainActor
+    func testIsRunningGoesFalseOnExitWhenRestartDisabled() async throws {
+        let fake = FakeLauncher()
+        let tunnel = CloudflareTunnel(
+            launcher: fake.launcher(),
+            environment: Self.fakeEnvironment(),
+            restartDelayOverride: 0,
+            restartOnUnexpectedExit: false
+        )
+        await tunnel.start(forwardingTo: 18_000)
+        XCTAssertTrue(tunnel.isRunning)
+
+        fake.onExit?(1)
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        XCTAssertFalse(tunnel.isRunning)
+        XCTAssertEqual(fake.launches.count, 1, "must not relaunch when supervision is off")
+        XCTAssertNotNil(tunnel.error, "an unexpected exit is an error the UI can show")
+    }
+
+    /// A deliberate `stop()` must not trigger the supervisor — otherwise
+    /// quitting the app would fight a relaunch loop.
+    @MainActor
+    func testDeliberateStopDoesNotRelaunch() async throws {
+        let fake = FakeLauncher()
+        let tunnel = CloudflareTunnel(
+            launcher: fake.launcher(),
+            environment: Self.fakeEnvironment(),
+            restartDelayOverride: 0
+        )
+        await tunnel.start(forwardingTo: 18_000)
+
+        tunnel.stop()
+        fake.onExit?(0)  // the terminate we asked for lands afterwards
+
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        XCTAssertEqual(fake.launches.count, 1, "stop() must not be followed by a relaunch")
+        XCTAssertFalse(tunnel.isRunning)
+        XCTAssertEqual(tunnel.mode, .idle)
+        XCTAssertEqual(fake.terminateCount, 1)
+    }
+
+    /// The absence of evidence was itself a defect: when the tunnel died,
+    /// nothing survived to say why. Keep cloudflared's recent output so the
+    /// exit can be logged with context.
+    @MainActor
+    func testRecentOutputIsRetainedForDiagnostics() async throws {
+        let fake = FakeLauncher()
+        let tunnel = CloudflareTunnel(
+            launcher: fake.launcher(),
+            environment: Self.fakeEnvironment(),
+            restartDelayOverride: 0,
+            restartOnUnexpectedExit: false
+        )
+        await tunnel.start(forwardingTo: 18_000)
+
+        fake.emitLine?("2026-08-09T17:00:00Z ERR Failed to serve quic connection error=\"timeout\"")
+        fake.emitLine?("2026-08-09T17:00:01Z INF Retrying connection in 1s")
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        let tail = tunnel.recentOutput
+        XCTAssertTrue(
+            tail.contains(where: { $0.contains("Failed to serve quic connection") }),
+            "cloudflared's own error lines must be retained, got: \(tail)"
+        )
+        XCTAssertLessThanOrEqual(tail.count, CloudflareTunnel.recentOutputLimit)
+    }
+
+    /// The retained buffer is bounded — a tunnel up for weeks must not
+    /// grow it without limit.
+    @MainActor
+    func testRecentOutputIsBounded() async throws {
+        let fake = FakeLauncher()
+        let tunnel = CloudflareTunnel(
+            launcher: fake.launcher(),
+            environment: Self.fakeEnvironment(),
+            restartDelayOverride: 0
+        )
+        await tunnel.start(forwardingTo: 18_000)
+
+        for i in 0..<(CloudflareTunnel.recentOutputLimit * 3) {
+            fake.emitLine?("line \(i)")
+        }
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(tunnel.recentOutput.count, CloudflareTunnel.recentOutputLimit)
+        XCTAssertTrue(tunnel.recentOutput.last?.contains("line \(CloudflareTunnel.recentOutputLimit * 3 - 1)") ?? false,
+                      "must keep the most recent lines, not the oldest")
+    }
+
+    // MARK: - Environment handling
+    //
+    // The seam these drive is the one that made the supervision tests
+    // machine-dependent. Now that it's injectable, both sides of every
+    // branch are reachable on any runner, so cover them.
+
+    /// No cloudflared on the box: `start()` must fail loudly and stay idle
+    /// rather than reporting a tunnel it never launched.
+    @MainActor
+    func testMissingBinaryFailsWithoutLaunching() async {
+        let fake = FakeLauncher()
+        let tunnel = CloudflareTunnel(
+            launcher: fake.launcher(),
+            environment: Self.fakeEnvironment(binary: nil),
+            restartDelayOverride: 0
+        )
+        await tunnel.start(forwardingTo: 18_000)
+
+        XCTAssertEqual(fake.launches.count, 0, "nothing to launch")
+        XCTAssertFalse(tunnel.isRunning)
+        XCTAssertEqual(tunnel.mode, .idle)
+        XCTAssertEqual(tunnel.error, "cloudflared binary not found")
+    }
+
+    /// Quick-tunnel mode: no config.yml, so forward the local port on the
+    /// command line and expect the URL to be scraped from stderr.
+    @MainActor
+    func testQuickTunnelPassesLocalPortOnCommandLine() async {
+        let fake = FakeLauncher()
+        let tunnel = CloudflareTunnel(
+            launcher: fake.launcher(),
+            environment: Self.fakeEnvironment(named: false),
+            restartDelayOverride: 0
+        )
+        await tunnel.start(forwardingTo: 18_000)
+
+        XCTAssertEqual(fake.launches.first, ["tunnel", "--url", "http://localhost:18000"])
+        XCTAssertEqual(tunnel.mode, .quick)
+        XCTAssertNil(tunnel.publicURL, "quick-tunnel URL only arrives via stderr")
+    }
+
+    /// Named-tunnel mode: a config.yml is present, so run it and show the
+    /// hostname the config declares. This is the mac-mini's actual shape —
+    /// radio.jonasjohansson.se comes from config.yml, not from stderr.
+    @MainActor
+    func testNamedTunnelRunsConfigAndSurfacesHostname() async {
+        let fake = FakeLauncher()
+        let tunnel = CloudflareTunnel(
+            launcher: fake.launcher(),
+            environment: Self.fakeEnvironment(
+                named: true,
+                hostname: URL(string: "https://radio.jonasjohansson.se")
+            ),
+            restartDelayOverride: 0
+        )
+        await tunnel.start(forwardingTo: 18_000)
+
+        XCTAssertEqual(fake.launches.first, ["tunnel", "run"])
+        XCTAssertEqual(tunnel.mode, .named)
+        XCTAssertEqual(tunnel.publicURL?.absoluteString, "https://radio.jonasjohansson.se")
+    }
+
+    /// A config.yml with no `hostname:` line is a real case — run the
+    /// named tunnel anyway, just without a URL to show.
+    @MainActor
+    func testNamedTunnelWithoutHostnameStillRuns() async {
+        let fake = FakeLauncher()
+        let tunnel = CloudflareTunnel(
+            launcher: fake.launcher(),
+            environment: Self.fakeEnvironment(named: true, hostname: nil),
+            restartDelayOverride: 0
+        )
+        await tunnel.start(forwardingTo: 18_000)
+
+        XCTAssertEqual(fake.launches.first, ["tunnel", "run"])
+        XCTAssertEqual(tunnel.mode, .named)
+        XCTAssertNil(tunnel.publicURL)
+    }
+
     // MARK: - URL extraction
 
     func testExtractPublicURLFromBannerLine() {
