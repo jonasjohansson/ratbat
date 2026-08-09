@@ -44,6 +44,62 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertNil(radio.streamURL(for: station))
     }
 
+    // MARK: - Test runs must not touch the production tunnel
+
+    #if os(macOS)
+    /// Running the suite used to spawn real `cloudflared` processes.
+    ///
+    /// `startBroadcast` bootstraps the tunnel unconditionally, and
+    /// `namedTunnelConfigured()` is true on this machine because
+    /// `~/.cloudflared/config.yml` exists — so every broadcasting test
+    /// connected another instance to the *production* named tunnel for
+    /// radio.jonasjohansson.se. A single suite run left eight of them
+    /// alive after it finished:
+    ///
+    ///     15376  05:46  /opt/homebrew/bin/cloudflared tunnel run
+    ///     15438  04:42  /opt/homebrew/bin/cloudflared tunnel run
+    ///     …
+    ///
+    /// The default must be "don't publish" whenever we're under XCTest.
+    @MainActor
+    func testTestRunsDoNotPublishPublicly() {
+        XCTAssertTrue(
+            RadioBroadcaster.isRunningUnderXCTest,
+            "test detection must work, or the guard below is vacuous"
+        )
+        let radio = RadioBroadcaster(port: 18_040)
+        XCTAssertFalse(
+            radio.publishesPublicly,
+            "a broadcaster built inside a test must not open the public tunnel"
+        )
+    }
+
+    /// Belt and braces: with publishing off, actually broadcasting a
+    /// station must leave the tunnel idle.
+    @MainActor
+    func testBroadcastWithPublishingDisabledLeavesTunnelIdle() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let radio = RadioBroadcaster(port: 18_041, publishesPublicly: false)
+        let station = Station(name: "No Publish", kind: .playlist(queue: tracks))
+        await radio.startBroadcast(station: station)
+        defer { radio.stopAll() }
+
+        try await Task.sleep(nanoseconds: 600_000_000)
+
+        XCTAssertFalse(radio.tunnel.isRunning, "tunnel must stay down when publishing is disabled")
+        XCTAssertEqual(radio.tunnel.mode, .idle)
+    }
+
+    /// The explicit opt-in still works, so production behaviour is intact.
+    @MainActor
+    func testPublishesPubliclyCanBeForcedOn() {
+        let radio = RadioBroadcaster(port: 18_042, publishesPublicly: true)
+        XCTAssertTrue(radio.publishesPublicly)
+    }
+    #endif
+
     // MARK: - ♥ like endpoint
 
     /// Preflight bails 404 when the broadcaster has no pipeline for the
