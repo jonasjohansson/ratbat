@@ -94,6 +94,25 @@ public final class RadioBroadcaster: ObservableObject {
     public let tunnel: CloudflareTunnel = CloudflareTunnel()
     #endif
 
+    /// Whether starting a station may open the public tunnel.
+    ///
+    /// Defaults to `false` under XCTest. `namedTunnelConfigured()` only
+    /// checks that `~/.cloudflared/config.yml` exists, so on the mac-mini
+    /// every broadcasting test used to spawn a real `cloudflared tunnel
+    /// run` against the *production* hostname and orphan it — eight live
+    /// connectors after one suite run, all competing for the same named
+    /// tunnel as the actual radio.
+    public let publishesPublicly: Bool
+
+    /// True when the process is hosting an XCTest bundle.
+    ///
+    /// `XCTestConfigurationFilePath` is set by the test runner for both
+    /// `xcodebuild test` and Xcode's test action, and is absent in a
+    /// normally-launched app.
+    nonisolated public static var isRunningUnderXCTest: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+    }
+
     // MARK: - Config
 
     private let port: NWEndpoint.Port
@@ -189,10 +208,11 @@ public final class RadioBroadcaster: ObservableObject {
     /// tests that need deterministic ports without trampling the
     /// user-facing preferences — production callers should prefer
     /// ``init(preferences:downloadService:nts:history:)``.
-    public init(port: UInt16 = 18000) {
+    public init(port: UInt16 = 18000, publishesPublicly: Bool? = nil) {
         // Force-unwrap: NWEndpoint.Port(rawValue:) only returns nil for 0.
         self.port = NWEndpoint.Port(rawValue: port) ?? .any
         self.preferences = BroadcastPreferences.shared
+        self.publishesPublicly = publishesPublicly ?? !Self.isRunningUnderXCTest
         #if os(macOS)
         self.downloadService = nil
         self.nts = nil
@@ -219,9 +239,11 @@ public final class RadioBroadcaster: ObservableObject {
         nts: NTSClient? = nil,
         history: HistoryStore? = nil,
         libraryConfig: LibraryConfig? = nil,
-        tasteProfile: TasteProfile? = nil
+        tasteProfile: TasteProfile? = nil,
+        publishesPublicly: Bool? = nil
     ) {
         self.preferences = preferences
+        self.publishesPublicly = publishesPublicly ?? !Self.isRunningUnderXCTest
         let raw = UInt16(clamping: preferences.port)
         self.port = NWEndpoint.Port(rawValue: raw) ?? .any
         self.downloadService = downloadService
@@ -236,8 +258,9 @@ public final class RadioBroadcaster: ObservableObject {
     #else
     /// iOS flavour keeps the tighter surface area — no NTS / tunnel / venv
     /// wiring on that platform today.
-    public init(preferences: BroadcastPreferences) {
+    public init(preferences: BroadcastPreferences, publishesPublicly: Bool? = nil) {
         self.preferences = preferences
+        self.publishesPublicly = publishesPublicly ?? !Self.isRunningUnderXCTest
         let raw = UInt16(clamping: preferences.port)
         self.port = NWEndpoint.Port(rawValue: raw) ?? .any
         subscribeToPreferences()
@@ -634,7 +657,7 @@ public final class RadioBroadcaster: ObservableObject {
         #if os(macOS)
         // First-station bootstrap for the tunnel. `CloudflareTunnel.start`
         // is idempotent, but gating on count avoids spurious log churn.
-        if broadcasting.count == 1 {
+        if broadcasting.count == 1, publishesPublicly {
             let tunnelPort = port.rawValue
             Task { [weak self] in
                 await self?.tunnel.start(forwardingTo: tunnelPort)
