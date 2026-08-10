@@ -355,7 +355,30 @@ public final class RadioBroadcaster: ObservableObject {
             #else
             let recorder: (@Sendable (String, String, URL) async -> Int64?)? = nil
             #endif
-            let source = PlaylistSource(tracks: queue, recordPlay: recorder)
+            // Second closure, same reason as `recorder` above: the
+            // exclusion rows have to reach the macOS-only store from a
+            // cross-platform actor.
+            #if os(macOS)
+            let exclusionRecorder: (@Sendable ([SelectionExclusionRecord]) async -> Void)?
+            if let store = history {
+                exclusionRecorder = { (rows: [SelectionExclusionRecord]) async -> Void in
+                    try? await store.recordExclusions(
+                        rows.map(HistoryStore.ExclusionInput.init),
+                        stationID: stationID
+                    )
+                }
+            } else {
+                exclusionRecorder = nil
+            }
+            #else
+            let exclusionRecorder: (@Sendable ([SelectionExclusionRecord]) async -> Void)? = nil
+            #endif
+            let source = PlaylistSource(
+                tracks: queue,
+                recordPlay: recorder,
+                selectionPolicy: selectionPolicyProvider(),
+                recordExclusions: exclusionRecorder
+            )
             await startBroadcast(station: station, source: source)
 
         case .nts(let config):
@@ -386,6 +409,26 @@ public final class RadioBroadcaster: ObservableObject {
             await startBroadcast(station: station, source: source)
         #endif
         }
+    }
+
+    /// A LIVE read of the selection policy, for a station actor to call.
+    ///
+    /// Note what this deliberately is NOT: a value. Every other preference
+    /// that crosses into the pipeline is snapshotted at broadcast start —
+    /// see the bitrate/sampleRate comment in `startBroadcast(station:source:)`
+    /// and `lastFMClientIfAvailable`'s "takes effect on the next broadcast
+    /// start". Doing that here would freeze both dials for the whole
+    /// broadcast, and `selectionPolicy` deliberately does not tick
+    /// `revision`, so there would be no "needs restart" nag to tell the
+    /// owner why nothing happened. This closure re-reads `preferences` on
+    /// every call instead, and the controllers call it at every refill.
+    ///
+    /// Captures the INJECTED `preferences`, not `BroadcastPreferences.shared`,
+    /// so a test that injects its own object is driving the thing it
+    /// configured.
+    private func selectionPolicyProvider() -> @Sendable () async -> SelectionPolicy {
+        let prefs = preferences
+        return { await MainActor.run { prefs.selectionPolicy } }
     }
 
     #if os(macOS)
@@ -453,7 +496,8 @@ public final class RadioBroadcaster: ObservableObject {
             lastFM: lastFM,
             history: history,
             resolver: resolver,
-            tasteProfile: profile
+            tasteProfile: profile,
+            selectionPolicy: selectionPolicyProvider()
         )
         return NTSSource(controller: controller)
     }
@@ -537,7 +581,8 @@ public final class RadioBroadcaster: ObservableObject {
             musicBrainz: musicBrainz,
             history: history,
             resolver: resolver,
-            tasteProfile: profile
+            tasteProfile: profile,
+            selectionPolicy: selectionPolicyProvider()
         )
         return LastFMSource(controller: controller)
     }
@@ -602,7 +647,8 @@ public final class RadioBroadcaster: ObservableObject {
             musicBrainz: musicBrainz,
             history: history,
             resolver: resolver,
-            tasteProfile: profile
+            tasteProfile: profile,
+            selectionPolicy: selectionPolicyProvider()
         )
         return BandcampSource(controller: controller)
     }

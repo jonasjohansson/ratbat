@@ -13,6 +13,37 @@ public struct BandcampRelease: Sendable, Hashable {
     public let title: String
     public let releaseURL: URL
     public let releaseDate: Date?
+
+    /// Length of the release's FEATURED TRACK, from the discover listing.
+    ///
+    /// Read the name literally. This is one track's length, and for an
+    /// album candidate — which is what the discover endpoint overwhelmingly
+    /// returns; all 48 items of the `bandcamp-discover-techno` fixture are
+    /// `type: "a"` — the thing this station plays is the RELEASE, and
+    /// `title` above is the release title. So a mix-set exclusion driven by
+    /// this number removes a whole release on the strength of one track.
+    /// Four of those 48 fixture items exceed the 20-minute threshold on the
+    /// featured track alone.
+    ///
+    /// That is why the exclusion log stamps `duration_source` as
+    /// `listing-featured-track` and not `listing`: the reader has to be
+    /// able to tell what was actually measured from what was actually
+    /// dropped.
+    public let featuredTrackDurationSeconds: TimeInterval?
+
+    public init(
+        artist: String,
+        title: String,
+        releaseURL: URL,
+        releaseDate: Date?,
+        featuredTrackDurationSeconds: TimeInterval? = nil
+    ) {
+        self.artist = artist
+        self.title = title
+        self.releaseURL = releaseURL
+        self.releaseDate = releaseDate
+        self.featuredTrackDurationSeconds = featuredTrackDurationSeconds
+    }
 }
 
 /// Thin wrapper around Bandcamp's private `/api/discover/3/get_web` JSON
@@ -100,13 +131,21 @@ public actor BandcampClient {
                 let secondaryText: String?
                 let publishDate: String?
                 let urlHints: URLHints?
+                let featuredTrack: FeaturedTrack?
                 enum CodingKeys: String, CodingKey {
                     case type
                     case primaryText = "primary_text"
                     case secondaryText = "secondary_text"
                     case publishDate = "publish_date"
                     case urlHints = "url_hints"
+                    case featuredTrack = "featured_track"
                 }
+            }
+            /// The one track the discover listing previews. Optional
+            /// throughout: absent items must decode, not fail the page.
+            struct FeaturedTrack: Decodable {
+                let duration: Double?
+                let title: String?
             }
             struct URLHints: Decodable {
                 let subdomain: String?
@@ -166,7 +205,15 @@ public actor BandcampClient {
             guard let url = URL(string: urlString) else { return nil }
 
             let date: Date? = item.publishDate.flatMap { dateFormatter.date(from: $0) }
-            return BandcampRelease(artist: artist, title: title, releaseURL: url, releaseDate: date)
+            return BandcampRelease(
+                artist: artist,
+                title: title,
+                releaseURL: url,
+                releaseDate: date,
+                // Carried, not consumed, here — see the field's own doc for
+                // what this number does and does not measure.
+                featuredTrackDurationSeconds: item.featuredTrack?.duration
+            )
         }
 
         if let rawCount = env.items?.count, releases.count < rawCount {

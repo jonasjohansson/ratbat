@@ -115,6 +115,29 @@ public actor TasteProfile {
         return snapshot.libraryArtists[key] != nil
     }
 
+    /// Every library artist as a ``SelectionOrdering/artistKey`` — trimmed
+    /// AND lowercased. Fetched once per pool refill so the new-vs-owned
+    /// dial costs one actor hop instead of one per candidate.
+    ///
+    /// A NEW accessor rather than a tweak to ``libraryContainsArtist(_:)``,
+    /// on purpose. That one matches on a trimmed but NOT lowercased key,
+    /// and it has two other callers: ``score(candidateArtist:candidateTags:stationID:history:exploration:)``'s
+    /// `libraryMatch` term — 25% of the blended score every generative
+    /// station's stage 8 sorts on — and `FacetedPipeline.applyExclusions`,
+    /// the "exclude my library" facet. Making it case-insensitive would
+    /// silently re-rank every generative station, so it is left alone.
+    ///
+    /// The consequence is that this set legitimately matches MORE artists
+    /// than ``libraryContainsArtist(_:)`` does: a candidate billed as
+    /// "aphex twin" counts as owned here and not there. That divergence is
+    /// intended, not a bug. It exists so ownership matching, the phase
+    /// counters and this index all run on one key rule and cannot drift
+    /// apart — which is the failure the dial would show up as a wrong
+    /// realised ratio.
+    public func ownedArtistKeys() -> Set<String> {
+        Set(snapshot.libraryArtists.keys.map { SelectionOrdering.artistKey($0) })
+    }
+
     // MARK: - Blended scoring (library + per-station behavior)
 
     #if os(macOS)

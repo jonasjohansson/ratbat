@@ -82,8 +82,37 @@ public actor BandcampStationController {
     private let tasteProfile: TasteProfile
     private let logger = Logger(subsystem: "se.jonasjohansson.ratbat", category: "bandcamp-station")
 
+    /// `source_kind` stamped on this station's exclusion rows.
+    private static let sourceKind = "bandcamp"
+
+    /// What ``BandcampRelease/featuredTrackDurationSeconds`` reported for a
+    /// candidate. A side table rather than a new field on
+    /// ``SourceCandidate``: that type is shared with the Last.fm and NTS
+    /// controllers, neither of which has a duration to put in it.
+    /// Rebuilt on each refill.
+    private var durationByCandidate: [DedupKey: TimeInterval] = [:]
+
+    /// Live read of the listener's two dials. A provider, not a value:
+    /// ``BroadcastPreferences`` is `@MainActor` and this is an actor, and a
+    /// policy snapshotted at construction would be frozen for the whole
+    /// broadcast. Re-read at every pool refill.
+    private let selectionPolicy: @Sendable () async -> SelectionPolicy
+
     private var pool: [SourceCandidate] = []
     private var cursor: Int = 0
+
+    /// The policy the current ``pool`` was built under, so a dial that has
+    /// not moved cannot trigger a re-filter.
+    private var poolPolicy: SelectionPolicy?
+
+    /// Owned-artist keys captured at the last refill — read by both the
+    /// dial's ordering and the phase counters, so the two cannot disagree.
+    private var ownedArtistKeys: Set<String> = []
+
+    /// Plays realised on this station, carried into the next refill so
+    /// candidates rejected after ordering self-correct rather than drift.
+    private var playedNew = 0
+    private var playedTotal = 0
 
     /// Reservation ratio: what fraction of the pool is unscored wildcards
     /// vs taste-sorted top picks. Matches ``LastFMStationController`` so
@@ -97,7 +126,8 @@ public actor BandcampStationController {
         musicBrainz: MusicBrainzClient,
         history: HistoryStore,
         resolver: TrackResolver,
-        tasteProfile: TasteProfile
+        tasteProfile: TasteProfile,
+        selectionPolicy: @escaping @Sendable () async -> SelectionPolicy = { .default }
     ) {
         self.config = config
         self.client = client
@@ -105,6 +135,7 @@ public actor BandcampStationController {
         self.history = history
         self.resolver = resolver
         self.tasteProfile = tasteProfile
+        self.selectionPolicy = selectionPolicy
     }
 
     // MARK: - Public
@@ -116,6 +147,11 @@ public actor BandcampStationController {
     /// transient resolver failures, refills the pool when empty, caps
     /// the retry loop at `maxAttempts` so a bad stretch can't hang.
     public func nextTrack() async throws -> ResolvedTrack {
+        // A dial moved since this pool was built? Re-choose from what is
+        // left instead of waiting for the pool to drain — a Bandcamp pool
+        // is the deepest of the three and can take a long time to turn over.
+        await reapplyPolicyIfChanged()
+
         let maxAttempts = 30
         var attempts = 0
 
@@ -167,6 +203,13 @@ public actor BandcampStationController {
                     cachedPath: resolution.cachedURL.path
                 )
                 logger.info("resolved \(candidate.artist, privacy: .public) — \(candidate.title, privacy: .public)")
+                // Irreversible commit point: this track is about to play,
+                // so it counts toward the dial's realised ratio. Same owned
+                // key set the ordering used.
+                playedTotal += 1
+                if !ownedArtistKeys.contains(SelectionOrdering.artistKey(candidate.artist)) {
+                    playedNew += 1
+                }
                 return ResolvedTrack(
                     artist: candidate.artist,
                     title: candidate.title,
@@ -221,9 +264,11 @@ public actor BandcampStationController {
         // order so "newest first" stays deterministic.
         var seeds: [SeedRecord] = []
         var seedIndex: [DedupKey: Int] = [:]
+        durationByCandidate.removeAll(keepingCapacity: true)
         for tag in config.query.genreTags {
             do {
                 let releases = try await client.releases(forTag: tag, sort: config.sort)
+                indexDurations(releases)
                 let tagLower = tag.lowercased()
                 for r in releases {
                     let key = DedupKey(artist: r.artist.lowercased(), title: r.title.lowercased())
@@ -333,6 +378,7 @@ public actor BandcampStationController {
         if scored.isEmpty {
             pool = []
             cursor = 0
+            poolPolicy = nil
             throw Error.noTracksForTags(config.query.genreTags)
         }
 
@@ -342,6 +388,7 @@ public actor BandcampStationController {
         // "newest first", so we ship newest first. True mixes a top /
         // wildcard interleave plus a soft in-window shuffle so the
         // station doesn't always lead with the same top-scored pick.
+        let ranked: [SourceCandidate]
         if config.shufflePool {
             let wildcardCount = max(1, Int(Double(scored.count) * wildcardFraction))
             let topCount = max(scored.count - wildcardCount, 0)
@@ -349,17 +396,129 @@ public actor BandcampStationController {
             var wildcardSlice = Array(scored.suffix(wildcardCount)).map { $0.cand }
             wildcardSlice.shuffle()
 
-            pool = interleave(topSlice, wildcardSlice)
-            pool = softShuffle(pool, window: 4)
-            cursor = 0
-            logger.info("stage9 pool ready: \(self.pool.count) candidates (wildcards: \(wildcardCount))")
+            ranked = softShuffle(interleave(topSlice, wildcardSlice), window: 4)
+            logger.info("stage9 ranked: \(ranked.count) candidates (wildcards: \(wildcardCount))")
         } else {
             // Temporal mode: keep the scrape order intact. Skip blacklist
             // already applied via stage 8's score-filter.
-            pool = scored.map { $0.cand }
-            cursor = 0
-            logger.info("stage9 pool ready: \(self.pool.count) candidates (order preserved)")
+            ranked = scored.map { $0.cand }
+            logger.info("stage9 ranked: \(ranked.count) candidates (order preserved)")
         }
+
+        // Stage 10: the listener's two dials, applied while the pool is
+        // being BUILT rather than after a track has already been chosen.
+        await applySelectionPolicy(to: ranked)
+    }
+
+    // MARK: - Selection policy (stage 10)
+
+    private func applySelectionPolicy(to ranked: [SourceCandidate]) async {
+        let policy = await selectionPolicy()
+        // ONE actor hop per refill, not one await per candidate.
+        ownedArtistKeys = await tasteProfile.ownedArtistKeys()
+
+        let plan = SelectionPlanner.plan(
+            ranked.map { SelectionInput(candidate: $0, subject: selectionSubject(for: $0)) },
+            policy: policy,
+            phase: (new: playedNew, total: playedTotal),
+            sourceKind: Self.sourceKind,
+            ownedArtistKeys: ownedArtistKeys,
+            subject: { $0.subject }
+        )
+
+        pool = plan.ordered.map(\.candidate)
+        cursor = 0
+        // Set at the END of the refill, not only in the re-filter branch:
+        // a stale value makes the next nextTrack() re-filter a pool that
+        // was just built and double-count hit_count on every candidate.
+        poolPolicy = policy
+        logger.info("stage10 policy: \(self.pool.count) candidates (exclusions: \(plan.exclusions.count), shortfall: \(plan.shortfall))")
+        await record(plan.exclusions)
+    }
+
+    /// Re-applies the policy to the UNPLAYED remainder when a dial moved
+    /// since this pool was built. No-op when it did not.
+    private func reapplyPolicyIfChanged() async {
+        guard let built = poolPolicy, cursor < pool.count else { return }
+        let policy = await selectionPolicy()
+        guard built != policy else { return }
+
+        let remainder = Array(pool[cursor...])
+        let plan = SelectionPlanner.plan(
+            remainder.map { SelectionInput(candidate: $0, subject: selectionSubject(for: $0)) },
+            policy: policy,
+            phase: (new: playedNew, total: playedTotal),
+            sourceKind: Self.sourceKind,
+            ownedArtistKeys: ownedArtistKeys,
+            subject: { $0.subject }
+        )
+        pool = Array(pool[..<cursor]) + plan.ordered.map(\.candidate)
+        poolPolicy = policy
+        logger.info("policy changed mid-pool: \(remainder.count) → \(plan.ordered.count) remaining")
+        await record(plan.exclusions)
+    }
+
+    /// Index the featured-track durations the discover listing reported.
+    private func indexDurations(_ releases: [BandcampRelease]) {
+        for r in releases {
+            guard let seconds = r.featuredTrackDurationSeconds else { continue }
+            durationByCandidate[
+                DedupKey(artist: r.artist.lowercased(), title: r.title.lowercased())
+            ] = seconds
+        }
+    }
+
+    /// What the mix-set rule gets to see about a candidate.
+    ///
+    /// The duration here is the length of the release's FEATURED TRACK, and
+    /// the candidate is the release. Those are not the same thing: the
+    /// discover endpoint returns albums almost exclusively (48/48 items of
+    /// the `bandcamp-discover-techno` fixture are `type: "a"`), the title
+    /// this station plays is the release title, and 4 of those 48 exceed
+    /// the 20-minute threshold on the featured track alone. So when this
+    /// arm fires it removes a whole release on the strength of one track's
+    /// length. That is a real, unmitigated over-reach — this arm is not
+    /// conservative and must not be described as such.
+    ///
+    /// `duration_source` is `listing-featured-track`, never `listing`, so
+    /// a reader of the audit log can tell what was measured apart from what
+    /// was dropped.
+    private func selectionSubject(for candidate: SourceCandidate) -> SelectionSubject {
+        let key = DedupKey(
+            artist: candidate.artist.lowercased(),
+            title: candidate.title.lowercased()
+        )
+        let seconds = durationByCandidate[key]
+        return SelectionSubject(
+            artist: candidate.artist,
+            title: candidate.title,
+            durationSeconds: seconds,
+            durationSource: seconds == nil ? nil : "listing-featured-track",
+            sourceURL: candidate.resolvedURL
+        )
+    }
+
+    private func record(_ rows: [SelectionExclusionRecord]) async {
+        guard !rows.isEmpty else { return }
+        do {
+            try await history.recordExclusions(
+                rows.map(HistoryStore.ExclusionInput.init),
+                stationID: config.id
+            )
+        } catch {
+            // Best-effort: the audit log must never take the station down.
+            logger.error("failed to record selection exclusions: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    // MARK: - Test seams
+
+    internal func indexDurationsForTesting(_ releases: [BandcampRelease]) {
+        indexDurations(releases)
+    }
+
+    internal func selectionSubjectForTesting(_ candidate: SourceCandidate) -> SelectionSubject {
+        selectionSubject(for: candidate)
     }
 
     // MARK: - Helpers
