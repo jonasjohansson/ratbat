@@ -677,10 +677,25 @@ public final class RadioBroadcaster: ObservableObject {
         stopBroadcast(stationID: stationID, forgetLive: true)
     }
 
+    /// Teardown for a pipeline whose encode loop ended on its own — the
+    /// source ran dry, or hit an error it could not continue past.
+    ///
+    /// Distinct from ``stopBroadcast(stationID:)`` in exactly one way: it
+    /// keeps the station's "was live" record, so the next launch resumes it.
+    /// Running dry is a supply problem, not the owner's decision, and the two
+    /// must not look the same after a restart. Exists as a named seam rather
+    /// than an inline `forgetLive: false` so the distinction is testable.
+    func stopBroadcastRanDry(stationID: Station.ID) {
+        stopBroadcast(stationID: stationID, forgetLive: false)
+    }
+
     /// `forgetLive: false` is the shutdown path — ``stopAll()`` tears
     /// pipelines down without erasing the "was live" record, so the next
     /// launch resumes them. A user stopping ONE station is intent; an app
-    /// stopping ALL of them is lifecycle.
+    /// stopping ALL of them is lifecycle. A station that runs dry is
+    /// lifecycle too, not intent: the encode loop's own unwind goes through
+    /// ``stopBroadcastRanDry(stationID:)`` so starvation cannot quietly
+    /// delete a station.
     private func stopBroadcast(stationID: Station.ID, forgetLive: Bool) {
         guard let pipeline = pipelines[stationID] else { return }
         if forgetLive {
@@ -2618,7 +2633,17 @@ public final class RadioBroadcaster: ObservableObject {
                 // cancellation-driven exit has already mutated the state
                 // from the main actor, so this is a no-op in that case.
                 if owner.broadcasting.contains(stationID) {
-                    owner.stopBroadcast(stationID: stationID)
+                    // Running dry is not the owner saying "stop". Reaching
+                    // here means the loop exited on its own; a deliberate
+                    // stop has already cleared `broadcasting`, so the guard
+                    // above is false and this never fires for one. Forgetting
+                    // the slug here would delete the station's live intent,
+                    // and since `RootView` resumes from
+                    // `autoStartSlugs ∪ lastLiveSlugs` once per launch, a
+                    // station that starved overnight would be silently gone
+                    // after the next restart — indistinguishable from the
+                    // owner having turned it off.
+                    owner.stopBroadcastRanDry(stationID: stationID)
                 }
             }
         }
