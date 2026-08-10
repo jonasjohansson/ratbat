@@ -79,6 +79,18 @@ public final class BroadcastPreferences: ObservableObject {
     @AppStorage("ratbat.lastfm.apiKey")
     public var lastFMAPIKey: String = ""
 
+    /// Target share of plays that should be music the owner does not already
+    /// own, in [0, 1]. See ``SelectionPolicy`` for the exact meaning — it is a
+    /// deterministic ratio over plays, not a per-track probability.
+    @AppStorage("ratbat.selection.newMusicShare")
+    private var newMusicShareRaw: Double = 0.7
+
+    /// Whether to drop candidates that ``MixSetRule`` classifies as mix sets.
+    /// Ships off: it removes music, and the shadow records written while it is
+    /// off are what let the owner see what it *would* remove before enabling it.
+    @AppStorage("ratbat.selection.excludeMixSets")
+    private var excludeMixSetsRaw: Bool = false
+
     /// Slugs of stations to broadcast automatically at launch. Slugs, not
     /// ``Station/ID``s: stations persist next to the library and sync
     /// across machines via the shared drive, while preferences are
@@ -122,6 +134,33 @@ public final class BroadcastPreferences: ObservableObject {
         set {
             sampleRateRaw = newValue.rawValue
             revision &+= 1
+        }
+    }
+
+    /// The two listener preferences as one value, for handing across the
+    /// actor boundary into the selection pipeline.
+    ///
+    /// Does NOT tick ``revision``: both settings take effect at the next pool
+    /// refill, so changing them must not raise the "needs restart" nag the way
+    /// quality/port do. A station picks the change up on its own.
+    public var selectionPolicy: SelectionPolicy {
+        get {
+            SelectionPolicy(
+                newMusicShare: newMusicShareRaw,
+                excludeMixSets: excludeMixSetsRaw,
+                mixSetMinimumDuration: MixSetRule.defaultMinimumDuration
+            )
+        }
+        set {
+            // Read back through the clamping initialiser rather than storing
+            // the caller's value directly.
+            let clamped = SelectionPolicy(
+                newMusicShare: newValue.newMusicShare,
+                excludeMixSets: newValue.excludeMixSets,
+                mixSetMinimumDuration: newValue.mixSetMinimumDuration
+            )
+            newMusicShareRaw = clamped.newMusicShare
+            excludeMixSetsRaw = clamped.excludeMixSets
         }
     }
 
@@ -210,6 +249,16 @@ public final class BroadcastPreferences: ObservableObject {
         defaults.removeObject(forKey: "ratbat.broadcast.autoStartSlugs")
         defaults.removeObject(forKey: "ratbat.broadcast.ownerToken")
         defaults.removeObject(forKey: "ratbat.broadcast.lastLiveSlugs")
+        defaults.removeObject(forKey: "ratbat.selection.newMusicShare")
+        defaults.removeObject(forKey: "ratbat.selection.excludeMixSets")
+        // Removing the key is enough for the String-backed settings above, but
+        // not for these two: this instance's `@AppStorage` wrappers keep
+        // serving the last value they wrote, so a removal alone leaves
+        // `selectionPolicy` reading back whatever the previous caller set.
+        // Assign the defaults through the wrappers so the reset is observable
+        // on `self`, which is what callers (and the tests) actually check.
+        newMusicShareRaw = SelectionPolicy.default.newMusicShare
+        excludeMixSetsRaw = SelectionPolicy.default.excludeMixSets
         revision &+= 1
     }
 }

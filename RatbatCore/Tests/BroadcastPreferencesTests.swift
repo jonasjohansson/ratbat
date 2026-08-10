@@ -86,6 +86,47 @@ final class BroadcastPreferencesTests: XCTestCase {
         }
     }
 
+    func testSelectionPolicyDefaults() {
+        let p = BroadcastPreferences.shared.selectionPolicy
+        XCTAssertEqual(p.newMusicShare, 0.7, accuracy: 0.0001)
+        XCTAssertFalse(p.excludeMixSets)
+    }
+
+    func testSelectionPolicyRoundTrips() {
+        let prefs = BroadcastPreferences.shared
+        prefs.selectionPolicy = SelectionPolicy(newMusicShare: 0.25, excludeMixSets: true)
+        XCTAssertEqual(prefs.selectionPolicy.newMusicShare, 0.25, accuracy: 0.0001)
+        XCTAssertTrue(prefs.selectionPolicy.excludeMixSets)
+        XCTAssertEqual(
+            UserDefaults.standard.double(forKey: "ratbat.selection.newMusicShare"),
+            0.25, accuracy: 0.0001
+        )
+    }
+
+    func testSelectionPolicyClampsOutOfRangeShare() {
+        let prefs = BroadcastPreferences.shared
+        prefs.selectionPolicy = SelectionPolicy(newMusicShare: 9)
+        XCTAssertEqual(prefs.selectionPolicy.newMusicShare, 1.0, accuracy: 0.0001)
+    }
+
+    /// Both settings take effect at the next pool refill, so neither may raise
+    /// the "needs restart" nag — a listener should not be interrupted to change
+    /// how much new music they hear.
+    func testSelectionPolicyDoesNotTickRevision() {
+        let prefs = BroadcastPreferences.shared
+        let before = prefs.revision
+        prefs.selectionPolicy = SelectionPolicy(newMusicShare: 0.1, excludeMixSets: true)
+        XCTAssertEqual(prefs.revision, before)
+    }
+
+    func testResetToDefaultsClearsSelectionPolicy() {
+        let prefs = BroadcastPreferences.shared
+        prefs.selectionPolicy = SelectionPolicy(newMusicShare: 0.1, excludeMixSets: true)
+        prefs.resetToDefaults()
+        XCTAssertEqual(prefs.selectionPolicy.newMusicShare, 0.7, accuracy: 0.0001)
+        XCTAssertFalse(prefs.selectionPolicy.excludeMixSets)
+    }
+
     func testAutoStartSlugsDefaultsEmpty() {
         XCTAssertEqual(BroadcastPreferences().autoStartSlugs, [])
     }
