@@ -429,6 +429,49 @@ final class RadioBroadcasterTests: XCTestCase {
         )
     }
 
+    /// A station that runs dry must keep its "was live" record, so the next
+    /// launch resumes it. Erasing it makes starvation permanent across a
+    /// restart and indistinguishable from the owner having stopped the
+    /// station deliberately.
+    ///
+    /// SCOPE OF THIS TEST, stated plainly: it exercises the *seam* — that the
+    /// non-deliberate teardown preserves `lastLiveSlugs` while a deliberate
+    /// stop clears it. It does NOT drive a real source exhaustion end to end;
+    /// `startBroadcast` builds the source from `station.kind` with no
+    /// injection point for a source that returns nil, and a playlist source
+    /// loops forever by design. The uncovered ground is the encode loop's
+    /// `guard let item = nextItem else { break }` actually being reached.
+    @MainActor
+    func testRunningDryKeepsTheStationResumable() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let prefs = BroadcastPreferences()
+        prefs.port = 18_046
+        defer {
+            prefs.port = 18_000
+            prefs.lastLiveSlugs = []
+        }
+        prefs.lastLiveSlugs = []
+        let radio = RadioBroadcaster(preferences: prefs)
+        let station = Station(name: "Starve Test", kind: .playlist(queue: tracks))
+
+        await radio.startBroadcast(station: station)
+        XCTAssertEqual(prefs.lastLiveSlugs, [station.slug], "start remembers")
+
+        // The teardown the encode-loop unwind now uses.
+        radio.stopBroadcastRanDry(stationID: station.id)
+        XCTAssertEqual(
+            prefs.lastLiveSlugs, [station.slug],
+            "a station that stopped on its own must still be resumable"
+        )
+
+        // Contrast: the owner stopping it IS intent, and must still forget.
+        await radio.startBroadcast(station: station)
+        radio.stopBroadcast(stationID: station.id)
+        XCTAssertEqual(prefs.lastLiveSlugs, [], "a deliberate stop still forgets")
+    }
+
     // MARK: - Boost + un-♥ (keep vs steer)
 
     /// The signal-model arc on an owned track: ♥ records affinity, un-♥
