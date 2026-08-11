@@ -39,7 +39,56 @@ public actor TrackResolver {
         case noYouTubeMatch(artist: String, title: String)
         case downloadFailed(String)
         case notConfigured(String)      // prefs / paths etc.
+        case timedOut(seconds: Int)
     }
+
+    // MARK: - The subprocess boundary
+
+    /// One invocation of the external resolver.
+    public struct Invocation: Sendable {
+        public let executable: URL
+        public let arguments: [String]
+
+        public init(executable: URL, arguments: [String]) {
+            self.executable = executable
+            self.arguments = arguments
+        }
+
+        /// Value of `--output`, i.e. where the resolver was told to put the
+        /// audio file. Handy for test doubles, which have to honour that
+        /// contract for the caller's "file actually landed" check to pass.
+        public var outputPath: String? {
+            guard let i = arguments.firstIndex(of: "--output"),
+                  arguments.index(after: i) < arguments.endIndex
+            else { return nil }
+            return arguments[arguments.index(after: i)]
+        }
+    }
+
+    /// What the external resolver reported back.
+    public struct Output: Sendable {
+        public let stdout: Data
+        public let stderr: Data
+        public let exitCode: Int32
+
+        public init(stdout: Data, stderr: Data, exitCode: Int32) {
+            self.stdout = stdout
+            self.stderr = stderr
+            self.exitCode = exitCode
+        }
+    }
+
+    /// How the resolver reaches the outside world.
+    ///
+    /// Injectable so tests can exercise argument construction, exit-code
+    /// handling and JSON parsing without spawning anything — the logic in
+    /// ``runResolver(artist:title:sourceURL:)`` is the part worth testing,
+    /// and a real subprocess only adds a dependency on the host having a
+    /// shell, a writable temp dir and a scheduler that cooperates.
+    ///
+    /// Implementations must respect `timeout` and throw ``Error/timedOut(seconds:)``
+    /// rather than blocking indefinitely.
+    public typealias Runner = @Sendable (Invocation, Duration) async throws -> Output
 
     /// Base cache dir. Transient — safe to nuke anytime.
     public let cacheRoot: URL
@@ -53,19 +102,32 @@ public actor TrackResolver {
     /// from this transient cache.
     public let cacheCapBytes: Int64
 
+    /// Hard ceiling on a single resolve. A search-and-download of one track
+    /// is normally seconds; anything past this is yt-dlp wedged on a stalled
+    /// socket or a host that never answers. Station controllers `await` this
+    /// call inside their next-track loop, so an unbounded resolve is not a
+    /// slow resolve — it is a station that never plays another track and
+    /// never says why.
+    public let timeout: Duration
+
     private let venvPython: URL
     private let wrapperScript: URL
+    private let runner: Runner
     private let logger = Logger(subsystem: "se.jonasjohansson.ratbat", category: "resolver")
 
     public init(
         venvPython: URL,
         wrapperScript: URL,
         cacheRoot: URL? = nil,
-        cacheCapBytes: Int64 = 10 * 1024 * 1024 * 1024
+        cacheCapBytes: Int64 = 10 * 1024 * 1024 * 1024,
+        timeout: Duration = .seconds(300),
+        runner: @escaping Runner = TrackResolver.spawnSubprocess
     ) throws {
         self.venvPython = venvPython
         self.wrapperScript = wrapperScript
         self.cacheCapBytes = cacheCapBytes
+        self.timeout = timeout
+        self.runner = runner
 
         let root: URL
         if let cacheRoot {
@@ -148,30 +210,24 @@ public actor TrackResolver {
             arguments.append(contentsOf: ["--source-url", sourceURL.absoluteString])
         }
 
-        let proc = Process()
-        proc.executableURL = venvPython
-        proc.arguments = arguments
-
-        let outPipe = Pipe()
-        let errPipe = Pipe()
-        proc.standardOutput = outPipe
-        proc.standardError = errPipe
-
+        let invocation = Invocation(executable: venvPython, arguments: arguments)
+        let output: Output
         do {
-            try proc.run()
+            output = try await runner(invocation, timeout)
+        } catch let error as Error {
+            // Timeouts and spawn failures both land here. The partial file,
+            // if any, is ours to clean up — nobody downstream knows about it.
+            try? FileManager.default.removeItem(at: outURL)
+            logger.error("resolve failed for \(artist, privacy: .public) — \(title, privacy: .public): \(String(describing: error), privacy: .public)")
+            throw error
         } catch {
-            throw Error.downloadFailed("failed to spawn resolver: \(error.localizedDescription)")
+            try? FileManager.default.removeItem(at: outURL)
+            throw Error.downloadFailed("resolver invocation failed: \(error.localizedDescription)")
         }
 
-        // Drain both pipes concurrently; waitUntilExit() alone can deadlock
-        // if the child fills a pipe buffer before we read it.
-        async let stdoutData = readAll(pipe: outPipe)
-        async let stderrData = readAll(pipe: errPipe)
-        let (outData, errData) = await (stdoutData, stderrData)
-        proc.waitUntilExit()
-
-        let exit = proc.terminationStatus
-        let errMsg = String(data: errData, encoding: .utf8)?
+        let outData = output.stdout
+        let exit = output.exitCode
+        let errMsg = String(data: output.stderr, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
         guard exit == 0 else {
@@ -308,14 +364,151 @@ public actor TrackResolver {
         }
     }
 
-    // MARK: - Private
+    // MARK: - The real runner
 
-    private nonisolated func readAll(pipe: Pipe) async -> Data {
-        await withCheckedContinuation { (cont: CheckedContinuation<Data, Never>) in
-            // readDataToEndOfFile is blocking; hop off the actor/caller thread.
-            DispatchQueue.global(qos: .utility).async {
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                cont.resume(returning: data)
+    /// Spawns the wrapper under the venv Python and captures its output,
+    /// bounded by `timeout`.
+    ///
+    /// Two things here are deliberate, and both replace code that hung:
+    ///
+    /// 1. **No `Process.waitUntilExit()`.** That call services the *calling
+    ///    thread's* run loop while it waits. Under Swift concurrency the
+    ///    thread that resumes after an `await` is not necessarily the one
+    ///    that called `run()`, so `waitUntilExit()` could end up spinning a
+    ///    run loop that will never be told the child died — a permanent
+    ///    hang, roughly one invocation in thirty on a busy machine. It also
+    ///    blocks a cooperative-pool thread, which is never allowed. We wait
+    ///    on `terminationHandler` instead, which is delivered by libdispatch
+    ///    and has no thread affinity.
+    ///
+    /// 2. **Files, not pipes, for stdout/stderr.** A pipe wedges the child
+    ///    once ~64 KB is unread, so pipes oblige you to run a concurrent
+    ///    reader per stream and to get that right; a file never blocks the
+    ///    writer and can be read once the child is gone. yt-dlp is chatty on
+    ///    stderr, so this is not hypothetical.
+    public static let spawnSubprocess: Runner = { invocation, timeout in
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ratbat-resolver-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+
+        let stdoutURL = scratch.appendingPathComponent("stdout")
+        let stderrURL = scratch.appendingPathComponent("stderr")
+        FileManager.default.createFile(atPath: stdoutURL.path, contents: nil)
+        FileManager.default.createFile(atPath: stderrURL.path, contents: nil)
+        let stdoutHandle = try FileHandle(forWritingTo: stdoutURL)
+        let stderrHandle = try FileHandle(forWritingTo: stderrURL)
+        defer {
+            try? stdoutHandle.close()
+            try? stderrHandle.close()
+        }
+
+        let proc = Process()
+        proc.executableURL = invocation.executable
+        proc.arguments = invocation.arguments
+        proc.standardOutput = stdoutHandle
+        proc.standardError = stderrHandle
+        // Never let the resolver inherit a terminal and block on a prompt.
+        proc.standardInput = FileHandle.nullDevice
+
+        // Wire the termination handler *before* run(): a fast-exiting child
+        // can be gone before the next line executes, and ProcessWatch is
+        // built to absorb that ordering.
+        let watch = ProcessWatch()
+        proc.terminationHandler = { finished in watch.complete(finished.terminationStatus) }
+
+        do {
+            try proc.run()
+        } catch {
+            throw Error.downloadFailed("failed to spawn resolver: \(error.localizedDescription)")
+        }
+
+        // SIGTERM first so yt-dlp gets to clean up its `.part` files, then
+        // SIGKILL for a child that ignores it. Signalling by pid rather than
+        // holding onto `proc`, which is not Sendable and so can't cross into
+        // the watchdog task.
+        let pid = proc.processIdentifier
+        let watchdog = Task { [watch] in
+            try await Task.sleep(for: timeout)
+            guard !watch.hasExited else { return }
+            watch.markTimedOut()
+            kill(pid, SIGTERM)
+            try await Task.sleep(for: .seconds(5))
+            if !watch.hasExited { kill(pid, SIGKILL) }
+        }
+
+        let exitCode = await watch.exitStatus()
+        watchdog.cancel()
+
+        // Close our write ends before reading so nothing is still in flight.
+        try? stdoutHandle.close()
+        try? stderrHandle.close()
+
+        if watch.timedOut {
+            throw Error.timedOut(seconds: Int(timeout.components.seconds))
+        }
+
+        return Output(
+            stdout: (try? Data(contentsOf: stdoutURL)) ?? Data(),
+            stderr: (try? Data(contentsOf: stderrURL)) ?? Data(),
+            exitCode: exitCode
+        )
+    }
+}
+
+/// One-shot bridge from `Process.terminationHandler` — a callback that may
+/// fire on any queue, possibly before anyone is awaiting it — into a single
+/// `await`, plus the watchdog's verdict on whether we killed the child.
+///
+/// Hand-locked rather than an actor because `terminationHandler` is a
+/// synchronous non-isolated callback and cannot `await` its way in.
+private final class ProcessWatch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var status: Int32?
+    private var waiter: CheckedContinuation<Int32, Never>?
+    private var killedByWatchdog = false
+
+    var timedOut: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return killedByWatchdog
+    }
+
+    var hasExited: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return status != nil
+    }
+
+    func markTimedOut() {
+        lock.lock()
+        killedByWatchdog = true
+        lock.unlock()
+    }
+
+    /// Idempotent: a process can only exit once, but be defensive about it.
+    func complete(_ value: Int32) {
+        lock.lock()
+        guard status == nil else {
+            lock.unlock()
+            return
+        }
+        status = value
+        let waiter = self.waiter
+        self.waiter = nil
+        lock.unlock()
+        waiter?.resume(returning: value)
+    }
+
+    func exitStatus() async -> Int32 {
+        await withCheckedContinuation { (cont: CheckedContinuation<Int32, Never>) in
+            lock.lock()
+            if let status {
+                lock.unlock()
+                cont.resume(returning: status)
+            } else {
+                waiter = cont
+                lock.unlock()
             }
         }
     }
