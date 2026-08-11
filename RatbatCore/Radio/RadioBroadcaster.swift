@@ -2492,8 +2492,13 @@ public final class RadioBroadcaster: ObservableObject {
                 try c.encode(stationID, forKey: .stationID)
                 try c.encode(station, forKey: .station)
                 try c.encode(saved, forKey: .saved)
-                try c.encodeIfPresent(youtubeURL, forKey: .youtubeURL)
-                try c.encodeIfPresent(sourceURL, forKey: .sourceURL)
+                // Explicit nulls, like every other field here. These two
+                // were the last `encodeIfPresent` on the wire, so a
+                // Bandcamp row (no YouTube match) and a Last.fm row (no
+                // source page) each came back missing a different key —
+                // the same shape complaint /now.json was fixed for.
+                try c.encode(youtubeURL, forKey: .youtubeURL)
+                try c.encode(sourceURL, forKey: .sourceURL)
             }
         }
         struct HistoryResponse: Encodable {
