@@ -43,18 +43,6 @@ public struct AddBandcampStationView: View {
     /// default so the sheet mirrors what a minimal config would persist.
     @State private var sort: BandcampClient.Sort = .date
 
-    /// Curated palette leaning into scenes where Bandcamp's long tail
-    /// actually lives — the microgenres with active tag feeds but
-    /// effectively no presence in Last.fm's chart-weighted vocabulary.
-    /// Clustered loosely by vibe so the picker reads as a tour of the
-    /// site's niches rather than an alphabetical list.
-    private static let availableTags: [String] = [
-        "techno", "house", "ambient", "dungeon synth",
-        "vaporwave", "hyperpop", "drone", "dub techno",
-        "outsider house", "idm", "breakcore", "footwork",
-        "witch house", "hauntology", "slowcore", "shoegaze",
-        "post-rock", "field recording", "lo-fi", "experimental"
-    ]
 
     public init(stations: StationManager) {
         self.stations = stations
@@ -76,7 +64,7 @@ public struct AddBandcampStationView: View {
                     .textFieldStyle(.roundedBorder)
             }
 
-            FacetedQueryEditor(query: $query, palette: Self.availableTags)
+            FacetedQueryEditor(query: $query, palette: StationTagPalette.bandcamp)
 
             DisclosureGroup("Bandcamp filters") {
                 VStack(alignment: .leading, spacing: 10) {

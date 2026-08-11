@@ -30,19 +30,6 @@ public struct AddNTSStationView: View {
     /// struct — SwiftUI re-renders whenever any field mutates.
     @State private var query = FacetedQuery(genreTags: [])
 
-    /// Curated list of common NTS genre/mood tags. Sourced from a quick
-    /// pass through what the NTS API actually returns — a later task
-    /// may replace this with a live-fetched list. Passed into the
-    /// shared ``FacetedQueryEditor`` as its `palette`.
-    private static let availableTags: [String] = [
-        "ambient", "electronic", "techno", "house",
-        "jazz", "experimental", "hip hop", "ECM",
-        "new age", "downtempo", "drum and bass",
-        "soul", "funk", "disco", "post-punk",
-        "minimal", "drone", "dub", "global",
-        "field recordings", "lo-fi", "piano",
-        "classical", "modern classical", "noise"
-    ]
 
     public init(stations: StationManager) {
         self.stations = stations
@@ -64,7 +51,7 @@ public struct AddNTSStationView: View {
                     .textFieldStyle(.roundedBorder)
             }
 
-            FacetedQueryEditor(query: $query, palette: Self.availableTags)
+            FacetedQueryEditor(query: $query, palette: StationTagPalette.nts)
 
             DisclosureGroup("NTS filters") {
                 VStack(alignment: .leading, spacing: 10) {

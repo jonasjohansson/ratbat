@@ -36,22 +36,6 @@ public struct AddLastFMStationView: View {
     /// ``LastFMStationConfig/exploration``; gentle comfort lean by default.
     @State private var exploration: Double = 0.25
 
-    /// Curated list of popular Last.fm tags. Ordered by rough popularity
-    /// and clustered loosely by vibe so the picker reads as a genre
-    /// palette rather than an alphabetical phone book. Passed into the
-    /// shared ``FacetedQueryEditor`` as its `palette`.
-    private static let availableTags: [String] = [
-        "techno", "house", "deep house", "minimal",
-        "ambient", "drone", "downtempo", "trip hop",
-        "jazz", "jazz fusion", "soul", "funk",
-        "disco", "krautrock", "psychedelic",
-        "experimental", "electronic", "idm",
-        "drum and bass", "dubstep", "dub",
-        "hip hop", "new wave", "post-punk",
-        "indie", "shoegaze", "dream pop",
-        "classical", "modern classical", "piano",
-        "1970s", "1980s", "1990s", "2000s", "2010s", "2020s"
-    ]
 
     public init(stations: StationManager, preferences: BroadcastPreferences) {
         self.stations = stations
@@ -87,7 +71,7 @@ public struct AddLastFMStationView: View {
                     .textFieldStyle(.roundedBorder)
             }
 
-            FacetedQueryEditor(query: $query, palette: Self.availableTags)
+            FacetedQueryEditor(query: $query, palette: StationTagPalette.lastFM)
 
             DisclosureGroup("Last.fm filters") {
                 VStack(alignment: .leading, spacing: 10) {

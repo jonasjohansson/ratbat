@@ -91,6 +91,68 @@ public final class StationManager: ObservableObject {
         persist()
     }
 
+    /// Replace a generative station's faceted query, in place.
+    ///
+    /// The station keeps its `id`, and so does its config — which matters
+    /// more than it looks: the config id is the key ``HistoryStore`` uses
+    /// for per-station dedup, skips, saves and taste affinity. Before this
+    /// existed, "same station, different genres" meant delete + recreate,
+    /// which minted a fresh UUID and left every play the station had ever
+    /// recorded pointing at a station that no longer exists.
+    ///
+    /// The pool is not rebuilt here. ``StationManager`` owns the catalogue,
+    /// not the broadcast; a live station picks the new facets up when its
+    /// pipeline is rebuilt — see ``RadioBroadcaster/restartBroadcast(station:)``,
+    /// which the caller invokes deliberately so the restart is never a
+    /// surprise mid-track.
+    ///
+    /// Returns the updated station, or `nil` when the id is unknown or the
+    /// station is playlist-backed — a fixed queue has no query to edit, and
+    /// answering `nil` says so instead of looking like a successful no-op.
+    @discardableResult
+    public func updateQuery(_ id: Station.ID, to query: FacetedQuery) -> Station? {
+        guard let index = stations.firstIndex(where: { $0.id == id }) else { return nil }
+        switch stations[index].kind {
+        case .playlist:
+            return nil
+        case .nts(var config):
+            config.query = query
+            stations[index].kind = .nts(config: config)
+        case .lastFM(var config):
+            config.query = query
+            stations[index].kind = .lastFM(config: config)
+        #if os(macOS)
+        case .bandcamp(var config):
+            config.query = query
+            stations[index].kind = .bandcamp(config: config)
+        #endif
+        }
+        persist()
+        return stations[index]
+    }
+
+    #if os(macOS)
+    /// Change a Bandcamp station's sort dimension in place.
+    ///
+    /// Lives outside ``updateQuery(_:to:)`` because `sort` isn't part of
+    /// the shared ``FacetedQuery`` — it's the one knob only Bandcamp has.
+    /// It's editable for the same reason the query is: the add sheet
+    /// offers it, so editing shouldn't be able to do less than creating.
+    ///
+    /// Returns `nil` for an unknown id or a non-Bandcamp station.
+    @discardableResult
+    public func updateBandcampSort(
+        _ id: Station.ID, to sort: BandcampClient.Sort
+    ) -> Station? {
+        guard let index = stations.firstIndex(where: { $0.id == id }),
+              case .bandcamp(var config) = stations[index].kind else { return nil }
+        config.sort = sort
+        stations[index].kind = .bandcamp(config: config)
+        persist()
+        return stations[index]
+    }
+    #endif
+
     /// Remove a station. No-op if the id isn't found.
     public func delete(_ id: Station.ID) {
         guard let index = stations.firstIndex(where: { $0.id == id }) else { return }

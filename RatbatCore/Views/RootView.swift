@@ -45,6 +45,11 @@ public struct RootView: View {
     @State private var showingAddNTSStation: Bool = false
     @State private var showingAddLastFMStation: Bool = false
     @State private var showingAddBandcampStation: Bool = false
+    /// Station whose facets the user is editing, if any. Holds the id
+    /// rather than the value so the sheet always renders the CURRENT
+    /// station — a rename or edit that lands while the sheet is open
+    /// shouldn't leave it editing a stale copy.
+    @State private var editingStation: EditTarget?
     /// Owned by the view so it lives as long as the window does. Held as
     /// optional `@State` because we can't `@StateObject` a non-
     /// `ObservableObject`, and we want to construct it *after* `player`
@@ -129,6 +134,14 @@ public struct RootView: View {
                     }
                     .sheet(isPresented: $showingAddBandcampStation) {
                         AddBandcampStationView(stations: stations)
+                    }
+                    // Editing a generative station's tags. `item:` rather
+                    // than `isPresented:` so the sheet can't be raised
+                    // without a station to edit. The body is a separate
+                    // method — inlining it pushed this already-large view
+                    // past what the type-checker will chew through.
+                    .sheet(item: $editingStation) { target in
+                        editStationSheet(for: target.id)
                     }
                     // Task id includes `reloadNonce` so a "Reload Library"
                     // action in Preferences re-fires the scan even when the
@@ -361,6 +374,19 @@ public struct RootView: View {
         }
     }
 
+    /// Sheet body for ``editingStation``. Renders nothing when the id no
+    /// longer resolves (the station was deleted from another window) or
+    /// when it resolves to a playlist station, which has no facets —
+    /// ``EditStationView``'s failable init is what says so.
+    @ViewBuilder private func editStationSheet(for id: Station.ID) -> some View {
+        if let station = stations.stations.first(where: { $0.id == id }),
+           let editor = EditStationView(
+               station: station, stations: stations, radio: radio
+           ) {
+            editor
+        }
+    }
+
     @ViewBuilder private var detailView: some View {
         if libraryVM.isLoading {
             VStack(spacing: 10) {
@@ -412,7 +438,8 @@ public struct RootView: View {
                             await radio.startBroadcast(station: ntsStation.0)
                         }
                     }
-                }
+                },
+                onEdit: { editingStation = EditTarget(id: ntsStation.0.id) }
             )
         } else if let lastFMStation = resolvedLastFMStation {
             LastFMStationDetailView(
@@ -427,7 +454,8 @@ public struct RootView: View {
                             await radio.startBroadcast(station: lastFMStation.0)
                         }
                     }
-                }
+                },
+                onEdit: { editingStation = EditTarget(id: lastFMStation.0.id) }
             )
         } else if let bandcampStation = resolvedBandcampStation {
             BandcampStationDetailView(
@@ -442,7 +470,8 @@ public struct RootView: View {
                             await radio.startBroadcast(station: bandcampStation.0)
                         }
                     }
-                }
+                },
+                onEdit: { editingStation = EditTarget(id: bandcampStation.0.id) }
             )
         } else if let playlist = resolvedDetailPlaylist {
             LibraryView(playlist: playlist) { tracks, startIndex in
@@ -521,6 +550,12 @@ public struct RootView: View {
             return libraryVM.selectedPlaylist
         }
     }
+}
+
+/// `Identifiable` wrapper so a station id can drive `.sheet(item:)`.
+/// `Station.ID` is a bare `UUID`, which isn't `Identifiable` on its own.
+private struct EditTarget: Identifiable {
+    let id: Station.ID
 }
 
 /// Composite id for the library-load `.task`: re-fires when the folder
