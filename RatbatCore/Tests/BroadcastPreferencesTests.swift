@@ -201,4 +201,64 @@ final class BroadcastPreferencesTests: XCTestCase {
             "needsRestart should stay false when no stations are live"
         )
     }
+
+    // MARK: - Owner passcode
+
+    /// The owner key is settable so it can be a passcode a human can
+    /// remember, not just the UUID generated on first use.
+    func testOwnerTokenIsSettable() {
+        let prefs = BroadcastPreferences()
+        prefs.resetToDefaults()
+        let generated = prefs.ownerToken
+        XCTAssertFalse(generated.isEmpty)
+
+        prefs.ownerToken = "a-chosen-passcode"
+        XCTAssertEqual(prefs.ownerToken, "a-chosen-passcode")
+        XCTAssertNotEqual(prefs.ownerToken, generated)
+        XCTAssertTrue(prefs.isOwner(token: "a-chosen-passcode"))
+        XCTAssertFalse(prefs.isOwner(token: generated))
+    }
+
+    /// Surrounding whitespace is stripped on the way in. A passcode pasted
+    /// out of a note drags a newline along and would otherwise be stored
+    /// as a key nobody can type.
+    func testOwnerTokenTrimsWhitespaceWhenStored() {
+        let prefs = BroadcastPreferences()
+        prefs.resetToDefaults()
+        prefs.ownerToken = "  spaced-passcode\n"
+        XCTAssertEqual(prefs.ownerToken, "spaced-passcode")
+    }
+
+    /// Blanking the passcode means "issue a new random one", never "no key
+    /// at all" — an empty key would reject every request and read as the
+    /// owner buttons being broken.
+    func testBlankingOwnerTokenIssuesAFreshRandomKey() {
+        let prefs = BroadcastPreferences()
+        prefs.resetToDefaults()
+        prefs.ownerToken = "temporary"
+        prefs.ownerToken = "   "
+        XCTAssertFalse(prefs.ownerToken.isEmpty)
+        XCTAssertNotEqual(prefs.ownerToken, "temporary")
+        XCTAssertFalse(prefs.isOwner(token: ""))
+        XCTAssertFalse(prefs.isOwner(token: nil))
+    }
+
+    /// The passcode is typed by hand now, so the comparison tolerates the
+    /// two things human typing reliably adds: a capital first letter from
+    /// a phone keyboard, and stray surrounding whitespace.
+    func testIsOwnerToleratesCaseAndWhitespaceOnTheWire() {
+        let prefs = BroadcastPreferences()
+        prefs.resetToDefaults()
+        prefs.ownerToken = "correct-horse"
+
+        XCTAssertTrue(prefs.isOwner(token: "correct-horse"))
+        XCTAssertTrue(prefs.isOwner(token: "Correct-Horse"))
+        XCTAssertTrue(prefs.isOwner(token: "CORRECT-HORSE"))
+        XCTAssertTrue(prefs.isOwner(token: "  correct-horse  "))
+        XCTAssertTrue(prefs.isOwner(token: "\tcorrect-horse\n"))
+
+        XCTAssertFalse(prefs.isOwner(token: "correct-horse-battery"))
+        XCTAssertFalse(prefs.isOwner(token: "correcthorse"))
+        XCTAssertFalse(prefs.isOwner(token: "wrong"))
+    }
 }

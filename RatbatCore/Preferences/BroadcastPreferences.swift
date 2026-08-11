@@ -178,18 +178,41 @@ public final class BroadcastPreferences: ObservableObject {
 
     /// The owner token, generating one on first access. Does not tick
     /// ``revision`` — the token never affects a running pipeline.
+    ///
+    /// Settable so the owner can choose a memorable passcode in
+    /// Settings → Broadcast instead of ferrying a UUID between devices.
+    /// Assigning blank means "issue me a fresh random one", not "no key":
+    /// an empty token would make ``isOwner(token:)`` reject everything,
+    /// which reads as "the buttons broke", not as a security posture.
     public var ownerToken: String {
-        if ownerTokenRaw.isEmpty {
-            ownerTokenRaw = UUID().uuidString.lowercased()
+        get {
+            if ownerTokenRaw.isEmpty {
+                ownerTokenRaw = UUID().uuidString.lowercased()
+            }
+            return ownerTokenRaw
         }
-        return ownerTokenRaw
+        set {
+            let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            ownerTokenRaw = trimmed.isEmpty ? UUID().uuidString.lowercased() : trimmed
+        }
     }
 
-    /// Constant-time-ish check is overkill here (UUID guessing over a
-    /// rate-limited home tunnel isn't the threat model); plain equality.
+    /// Whitespace- and case-insensitive comparison against the stored key.
+    ///
+    /// Both tolerances are there because the key is now typed by a human
+    /// rather than pasted from a URL: a phone keyboard capitalises the
+    /// first letter unprompted, and a passcode copied out of a note tends
+    /// to carry a trailing newline. Either one produces "it says wrong and
+    /// I can't see why", which is the exact failure this is meant to avoid.
+    /// Folding case costs a few bits against an attacker who is already
+    /// throttled (see `RadioBroadcaster.ownerGate`) and who would be
+    /// guessing a shared passcode over a home tunnel; the trade is
+    /// deliberate. Constant-time comparison is overkill for the same reason.
     public func isOwner(token: String?) -> Bool {
-        guard let token, !token.isEmpty else { return false }
-        return token == ownerToken
+        guard let token else { return false }
+        let candidate = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !candidate.isEmpty else { return false }
+        return candidate.compare(ownerToken, options: .caseInsensitive) == .orderedSame
     }
 
     /// Add or remove `slug` from the auto-start list. Idempotent in both

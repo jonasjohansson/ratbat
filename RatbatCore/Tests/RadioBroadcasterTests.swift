@@ -548,6 +548,10 @@ final class RadioBroadcasterTests: XCTestCase {
     @MainActor
     func testActionsRejectGuestsWith403() async throws {
         let radio = RadioBroadcaster(port: 18_041)
+        // This test deliberately fails the gate nine times in a row, which
+        // the failed-attempt throttle would answer with ~10s of accumulated
+        // delay. The throttle has its own tests; here it is just drag.
+        radio.ownerThrottleStep = 0
         defer { radio.stopAll() }
         for token in [nil, "", "wrong-token"] as [String?] {
             let (likeStatus, likeBody) = await radio.performLikeAsync(stationID: UUID(), token: token)
@@ -1369,5 +1373,93 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertEqual(data.count, capacity)
         XCTAssertEqual(data.first, UInt8(2048 & 0xFF))
         XCTAssertEqual(data.last, UInt8((total - 1) & 0xFF))
+    }
+
+    // MARK: - Owner passcode: /auth and the failed-attempt throttle
+
+    /// `/auth` answers 200 for the owner and 403 for everyone else, and
+    /// changes nothing either way — the web player's unlock prompt needs
+    /// to test a passcode without ♥-ing a track to find out.
+    @MainActor
+    func testAuthValidatesPasscodeWithoutSideEffects() async {
+        let prefs = BroadcastPreferences()
+        prefs.resetToDefaults()
+        prefs.ownerToken = "test-passcode"
+        let radio = RadioBroadcaster(preferences: prefs)
+        radio.ownerThrottleStep = 0
+        defer { radio.stopAll() }
+
+        let (ok, okBody) = await radio.performAuthAsync(token: "test-passcode")
+        XCTAssertEqual(ok, 200)
+        XCTAssertTrue(String(data: okBody, encoding: .utf8)!.contains("ok"))
+
+        for bad in [nil, "", "  ", "nope"] as [String?] {
+            let (status, body) = await radio.performAuthAsync(token: bad)
+            XCTAssertEqual(status, 403, "auth with token \(bad ?? "nil")")
+            XCTAssertTrue(String(data: body, encoding: .utf8)!.contains("listener mode"))
+        }
+
+        // Nothing was started, nothing was consumed: /auth is inert.
+        XCTAssertTrue(radio.broadcasting.isEmpty)
+        XCTAssertTrue(radio.currentItemByStation.isEmpty)
+    }
+
+    /// Wrong passcodes get progressively slower; the right one never does.
+    /// The property that matters is that a stranger hammering the endpoint
+    /// cannot lock the owner out — success is not rate limited and clears
+    /// the count.
+    @MainActor
+    func testRepeatedWrongPasscodesAreThrottledButOwnerIsNot() async {
+        let prefs = BroadcastPreferences()
+        prefs.resetToDefaults()
+        prefs.ownerToken = "test-passcode"
+        let radio = RadioBroadcaster(preferences: prefs)
+        radio.ownerFreeAttempts = 2
+        radio.ownerThrottleStep = 0.2
+        radio.ownerThrottleCeiling = 1
+        defer { radio.stopAll() }
+
+        // The first `ownerFreeAttempts` failures are not delayed.
+        let freeStart = Date()
+        for _ in 0..<2 { _ = await radio.performAuthAsync(token: "nope") }
+        XCTAssertLessThan(Date().timeIntervalSince(freeStart), 0.2)
+
+        // The next two are (0.2s then 0.4s).
+        let throttledStart = Date()
+        for _ in 0..<2 { _ = await radio.performAuthAsync(token: "nope") }
+        let throttled = Date().timeIntervalSince(throttledStart)
+        XCTAssertGreaterThan(throttled, 0.5, "wrong passcodes should be slowed")
+
+        // The owner is let straight through despite the failures ahead of
+        // them, and that success resets the penalty for the next attempt.
+        let ownerStart = Date()
+        let (status, _) = await radio.performAuthAsync(token: "test-passcode")
+        let ownerElapsed = Date().timeIntervalSince(ownerStart)
+        XCTAssertEqual(status, 200)
+        XCTAssertLessThan(ownerElapsed, 0.2, "the owner must never be throttled")
+        XCTAssertEqual(radio.failedOwnerAttempts, 0)
+    }
+
+    /// The throttle guards the action endpoints too, not just `/auth` —
+    /// they share one gate, so a guesser cannot dodge it by hammering
+    /// `/like` instead.
+    @MainActor
+    func testActionEndpointsShareTheOwnerThrottle() async {
+        let prefs = BroadcastPreferences()
+        prefs.resetToDefaults()
+        prefs.ownerToken = "test-passcode"
+        let radio = RadioBroadcaster(preferences: prefs)
+        radio.ownerThrottleStep = 0
+        defer { radio.stopAll() }
+
+        _ = await radio.performLikeAsync(stationID: UUID(), token: "nope")
+        _ = await radio.performSkipAsync(stationID: UUID(), token: "nope")
+        XCTAssertEqual(radio.failedOwnerAttempts, 2)
+
+        // A valid passcode resets the shared count even though the station
+        // itself is bogus (the gate runs before the station lookup).
+        let (status, _) = await radio.performSkipAsync(stationID: UUID(), token: "test-passcode")
+        XCTAssertEqual(status, 404, "valid passcode gets past the gate to a real 404")
+        XCTAssertEqual(radio.failedOwnerAttempts, 0)
     }
 }

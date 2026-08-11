@@ -118,6 +118,15 @@ public final class RadioBroadcaster: ObservableObject {
     private let port: NWEndpoint.Port
     private let preferences: BroadcastPreferences
     private var preferencesSubscription: AnyCancellable?
+
+    /// Failed-attempt throttle state for ``ownerGate(_:)``. The three
+    /// knobs are `var`s rather than constants only so the tests that
+    /// deliberately hammer the guest path can zero the delay and stay
+    /// fast — production never assigns them.
+    private(set) var failedOwnerAttempts = 0
+    var ownerFreeAttempts = 3
+    var ownerThrottleStep: TimeInterval = 0.5
+    var ownerThrottleCeiling: TimeInterval = 5
     private let logger = Logger(
         subsystem: "se.jonasjohansson.ratbat",
         category: "broadcaster"
@@ -946,6 +955,10 @@ public final class RadioBroadcaster: ObservableObject {
             await self?.buildHistoryPayload(path: path)
                 ?? Data("{\"entries\":[]}".utf8)
         }
+        let authHandler: @Sendable (String?) async -> (Int, Data) = { [weak self] token in
+            await self?.performAuthAsync(token: token)
+                ?? (500, Data("{\"status\":\"error\",\"message\":\"no broadcaster\"}".utf8))
+        }
         let likeHandler: @Sendable (UUID, String?) async -> (Int, Data) = { [weak self] stationID, token in
             // Hop to the main actor to resolve the pipeline snapshot,
             // then do the copy + history mark off-main without pinning
@@ -993,13 +1006,36 @@ public final class RadioBroadcaster: ObservableObject {
 
             // CORS preflight for the action POSTs — browsers send OPTIONS
             // before the real POST because we use Content-Type: application/json.
-            if method == "OPTIONS" && (path == "/like" || path == "/skip" || path == "/next" || path == "/boost" || path == "/unlike") {
+            if method == "OPTIONS" && (path == "/auth" || path == "/like" || path == "/skip" || path == "/next" || path == "/boost" || path == "/unlike") {
                 _ = await Self.send(
                     data: Self.buildHTTPResponse(
                         status: 204,
                         headers: Self.corsHeaders(),
                         body: Data()
                     ),
+                    on: connection
+                )
+                connection.cancel()
+                return
+            }
+
+            // Passcode check for the web player's unlock prompt. Answers
+            // 200 or 403 and changes nothing either way, so the prompt can
+            // tell the owner they mistyped without ♥-ing a track to find
+            // out. Shares the throttle with the action endpoints.
+            if method == "POST" && path == "/auth" {
+                let contentLength = Self.contentLength(from: headerBytes) ?? 0
+                let body = await Self.readBody(
+                    connection: connection,
+                    alreadyRead: Self.bodyBytes(after: headerBytes),
+                    expected: contentLength
+                )
+                let token = (try? JSONDecoder().decode(AuthRequest.self, from: body))?.token
+                let (status, payload) = await authHandler(token)
+                var headers = Self.corsHeaders()
+                headers["Content-Type"] = "application/json"
+                _ = await Self.send(
+                    data: Self.buildHTTPResponse(status: status, headers: headers, body: payload),
                     on: connection
                 )
                 connection.cancel()
@@ -1583,6 +1619,13 @@ public final class RadioBroadcaster: ObservableObject {
 
     // MARK: - ♥ Save flow
 
+    /// JSON body accepted by `POST /auth` — just the candidate passcode.
+    /// Optional so a malformed or empty body decodes to "no token" and
+    /// takes the ordinary rejection path instead of a 400.
+    struct AuthRequest: Decodable {
+        let token: String?
+    }
+
     /// JSON body accepted by `POST /like`. Kept internal to the broadcaster
     /// since no caller outside this file assembles one manually.
     struct LikeRequest: Decodable {
@@ -1626,6 +1669,54 @@ public final class RadioBroadcaster: ObservableObject {
         case ready(LikeSnapshot)
         case affinity(station: UUID, artist: String, title: String, path: String, existingID: Int64?)
         case early(Int, Data)
+    }
+
+    /// Rejection payload for guest requests. 403, not 401: there is no
+    /// browser-negotiated login to attempt — the public surface is
+    /// listen-only by design, and the web player unlocks itself out of
+    /// band via `POST /auth`.
+    private static func guestRejection() -> (Int, Data) {
+        (403, Data("{\"status\":\"error\",\"message\":\"listener mode\"}".utf8))
+    }
+
+    /// Owner gate for every action endpoint: `nil` means "this is the
+    /// owner, carry on", anything else is the ready-made rejection.
+    ///
+    /// Consecutive failures buy a growing delay. Two properties matter:
+    ///
+    /// 1. Only REJECTIONS are delayed, and a success resets the count.
+    ///    A stranger hammering the endpoint therefore cannot lock the
+    ///    owner out — the right passcode still answers immediately.
+    /// 2. The counter is global rather than per-client on purpose. Every
+    ///    request reaches us through cloudflared from localhost, so
+    ///    per-IP buckets would all be the same bucket; pretending
+    ///    otherwise would be accounting theatre.
+    ///
+    /// This became worth having when the key stopped being a 122-bit UUID
+    /// and became a passcode a human can remember and type.
+    func ownerGate(_ token: String?) async -> (Int, Data)? {
+        guard preferences.isOwner(token: token) else {
+            failedOwnerAttempts += 1
+            let over = Double(failedOwnerAttempts - ownerFreeAttempts)
+            if over > 0 {
+                let delay = min(over * ownerThrottleStep, ownerThrottleCeiling)
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+            return Self.guestRejection()
+        }
+        failedOwnerAttempts = 0
+        return nil
+    }
+
+    /// Answer whether a passcode is the owner's, with no side effect.
+    ///
+    /// Exists so the web player's unlock prompt can say "wrong passcode"
+    /// without having to ♥ or skip something to find out. Before this the
+    /// only way to test a key was to perform an action, which is a side
+    /// effect nobody asked for and which lands in the play history.
+    func performAuthAsync(token: String?) async -> (Int, Data) {
+        if let rejection = await ownerGate(token) { return rejection }
+        return (200, Data("{\"status\":\"ok\"}".utf8))
     }
 
     /// Main-actor pre-flight: resolve everything the save needs into a
@@ -1700,14 +1791,8 @@ public final class RadioBroadcaster: ObservableObject {
     ///    profile too. Wire status: "noted".
     /// 3. Otherwise: file copy + `history.markSaved` off the main actor.
     ///    Wire status: "saved".
-    /// Rejection payload for guest requests. 403, not 401: there is no
-    /// login to attempt — the public surface is listen-only by design.
-    private static func guestRejection() -> (Int, Data) {
-        (403, Data("{\"status\":\"error\",\"message\":\"listener mode\"}".utf8))
-    }
-
     func performLikeAsync(stationID: UUID, token: String?) async -> (Int, Data) {
-        guard preferences.isOwner(token: token) else { return Self.guestRejection() }
+        if let rejection = await ownerGate(token) { return rejection }
         let snapshot: LikeSnapshot
         switch likePreflight(stationID: stationID) {
         case .early(let status, let data):
@@ -1789,7 +1874,7 @@ public final class RadioBroadcaster: ObservableObject {
     /// playlist track with no historyID), 200 on success — mirroring the
     /// shape `/like` returns.
     func performSkipAsync(stationID: UUID, token: String?) async -> (Int, Data) {
-        guard preferences.isOwner(token: token) else { return Self.guestRejection() }
+        if let rejection = await ownerGate(token) { return rejection }
         guard pipelines[stationID] != nil,
               let item = currentItemByStation[stationID],
               item.historyID != nil else {
@@ -1805,7 +1890,7 @@ public final class RadioBroadcaster: ObservableObject {
     /// no history row, which is exactly why 👎 refuses them — a neutral
     /// advance records nothing, so it has nothing to refuse).
     func performNextAsync(stationID: UUID, token: String?) async -> (Int, Data) {
-        guard preferences.isOwner(token: token) else { return Self.guestRejection() }
+        if let rejection = await ownerGate(token) { return rejection }
         guard pipelines[stationID] != nil,
               currentItemByStation[stationID] != nil else {
             return (404, Data("{\"status\":\"error\",\"message\":\"no current track\"}".utf8))
@@ -1829,7 +1914,7 @@ public final class RadioBroadcaster: ObservableObject {
     /// tracks get the normal copy, unless the transient cache's LRU cap
     /// already evicted the file — then 410, honestly gone.
     func performRetroLikeAsync(stationID: UUID, entryID: String, token: String?) async -> (Int, Data) {
-        guard preferences.isOwner(token: token) else { return Self.guestRejection() }
+        if let rejection = await ownerGate(token) { return rejection }
         guard let uuid = UUID(uuidString: entryID),
               let rec = (recentByStation[stationID] ?? []).first(where: { $0.entryID == uuid }) else {
             return (404, Self.encodeLikeResponse(LikeResponse(
@@ -1914,7 +1999,7 @@ public final class RadioBroadcaster: ObservableObject {
     /// scoring term weighted above ♥-saves. No refill is forced: the next
     /// natural refill steers, which also debounces rapid boosts for free.
     func performBoostAsync(stationID: UUID, token: String?) async -> (Int, Data) {
-        guard preferences.isOwner(token: token) else { return Self.guestRejection() }
+        if let rejection = await ownerGate(token) { return rejection }
         guard pipelines[stationID] != nil,
               let item = currentItemByStation[stationID] else {
             return (404, Data("{\"status\":\"error\",\"message\":\"no current track\"}".utf8))
@@ -1955,7 +2040,7 @@ public final class RadioBroadcaster: ObservableObject {
     /// whose parent is a dated radio-save folder (`YYMMDD …`) — a library
     /// original can never match, so un-♥ can never delete your own record.
     func performUnlikeAsync(stationID: UUID, token: String?) async -> (Int, Data) {
-        guard preferences.isOwner(token: token) else { return Self.guestRejection() }
+        if let rejection = await ownerGate(token) { return rejection }
         guard pipelines[stationID] != nil,
               let item = currentItemByStation[stationID] else {
             return (404, Data("{\"status\":\"error\",\"message\":\"no current track\"}".utf8))

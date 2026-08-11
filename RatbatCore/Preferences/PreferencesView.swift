@@ -31,6 +31,32 @@ public struct PreferencesView: View {
         self.needsRestart = needsRestart
     }
 
+    /// Pending edit to the owner passcode, or nil when the field is just
+    /// showing what's stored.
+    ///
+    /// The field deliberately does NOT bind straight to
+    /// `preferences.ownerToken`. That setter reads blank as "issue me a
+    /// fresh random key", so a bound field would regenerate the passcode
+    /// the moment the last character was backspaced out — mid-retype,
+    /// under the cursor. Buffer the edit, commit it on ⏎ or "Set".
+    @State private var passcodeDraft: String?
+
+    private var passcodeBinding: Binding<String> {
+        Binding(
+            get: { passcodeDraft ?? preferences.ownerToken },
+            set: { passcodeDraft = $0 }
+        )
+    }
+
+    /// Write the draft through and drop back to displaying stored state.
+    /// `ownerToken` isn't `@Published`, so clearing the draft is also what
+    /// re-renders the field with whatever the setter actually kept.
+    private func commitPasscode() {
+        guard let passcodeDraft else { return }
+        preferences.ownerToken = passcodeDraft
+        self.passcodeDraft = nil
+    }
+
     public var body: some View {
         TabView {
             broadcastTab
@@ -75,19 +101,21 @@ public struct PreferencesView: View {
                 }
                 Toggle("Include track info (ICY metadata)", isOn: $preferences.icyMetadataEnabled)
             }
-            Section("Owner Key") {
+            Section("Owner Passcode") {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 8) {
-                        Text(preferences.ownerToken)
+                        TextField("", text: passcodeBinding)
+                            .textFieldStyle(.roundedBorder)
                             .font(.caption.monospaced())
-                            .textSelection(.enabled)
-                            .lineLimit(1)
+                            .onSubmit(commitPasscode)
+                        Button("Set", action: commitPasscode)
+                            .disabled(passcodeDraft == nil)
                         Button("Copy") {
                             NSPasteboard.general.clearContents()
                             NSPasteboard.general.setString(preferences.ownerToken, forType: .string)
                         }
                     }
-                    Text("♥ / skip / next on the web player require this key — open ratbat.jonasjohansson.se#key=<key> once per device to unlock. Without it, listeners get a radio, not a mixer.")
+                    Text("♥ / skip / next on the web player require this passcode — enter it once on ratbat.jonasjohansson.se and the browser remembers it. Without it, listeners get a radio, not a mixer. Clearing the field issues a new random one.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
