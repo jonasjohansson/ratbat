@@ -13,6 +13,11 @@ public struct NTSStationDetailView: View {
     public let config: NTSStationConfig
     @ObservedObject public var radio: RadioBroadcaster
     public let onBroadcastToggle: () -> Void
+    /// Raised when the user asks to change the station's facets. The
+    /// sheet lives in ``RootView`` — the detail pane doesn't own the
+    /// station catalogue, and shouldn't have to, so it reports the intent
+    /// the same way it reports a broadcast toggle.
+    public let onEdit: () -> Void
 
     /// Per-track saved state. Keyed on the cached file URL of the
     /// currently-playing item so the button resets automatically when
@@ -29,12 +34,14 @@ public struct NTSStationDetailView: View {
         station: Station,
         config: NTSStationConfig,
         radio: RadioBroadcaster,
-        onBroadcastToggle: @escaping () -> Void
+        onBroadcastToggle: @escaping () -> Void,
+        onEdit: @escaping () -> Void
     ) {
         self.station = station
         self.config = config
         self.radio = radio
         self.onBroadcastToggle = onBroadcastToggle
+        self.onEdit = onEdit
     }
 
     public var body: some View {
@@ -141,13 +148,26 @@ public struct NTSStationDetailView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
 
-                    Button(action: onBroadcastToggle) {
-                        Label(isLive ? "Stop Broadcast" : "Start Broadcast",
-                              systemImage: isLive ? "stop.fill" : "play.fill")
+                    HStack(spacing: 10) {
+                        Button(action: onBroadcastToggle) {
+                            Label(isLive ? "Stop Broadcast" : "Start Broadcast",
+                                  systemImage: isLive ? "stop.fill" : "play.fill")
+                        }
+                        .controlSize(.large)
+                        .buttonStyle(.borderedProminent)
+                        .tint(isLive ? .red : .accentColor)
+
+                        // Editing the tags keeps the station's id, and with
+                        // it every play, save and skip it has recorded.
+                        // Deleting and recreating does not.
+                        Button(action: onEdit) {
+                            Label("Edit Tags…", systemImage: "slider.horizontal.3")
+                        }
+                        .controlSize(.large)
+                        .help(isLive
+                              ? "Change what this station looks for. Saving restarts it."
+                              : "Change what this station looks for")
                     }
-                    .controlSize(.large)
-                    .buttonStyle(.borderedProminent)
-                    .tint(isLive ? .red : .accentColor)
                 }
 
                 // Stream URLs (if live)

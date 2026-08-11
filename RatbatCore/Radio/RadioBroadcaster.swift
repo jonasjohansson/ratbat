@@ -713,6 +713,35 @@ public final class RadioBroadcaster: ObservableObject {
         )
     }
 
+    /// Take a station off air and put it straight back on with the value
+    /// supplied — the "remake it" half of editing a station's tags.
+    ///
+    /// A generative station's pool, controller and dedup state are built
+    /// once, at ``startBroadcast(station:)``, from the config. Editing the
+    /// config therefore changes nothing anyone can hear until the pipeline
+    /// is rebuilt. This is the named, deliberate way to do that, rather
+    /// than the UI reaching for stop-then-start and hoping the two halves
+    /// stay in step.
+    ///
+    /// The interruption is real and audible: the current track ends
+    /// immediately and listeners reconnect. Callers are expected to say so
+    /// before calling. What it is NOT is the owner turning the station off
+    /// — the "was live when we last ran" record survives, so a restart can
+    /// never cost the station its place in the next launch's resume set.
+    ///
+    /// Starting an idle station is a valid use: the edit sheet saves the
+    /// same way whether or not the station happens to be on air.
+    public func restartBroadcast(station: Station) async {
+        let wasLive = broadcasting.contains(station.id)
+        if wasLive {
+            logger.info(
+                "restarting \(station.slug, privacy: .public) to pick up an edited config"
+            )
+            stopBroadcast(stationID: station.id, forgetLive: false)
+        }
+        await startBroadcast(station: station)
+    }
+
     /// Stop a single station's broadcast. Tears down its encode loop,
     /// disconnects clients bound to it, and drops the pipeline. If it was
     /// the last live station, the shared listener and tunnel come down too.
