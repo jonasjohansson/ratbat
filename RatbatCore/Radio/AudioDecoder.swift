@@ -74,6 +74,19 @@ final class AudioDecoder: @unchecked Sendable {
         }
     }
 
+    /// Playing time of the open file, or `nil` when nothing is open.
+    ///
+    /// Ground truth: this is the audio the listener is about to hear, so it
+    /// can't disagree with what is actually streaming the way a metadata
+    /// field can. Matters most for Bandcamp album downloads, where the
+    /// extractor's per-track durations describe a playlist and the file on
+    /// disk is one unidentified member of it.
+    var duration: TimeInterval? {
+        guard let file, file.processingFormat.sampleRate > 0 else { return nil }
+        let seconds = Double(file.length) / file.processingFormat.sampleRate
+        return seconds > 0 ? seconds : nil
+    }
+
     /// Pull the next chunk of PCM, already in ``outputFormat``. Returns
     /// `nil` at EOF, on error, or if nothing is open. The broadcaster
     /// interprets `nil` as "advance to next track".

@@ -927,6 +927,7 @@ public final class RadioBroadcaster: ObservableObject {
     fileprivate func updateCurrentItem(
         _ item: TrackSourceItem?,
         artwork: Data? = nil,
+        measuredDuration: TimeInterval? = nil,
         stationID: Station.ID
     ) {
         // Retire the outgoing track into the recent ring. Newest first.
@@ -944,13 +945,15 @@ public final class RadioBroadcaster: ObservableObject {
         // past — either way it's stale until the loop re-publishes.
         upcomingByStation.removeValue(forKey: stationID)
         if let item {
-            var published = item
+            var probedArtwork: String?
             if let artwork {
                 let id = TrackFileProbe.artworkID(for: item.url)
                 cacheArtwork(artwork, id: id)
-                published = item.withArtworkURL("/artwork/\(id).jpg")
+                probedArtwork = "/artwork/\(id).jpg"
             }
-            currentItemByStation[stationID] = published
+            currentItemByStation[stationID] = item.withProbedFile(
+                artworkURL: probedArtwork, duration: measuredDuration
+            )
         } else {
             currentItemByStation.removeValue(forKey: stationID)
         }
@@ -2526,7 +2529,13 @@ public final class RadioBroadcaster: ObservableObject {
                 // to its new name from the moment it is renamed.
                 station: stationNames[row.stationID],
                 saved: row.saved,
-                youtubeURL: row.youtubeID.map { "https://www.youtube.com/watch?v=\($0)" },
+                // Same filter `/now.json` applies: the direct-URL resolver
+                // path stores a SYNTHETIC `"<extractor>:<id>"` in the
+                // youtube_id column, and pasting that into a watch?v=
+                // template yields a link that 404s. `/history` was still
+                // minting them after /now.json stopped — verifying the
+                // deploy from outside is what caught the gap.
+                youtubeURL: TrackSourceItem.youtubeWatchURL(for: row.youtubeID),
                 sourceURL: row.sourceShowURL?.absoluteString
             )
         }
@@ -2610,6 +2619,12 @@ public final class RadioBroadcaster: ObservableObject {
     }
 
     private func buildNowPayload() -> Data {
+        /// Same rule as ``NowTrack``, one level up: every key is always
+        /// present, null where there is nothing. The synthesised encoder
+        /// dropped `currentTrack` / `nextTrack` when nil, so a station with
+        /// nothing prefetched had a different key set from its neighbour in
+        /// the same payload — which is the exact complaint the track shape
+        /// was fixed for.
         struct NowStation: Encodable {
             let id: String
             let name: String
@@ -2620,6 +2635,24 @@ public final class RadioBroadcaster: ObservableObject {
             let currentTrack: NowTrack?
             let recent: [RecentPayload]
             let nextTrack: NowTrack?
+
+            enum CodingKeys: String, CodingKey {
+                case id, name, slug, broadcasting, streamURL
+                case listeners, currentTrack, recent, nextTrack
+            }
+
+            func encode(to encoder: Encoder) throws {
+                var c = encoder.container(keyedBy: CodingKeys.self)
+                try c.encode(id, forKey: .id)
+                try c.encode(name, forKey: .name)
+                try c.encode(slug, forKey: .slug)
+                try c.encode(broadcasting, forKey: .broadcasting)
+                try c.encode(streamURL, forKey: .streamURL)
+                try c.encode(listeners, forKey: .listeners)
+                try c.encode(currentTrack, forKey: .currentTrack)
+                try c.encode(recent, forKey: .recent)
+                try c.encode(nextTrack, forKey: .nextTrack)
+            }
         }
         struct NowResponse: Encodable {
             let stations: [NowStation]
@@ -2922,10 +2955,16 @@ public final class RadioBroadcaster: ObservableObject {
                 let artwork: Data? = item.artworkURL == nil
                     ? await TrackFileProbe.artworkJPEG(of: item.url)
                     : nil
+                // The file the listener is about to hear is the only
+                // unimpeachable source for how long it runs.
+                let measured = decoder.duration
                 if let owner {
                     await MainActor.run {
                         owner.updateCurrentItem(
-                            item, artwork: artwork, stationID: stationID
+                            item,
+                            artwork: artwork,
+                            measuredDuration: measured,
+                            stationID: stationID
                         )
                     }
                 }

@@ -168,19 +168,52 @@ def _describe(info: dict) -> dict:
 
     Every key is optional: extractors disagree about what they populate,
     and the Swift side decodes all of these as optionals.
+
+    ## Playlists
+
+    A Bandcamp ALBUM url — which is most of what the Bandcamp station
+    resolves — produces `_type == "playlist"`. The top level of that dict
+    carries no album, duration or thumbnail at all; they live on each
+    entry. Reading only the top level is why the first deploy of this
+    reported nothing for every Bandcamp track:
+
+        TOPLEVEL: {'album': None, 'duration': None, 'thumbnail': None,
+                   'title': "Don't Know How Fast I'm Moving…"}
+        ENTRY0:   {'album': "Don't Know How Fast I'm Moving…",
+                   'duration': 344.955,
+                   'thumbnail': 'https://f4.bcbits.com/img/a3028845176_5.jpg'}
+
+    So fall through to the first entry. Two deliberate exceptions:
+
+    - The album name prefers the playlist's own `title`, which is right for
+      every entry rather than just the one we happened to look at.
+    - `duration` is NOT taken from a playlist entry. All entries download
+      to the same output path, so the file on disk is one specific track
+      and we cannot be sure which; a per-entry duration would be a
+      confident guess. Swift measures the file it actually opens instead.
     """
     out: dict = {}
+    entries = info.get("entries") or []
+    is_playlist = bool(entries) and isinstance(entries[0], dict)
+    entry = entries[0] if is_playlist else {}
+
     album = info.get("album")
+    if is_playlist and not album:
+        # Playlist title == release name, and true for every entry.
+        album = info.get("title") or entry.get("album")
     if isinstance(album, str) and album.strip():
         out["album"] = album.strip()
-    duration = info.get("duration")
-    if isinstance(duration, (int, float)) and duration > 0:
-        out["duration"] = float(duration)
-    thumb = info.get("thumbnail")
+
+    if not is_playlist:
+        duration = info.get("duration")
+        if isinstance(duration, (int, float)) and duration > 0:
+            out["duration"] = float(duration)
+
+    thumb = info.get("thumbnail") or (entry.get("thumbnail") if is_playlist else None)
     if not thumb:
         # Some extractors only fill the `thumbnails` list. Prefer the last
         # entry — yt-dlp sorts it worst-to-best.
-        thumbs = info.get("thumbnails") or []
+        thumbs = info.get("thumbnails") or entry.get("thumbnails") or []
         if isinstance(thumbs, list) and thumbs:
             last = thumbs[-1]
             thumb = last.get("url") if isinstance(last, dict) else None
