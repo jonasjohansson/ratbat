@@ -55,6 +55,17 @@ public actor BandcampStationController {
         public let cachedURL: URL
         public let youtubeID: String
         public let historyID: Int64
+        /// The Bandcamp release page this track came from. Always present:
+        /// the stage-1 discover scrape hands us a release URL for every
+        /// candidate, which is also what makes the direct-URL resolver
+        /// shortcut possible.
+        public let sourceURL: URL
+        /// Display metadata from the extractor. Bandcamp's yt-dlp
+        /// extractor is generous here — album, duration and release art
+        /// are all normally present.
+        public let album: String?
+        public let duration: TimeInterval?
+        public let artworkURL: String?
     }
 
     public enum Error: Swift.Error, Sendable {
@@ -161,7 +172,11 @@ public actor BandcampStationController {
                     title: candidate.title,
                     cachedURL: resolution.cachedURL,
                     youtubeID: resolution.youtubeID,
-                    historyID: rowid
+                    historyID: rowid,
+                    sourceURL: sourceURL,
+                    album: resolution.album,
+                    duration: resolution.duration,
+                    artworkURL: resolution.artworkURL
                 )
             } catch TrackResolver.Error.noYouTubeMatch {
                 logger.info("no YT match for \(candidate.artist, privacy: .public) — \(candidate.title, privacy: .public); skipping")

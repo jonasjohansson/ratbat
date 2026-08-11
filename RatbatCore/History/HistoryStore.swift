@@ -740,6 +740,25 @@ public actor HistoryStore {
         return collectRows(stmt)
     }
 
+    /// Recent plays for ONE station, newest first — what the broadcaster
+    /// seeds `/now.json`'s `recent` ring from at broadcast start, so "what
+    /// just played" survives a restart instead of resetting to `[]`.
+    public func recentEntries(forStation station: UUID, limit: Int = 50) throws -> [Entry] {
+        let sql = """
+            SELECT id, station_id, artist, title, played_at,
+                   source_show_url, youtube_id, saved, cached_path
+            FROM history
+            WHERE station_id = ?
+            ORDER BY played_at DESC
+            LIMIT ?;
+            """
+        let stmt = try prepare(sql)
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, station.uuidString, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(stmt, 2, Int64(limit))
+        return collectRows(stmt)
+    }
+
     // MARK: - v3: boost / un-♥ API (keep vs steer)
 
     /// Stamp an entry as boosted — "more of this". The strong steering

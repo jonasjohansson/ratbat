@@ -64,18 +64,31 @@ public final class RadioBroadcaster: ObservableObject {
         let entryID: UUID
         let item: TrackSourceItem
         let playedAt: Date
-        let youtubeURL: String?
-        let sourceURL: String?
     }
-    /// Newest-first, capped at 5. In-memory on purpose: uniform across
-    /// station kinds (playlist tracks have no history rows) and reset on
-    /// restart, which is the honest lifetime for "what just played".
+    /// Newest-first, capped at ``recentRingCapacity``.
+    ///
+    /// Seeded from ``HistoryStore`` at broadcast start and topped up in
+    /// memory as tracks retire. The in-memory-only version was empty on
+    /// every poll in practice, for two compounding reasons: it reset on
+    /// every restart, and with no listener attached the encode loop parks
+    /// after track one (the data-conscious idle) so nothing ever retires.
+    /// A field that is always `[]` tells a client less than no field at all.
     private(set) var recentByStation: [Station.ID: [RecentTrack]] = [:]
 
-    /// Provenance for the CURRENT track, resolved once per track change
-    /// from its history row (YouTube id → watch URL; Bandcamp release /
-    /// NTS show URL). nil for playlist tracks and while the lookup runs.
-    private var provenanceByStation: [Station.ID: (youtube: String?, source: String?)] = [:]
+    /// How many just-played tracks each station keeps. Also the number of
+    /// history rows the seed reads back at broadcast start.
+    static let recentRingCapacity = 5
+
+    /// Embedded cover art, keyed by ``TrackFileProbe/artworkID(for:)`` and
+    /// served from `GET /artwork/{id}.jpg`.
+    ///
+    /// Only local files land here — a generative track's art already has a
+    /// perfectly good URL on the source's own CDN and there is no reason to
+    /// proxy it. Bounded to a few entries beyond the recent ring so a
+    /// client rendering "what just played" can still fetch each tile.
+    private var artworkCache: [String: Data] = [:]
+    private var artworkOrder: [String] = []
+    private static let artworkCacheLimit = 16
 
     /// Last error surfaced by the listener or any encode/decode loop.
     /// String-typed so the UI can just render it; OSLog has the details.
@@ -664,6 +677,15 @@ public final class RadioBroadcaster: ObservableObject {
         }
 
         #if os(macOS)
+        // Prime "what just played" from the durable history so the field
+        // means something the instant a station goes live. Without this
+        // it stayed `[]` until the SECOND track change of the session —
+        // which, with the data-conscious idle holding the loop after track
+        // one, meant "until somebody tuned in", i.e. usually never.
+        seedRecentFromHistory(station: station)
+        #endif
+
+        #if os(macOS)
         // First-station bootstrap for the tunnel. `CloudflareTunnel.start`
         // is idempotent, but gating on count avoids spurious log churn.
         if broadcasting.count == 1, publishesPublicly {
@@ -718,7 +740,6 @@ public final class RadioBroadcaster: ObservableObject {
         currentItemByStation.removeValue(forKey: stationID)
         upcomingByStation.removeValue(forKey: stationID)
         recentByStation.removeValue(forKey: stationID)
-        provenanceByStation.removeValue(forKey: stationID)
 
         // Boot any clients still attached to this station.
         let toRemove = clients.filter { $0.value.stationID == stationID }
@@ -814,55 +835,134 @@ public final class RadioBroadcaster: ObservableObject {
     /// Called from the detached encode loop each time the decoder opens a
     /// new track. Drives the ICY metadata surfaced to clients at the next
     /// block boundary.
-    fileprivate func updateCurrentItem(_ item: TrackSourceItem?, stationID: Station.ID) {
-        // Retire the outgoing track into the recent ring, carrying
-        // whatever provenance had resolved for it. Newest first, cap 5.
+    ///
+    /// `artwork` is the outgoing file's embedded cover art, already read off
+    /// the detached loop (see ``TrackFileProbe``). Provenance used to be
+    /// resolved here with a per-track hop back into ``HistoryStore``; the
+    /// sources now carry it on the item itself, which removes both the hop
+    /// and the window where `/now.json` showed a track with no source URL
+    /// because the lookup hadn't landed yet.
+    fileprivate func updateCurrentItem(
+        _ item: TrackSourceItem?,
+        artwork: Data? = nil,
+        stationID: Station.ID
+    ) {
+        // Retire the outgoing track into the recent ring. Newest first.
         if let outgoing = currentItemByStation[stationID] {
-            let prov = provenanceByStation[stationID]
             var ring = recentByStation[stationID] ?? []
             ring.insert(RecentTrack(
-                entryID: UUID(),
-                item: outgoing,
-                playedAt: Date(),
-                youtubeURL: prov?.youtube,
-                sourceURL: prov?.source
+                entryID: UUID(), item: outgoing, playedAt: Date()
             ), at: 0)
-            if ring.count > 5 { ring.removeLast(ring.count - 5) }
+            if ring.count > Self.recentRingCapacity {
+                ring.removeLast(ring.count - Self.recentRingCapacity)
+            }
             recentByStation[stationID] = ring
         }
-        provenanceByStation.removeValue(forKey: stationID)
         // The prefetched "next" either just became current or was skipped
         // past — either way it's stale until the loop re-publishes.
         upcomingByStation.removeValue(forKey: stationID)
         if let item {
-            currentItemByStation[stationID] = item
+            var published = item
+            if let artwork {
+                let id = TrackFileProbe.artworkID(for: item.url)
+                cacheArtwork(artwork, id: id)
+                published = item.withArtworkURL("/artwork/\(id).jpg")
+            }
+            currentItemByStation[stationID] = published
         } else {
             currentItemByStation.removeValue(forKey: stationID)
         }
         // A track change is exactly what /events subscribers are waiting
         // for — push the fresh now-playing snapshot.
         pushSSE()
+    }
 
-        #if os(macOS)
-        // Resolve the incoming track's provenance from its history row —
-        // one actor hop per track change, cached until the next change,
-        // re-pushed over SSE when it lands.
-        if let item, let historyID = item.historyID, let history {
-            Task { [weak self] in
-                guard let entry = try? await history.entry(id: historyID) else { return }
-                await MainActor.run { [weak self] in
-                    guard let self,
-                          self.currentItemByStation[stationID]?.historyID == historyID else { return }
-                    self.provenanceByStation[stationID] = (
-                        entry.youtubeID.map { "https://www.youtube.com/watch?v=\($0)" },
-                        entry.sourceShowURL?.absoluteString
-                    )
-                    self.pushSSE()
-                }
+    #if os(macOS)
+    /// Fill a station's recent ring from its newest history rows.
+    ///
+    /// Runs once per broadcast start, before the first track opens, so the
+    /// ring is never empty for a station that has played before. Rows the
+    /// in-memory ring will re-add naturally are harmless — a retiring track
+    /// pushes onto the front and the cap trims the tail.
+    ///
+    /// A row is only usable if its `cachedPath` still exists: the recent
+    /// entries double as retro-♥ targets, and offering a ♥ for a file the
+    /// LRU already evicted would be a button that can only fail. Rows
+    /// without a live file are skipped, which is why the ring can come back
+    /// shorter than the capacity.
+    private func seedRecentFromHistory(station: Station) {
+        let stationID = station.id
+        guard let history, recentByStation[stationID] == nil else { return }
+        let capacity = Self.recentRingCapacity
+        let musicFolder = libraryConfig?.musicFolder
+        // History rows don't record which controller produced them, but the
+        // station being started does — its kind is the same for every row
+        // it ever wrote.
+        let origin: TrackOrigin
+        switch station.kind {
+        case .playlist: origin = .library
+        case .nts: origin = .nts
+        case .lastFM: origin = .lastFM
+        case .bandcamp: origin = .bandcamp
+        }
+        Task { [weak self] in
+            let rows = (try? await history.recentEntries(
+                forStation: stationID, limit: capacity
+            )) ?? []
+            let seeded: [RecentTrack] = rows.compactMap { row in
+                guard let path = row.cachedPath,
+                      FileManager.default.fileExists(atPath: path) else { return nil }
+                let url = URL(fileURLWithPath: path)
+                let owned = musicFolder.map { url.path.hasPrefix($0.path) } ?? false
+                return RecentTrack(
+                    entryID: UUID(),
+                    item: TrackSourceItem(
+                        url: url,
+                        artist: row.artist,
+                        title: row.title,
+                        sourceURL: row.sourceShowURL?.absoluteString,
+                        youtubeURL: TrackSourceItem.youtubeWatchURL(for: row.youtubeID),
+                        origin: origin,
+                        // A ♥ on a seeded row must take the same path it
+                        // would have taken live: owned files record affinity
+                        // (no row id needed), cached ones copy the file.
+                        historyID: owned ? nil : row.id,
+                        isOwned: owned
+                    ),
+                    playedAt: row.playedAt
+                )
+            }
+            guard !seeded.isEmpty else { return }
+            await MainActor.run { [weak self] in
+                guard let self, self.pipelines[stationID] != nil else { return }
+                var ring = self.recentByStation[stationID] ?? []
+                // Anything the live ring already retired wins — it is newer.
+                ring.append(contentsOf: seeded)
+                if ring.count > capacity { ring.removeLast(ring.count - capacity) }
+                self.recentByStation[stationID] = ring
+                self.pushSSE()
             }
         }
-        #endif
     }
+    #endif
+
+    /// Store cover-art bytes under `id`, evicting the oldest once the cache
+    /// is over its limit. Insertion-ordered rather than true LRU: the access
+    /// pattern is "the current track, then whatever is in the recent ring",
+    /// which insertion order already tracks.
+    private func cacheArtwork(_ data: Data, id: String) {
+        if artworkCache[id] == nil {
+            artworkOrder.append(id)
+        }
+        artworkCache[id] = data
+        while artworkOrder.count > Self.artworkCacheLimit {
+            let evicted = artworkOrder.removeFirst()
+            artworkCache.removeValue(forKey: evicted)
+        }
+    }
+
+    /// Cover-art bytes for `id`, or nil if we never had them / they aged out.
+    func artwork(id: String) -> Data? { artworkCache[id] }
 
     /// The encode loop's prefetch resolved — publish it as the certain
     /// next track. Only meaningful while its station still broadcasts.
@@ -1215,6 +1315,40 @@ public final class RadioBroadcaster: ObservableObject {
                 return
             }
 
+            // Cover art extracted from a local file's own tags. Generative
+            // tracks point `artworkURL` straight at the source's CDN, so
+            // this route only ever serves library art — bytes we already
+            // hold in memory for the current track and the recent ring.
+            if let artworkID = Self.extractArtworkID(from: path) {
+                let bytes = await MainActor.run { [weak self] in
+                    self?.artwork(id: artworkID)
+                }
+                guard let bytes else {
+                    _ = await Self.send(
+                        data: Data(Self.notFoundResponse().utf8), on: connection
+                    )
+                    connection.cancel()
+                    return
+                }
+                _ = await Self.send(
+                    data: Self.buildHTTPResponse(
+                        status: 200,
+                        headers: [
+                            "Content-Type": "image/jpeg",
+                            "Access-Control-Allow-Origin": "*",
+                            // Content is immutable for a given id (it is a
+                            // digest of the file path), so let clients keep
+                            // it rather than re-fetching per poll.
+                            "Cache-Control": "public, max-age=86400"
+                        ],
+                        body: bytes
+                    ),
+                    on: connection
+                )
+                connection.cancel()
+                return
+            }
+
             // Public JSON status. Lists the CURRENTLY BROADCASTING stations
             // plus their current track and listener counts. No auth —
             // broadcaster only knows live stations, so idle library
@@ -1540,6 +1674,22 @@ public final class RadioBroadcaster: ObservableObject {
         let end = path.index(path.endIndex, offsetBy: -suffix.count)
         let slug = String(path[start..<end])
         return slug.isEmpty ? nil : slug
+    }
+
+    /// Parse `/artwork/{id}.jpg` → `id`. The id is a hex digest produced by
+    /// ``TrackFileProbe/artworkID(for:)``, so anything outside `[0-9a-f]` is
+    /// not one of ours and gets no answer — the route is a plain in-memory
+    /// dictionary lookup and must never be coaxed into looking like a path.
+    nonisolated static func extractArtworkID(from path: String) -> String? {
+        let prefix = "/artwork/"
+        let suffix = ".jpg"
+        guard path.hasPrefix(prefix), path.hasSuffix(suffix) else { return nil }
+        let start = path.index(path.startIndex, offsetBy: prefix.count)
+        let end = path.index(path.endIndex, offsetBy: -suffix.count)
+        let id = String(path[start..<end])
+        guard !id.isEmpty, id.count <= 64,
+              id.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else { return nil }
+        return id
     }
 
     // MARK: - Response builders
@@ -2280,6 +2430,76 @@ public final class RadioBroadcaster: ObservableObject {
         #endif
     }
 
+    /// One track, however it reached us.
+    ///
+    /// Every field is emitted on every track object — current, recent, or
+    /// next — with `null` where the origin genuinely has nothing to say. The
+    /// previous shape omitted keys per source, so a client could not tell
+    /// "Bandcamp has no album for this single" from "the library path never
+    /// plumbed album through". `origin` names the source so a null is
+    /// attributable; see ``TrackSourceItem`` for the per-origin table.
+    ///
+    /// `nil` optionals must still encode as JSON `null`, so every field is
+    /// written explicitly rather than through the synthesised encoder,
+    /// which skips nils.
+    struct NowTrack: Encodable {
+        let title: String
+        let artist: String
+        let album: String?
+        let durationSeconds: Double?
+        let artworkURL: String?
+        let sourceURL: String?
+        let youtubeURL: String?
+        let origin: String
+
+        init(_ item: TrackSourceItem) {
+            self.title = item.title ?? ""
+            self.artist = item.artist ?? ""
+            self.album = item.album
+            self.durationSeconds = item.duration
+            self.artworkURL = item.artworkURL
+            self.sourceURL = item.sourceURL
+            self.youtubeURL = item.youtubeURL
+            self.origin = item.origin.rawValue
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case title, artist, album, durationSeconds, artworkURL
+            case sourceURL, youtubeURL, origin
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(title, forKey: .title)
+            try c.encode(artist, forKey: .artist)
+            // `encode` (not `encodeIfPresent`) so nil becomes an explicit
+            // JSON null instead of a missing key.
+            try c.encode(album, forKey: .album)
+            try c.encode(durationSeconds, forKey: .durationSeconds)
+            try c.encode(artworkURL, forKey: .artworkURL)
+            try c.encode(sourceURL, forKey: .sourceURL)
+            try c.encode(youtubeURL, forKey: .youtubeURL)
+            try c.encode(origin, forKey: .origin)
+        }
+    }
+
+    /// A recent play: a track object plus its own identity, so the web
+    /// player can retro-♥ "the one two tracks back".
+    struct RecentPayload: Encodable {
+        let track: NowTrack
+        let entryID: String
+        let playedAt: Double
+
+        enum CodingKeys: String, CodingKey { case entryID, playedAt }
+
+        func encode(to encoder: Encoder) throws {
+            try track.encode(to: encoder)
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(entryID, forKey: .entryID)
+            try c.encode(playedAt, forKey: .playedAt)
+        }
+    }
+
     private func buildNowPayload() -> Data {
         struct NowStation: Encodable {
             let id: String
@@ -2290,26 +2510,7 @@ public final class RadioBroadcaster: ObservableObject {
             let listeners: Int
             let currentTrack: NowTrack?
             let recent: [RecentPayload]
-            let nextTrack: NextPayload?
-        }
-        struct NowTrack: Encodable {
-            let title: String
-            let artist: String
-            let album: String
-            let youtubeURL: String?
-            let sourceURL: String?
-        }
-        struct RecentPayload: Encodable {
-            let entryID: String
-            let title: String
-            let artist: String
-            let playedAt: Double
-            let youtubeURL: String?
-            let sourceURL: String?
-        }
-        struct NextPayload: Encodable {
-            let title: String
-            let artist: String
+            let nextTrack: NowTrack?
         }
         struct NowResponse: Encodable {
             let stations: [NowStation]
@@ -2320,40 +2521,22 @@ public final class RadioBroadcaster: ObservableObject {
         let ordered = pipelines.values.sorted { $0.station.name < $1.station.name }
         let stations: [NowStation] = ordered.map { pipeline in
             let stationID = pipeline.station.id
-            let item = currentItemByStation[stationID]
-            let listeners = listenerCount[stationID] ?? 0
-            let prov = provenanceByStation[stationID]
-            // `NowTrack.album` kept for UI backwards compat, but TrackSource
-            // items don't carry album metadata — empty string is fine.
             return NowStation(
                 id: stationID.uuidString,
                 name: pipeline.station.name,
                 slug: pipeline.station.slug,
                 broadcasting: true,
                 streamURL: "/stream/\(pipeline.station.slug).aac",
-                listeners: listeners,
-                currentTrack: item.map {
-                    NowTrack(
-                        title: $0.title ?? "",
-                        artist: $0.artist ?? "",
-                        album: "",
-                        youtubeURL: prov?.youtube,
-                        sourceURL: prov?.source
-                    )
-                },
+                listeners: listenerCount[stationID] ?? 0,
+                currentTrack: currentItemByStation[stationID].map(NowTrack.init),
                 recent: (recentByStation[stationID] ?? []).map {
                     RecentPayload(
+                        track: NowTrack($0.item),
                         entryID: $0.entryID.uuidString,
-                        title: $0.item.title ?? "",
-                        artist: $0.item.artist ?? "",
-                        playedAt: $0.playedAt.timeIntervalSince1970,
-                        youtubeURL: $0.youtubeURL,
-                        sourceURL: $0.sourceURL
+                        playedAt: $0.playedAt.timeIntervalSince1970
                     )
                 },
-                nextTrack: upcomingByStation[stationID].map {
-                    NextPayload(title: $0.title ?? "", artist: $0.artist ?? "")
-                }
+                nextTrack: upcomingByStation[stationID].map(NowTrack.init)
             )
         }
 
@@ -2624,8 +2807,18 @@ public final class RadioBroadcaster: ObservableObject {
                 try decoder.open(url: item.url)
                 let label = item.title ?? item.url.lastPathComponent
                 log.info("decoding \(label, privacy: .public)")
+                // Read embedded cover art here, on the detached loop, while
+                // the file is already warm — a generative track carries a
+                // remote thumbnail URL instead and needs no probe.
+                let artwork: Data? = item.artworkURL == nil
+                    ? await TrackFileProbe.artworkJPEG(of: item.url)
+                    : nil
                 if let owner {
-                    await MainActor.run { owner.updateCurrentItem(item, stationID: stationID) }
+                    await MainActor.run {
+                        owner.updateCurrentItem(
+                            item, artwork: artwork, stationID: stationID
+                        )
+                    }
                 }
             } catch {
                 let label = item.title ?? item.url.lastPathComponent

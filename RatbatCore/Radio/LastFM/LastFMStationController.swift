@@ -44,6 +44,13 @@ public actor LastFMStationController {
         public let cachedURL: URL
         public let youtubeID: String
         public let historyID: Int64
+        /// Display metadata the resolver's extractor already knew. `nil`
+        /// where it didn't report one — Last.fm's own chart data has no
+        /// album/artwork, so everything here comes from the YouTube Music
+        /// match, which fills album inconsistently.
+        public let album: String?
+        public let duration: TimeInterval?
+        public let artworkURL: String?
     }
 
     public enum Error: Swift.Error, Sendable {
@@ -137,7 +144,10 @@ public actor LastFMStationController {
                     title: candidate.title,
                     cachedURL: resolution.cachedURL,
                     youtubeID: resolution.youtubeID,
-                    historyID: rowid
+                    historyID: rowid,
+                    album: resolution.album,
+                    duration: resolution.duration,
+                    artworkURL: resolution.artworkURL
                 )
             } catch TrackResolver.Error.noYouTubeMatch {
                 logger.info("no YT match for \(candidate.artist, privacy: .public) — \(candidate.title, privacy: .public); skipping")
