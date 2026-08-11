@@ -154,13 +154,26 @@ public struct TrackSourceItem: Sendable {
         return "https://www.youtube.com/watch?v=\(id)"
     }
 
-    /// Copy carrying artwork the broadcaster resolved after the fact —
-    /// embedded cover art is only read once the encode loop has the file
-    /// open, which is after the source has already handed the item over.
-    public func withArtworkURL(_ artworkURL: String?) -> TrackSourceItem {
+    /// Copy carrying what the broadcaster could only learn by opening the
+    /// file — embedded cover art, and the file's true playing time.
+    ///
+    /// Both are resolved after the source has already handed the item over,
+    /// because both need the decoder to have the file open.
+    ///
+    /// A measured duration WINS over a reported one. The file is what the
+    /// listener hears; the metadata is a claim about it. They diverge for
+    /// real: a Bandcamp album download reports per-track durations for a
+    /// playlist while the file on disk is one unidentified member of it.
+    /// `nil` leaves whatever the source reported alone.
+    public func withProbedFile(
+        artworkURL probedArtwork: String?,
+        duration measured: TimeInterval?
+    ) -> TrackSourceItem {
         TrackSourceItem(
             url: url, artist: artist, title: title, album: album,
-            duration: duration, artworkURL: artworkURL, sourceURL: sourceURL,
+            duration: measured ?? duration,
+            artworkURL: probedArtwork ?? artworkURL,
+            sourceURL: sourceURL,
             youtubeURL: youtubeURL, origin: origin, historyID: historyID,
             isOwned: isOwned
         )
