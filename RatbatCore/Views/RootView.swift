@@ -138,6 +138,10 @@ public struct RootView: View {
                         // BEFORE loading the library so any saved stations
                         // are visible in the sidebar as soon as it appears.
                         stations.setStorage(root: folder)
+                        // The broadcaster names history rows and live
+                        // stations from this catalogue — without it a row
+                        // for an idle station comes back nameless.
+                        radio.registerStations(stations.stations)
                         await libraryVM.load(from: folder)
                         // Feed the taste profile with the freshly-loaded
                         // tracks so Last.fm pool scoring has something to
@@ -177,6 +181,12 @@ public struct RootView: View {
                     // library view model so anything still reading
                     // `selectedPlaylistID` (tests, the selected-playlist
                     // computed convenience) stays in sync.
+                    // Keep the broadcaster's catalogue in step with every
+                    // create / rename / edit / delete, so names on the wire
+                    // never lag what the sidebar shows.
+                    .onChange(of: stations.stations) { _, updated in
+                        radio.registerStations(updated)
+                    }
                     .onChange(of: sidebarSelection) { _, newSel in
                         if case let .playlist(id) = newSel {
                             libraryVM.selectedPlaylistID = id

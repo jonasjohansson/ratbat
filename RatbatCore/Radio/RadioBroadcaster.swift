@@ -170,18 +170,23 @@ public final class RadioBroadcaster: ObservableObject {
     /// accessed from the main actor; the detached tasks inside only hold
     /// weak refs to the broadcaster and reach back through `MainActor.run`.
     private final class BroadcastPipeline {
-        let station: Station
+        /// Refreshed by ``RadioBroadcaster/registerStations(_:)`` when the
+        /// user edits a live station. It used to be a `let` snapshotted at
+        /// broadcast start, which is why `/now.json` and `/history` kept
+        /// publishing a station's pre-rename name until the next restart.
+        var station: Station
         let buffer: AACRingBuffer
         /// Encoder bitrate this pipeline was started with. Frozen at
         /// construction — AACEncoder doesn't support live bitrate changes,
         /// so a live pipeline keeps its original setting until stopped.
         let bitrate: Int
         let sampleRate: Double
-        /// Station name snapshot frozen at broadcast-start time. The ♥
-        /// save flow needs a human-readable folder name per station
-        /// without having to reach into the (separately-owned)
-        /// StationManager.
-        let stationName: String
+        /// Human-readable folder name for the ♥ save flow, without having
+        /// to reach into the (separately-owned) StationManager. Tracks
+        /// ``station`` rather than freezing at start, so a ♥ after a rename
+        /// files under the name the user can actually see. Anything already
+        /// saved keeps its old folder.
+        var stationName: String { station.name }
         var encodeTask: Task<Void, Never>?
         /// Flipped `true` by ``RadioBroadcaster/skipCurrent(stationID:)``
         /// when the user hits 👎. The encode loop's inner PCM loop reads
@@ -195,11 +200,15 @@ public final class RadioBroadcaster: ObservableObject {
             self.buffer = buffer
             self.bitrate = bitrate
             self.sampleRate = sampleRate
-            self.stationName = station.name
         }
     }
 
     private var pipelines: [Station.ID: BroadcastPipeline] = [:]
+    /// Display names for every station the user has saved, live or not —
+    /// see ``registerStations(_:)``. Absent id means "we have never heard
+    /// of this station", which is how `/history` distinguishes a deleted
+    /// station from one that simply isn't on air.
+    private var stationNames: [Station.ID: String] = [:]
     private var listener: NWListener?
     /// Connected clients keyed by connection identity. We store the
     /// station each client is bound to so disconnects decrement the
@@ -623,6 +632,9 @@ public final class RadioBroadcaster: ObservableObject {
             sampleRate: sampleRate
         )
         pipelines[station.id] = pipeline
+        // A station we are broadcasting is one we can always name, even if
+        // nobody registered the catalogue (older callers, tests).
+        stationNames[station.id] = station.name
         broadcasting.insert(station.id)
         listenerCount[station.id] = 0
         // Restart resilience: remember what's live so the next launch can
@@ -751,6 +763,47 @@ public final class RadioBroadcaster: ObservableObject {
     /// Whether `stationID` is currently broadcasting.
     public func isBroadcasting(stationID: Station.ID) -> Bool {
         broadcasting.contains(stationID)
+    }
+
+    /// Tell the broadcaster about the user's full station catalogue.
+    ///
+    /// Two things depend on it, and both were broken without it:
+    ///
+    /// 1. `/history` could only name a station that happened to be
+    ///    broadcasting right then, so every row belonging to an idle
+    ///    station came back with an empty name. The catalogue covers idle
+    ///    stations too.
+    /// 2. A live pipeline held a `Station` value frozen at broadcast start,
+    ///    so renaming a station left `/now.json` and `/history` publishing
+    ///    the old name until the next restart.
+    ///
+    /// Call it whenever the saved list changes — creation, rename, edit,
+    /// delete — and once after loading it from disk. It is a pure
+    /// bookkeeping update: it never starts, stops or restarts anything, and
+    /// stations it doesn't mention are left exactly as they are.
+    public func registerStations(_ stations: [Station]) {
+        for station in stations {
+            stationNames[station.id] = station.name
+        }
+        // A live pipeline's copy is what the wire reads, so refresh it.
+        for station in stations {
+            guard let pipeline = pipelines[station.id] else { continue }
+            let previousSlug = pipeline.station.slug
+            pipeline.station = station
+            // The slug is derived from the name, so a rename moves the
+            // station's stream path. The "was live when we last ran"
+            // record is keyed by slug — leaving the old one behind would
+            // make the next launch try to resume a path that no longer
+            // answers.
+            if previousSlug != station.slug {
+                preferences.forgetLive(slug: previousSlug)
+                preferences.rememberLive(slug: station.slug)
+                logger.info(
+                    "station renamed while live: \(previousSlug, privacy: .public) → \(station.slug, privacy: .public)"
+                )
+            }
+        }
+        objectWillChange.send()
     }
 
     #if os(macOS)
@@ -2223,15 +2276,43 @@ public final class RadioBroadcaster: ObservableObject {
     /// resolved from live pipelines where possible; historical rows from
     /// stations that aren't currently broadcasting just carry their id.
     func buildHistoryPayload(path: String) async -> Data {
+        /// `stationID` is the row's real key — the stable UUID history has
+        /// always stored. `station` is a display name resolved against the
+        /// current catalogue, so a rename shows up immediately and an idle
+        /// station is still named. It is `null`, never `""`, when the
+        /// station has been deleted: the row keeps its id and stays
+        /// attributable, we just can't say what it used to be called.
         struct HistoryEntry: Encodable {
             let id: Int64
             let artist: String
             let title: String
             let playedAt: Double
-            let station: String
+            let stationID: String
+            let station: String?
             let saved: Bool
             let youtubeURL: String?
             let sourceURL: String?
+
+            enum CodingKeys: String, CodingKey {
+                case id, artist, title, playedAt, stationID, station
+                case saved, youtubeURL, sourceURL
+            }
+
+            /// Hand-written so a nil `station` encodes as an explicit JSON
+            /// null rather than a missing key — a client should be able to
+            /// tell "unnamed" from "field not in this build".
+            func encode(to encoder: Encoder) throws {
+                var c = encoder.container(keyedBy: CodingKeys.self)
+                try c.encode(id, forKey: .id)
+                try c.encode(artist, forKey: .artist)
+                try c.encode(title, forKey: .title)
+                try c.encode(playedAt, forKey: .playedAt)
+                try c.encode(stationID, forKey: .stationID)
+                try c.encode(station, forKey: .station)
+                try c.encode(saved, forKey: .saved)
+                try c.encodeIfPresent(youtubeURL, forKey: .youtubeURL)
+                try c.encodeIfPresent(sourceURL, forKey: .sourceURL)
+            }
         }
         struct HistoryResponse: Encodable {
             let entries: [HistoryEntry]
@@ -2254,18 +2335,17 @@ public final class RadioBroadcaster: ObservableObject {
               let rows = try? await history.recentEntries(limit: limit, offset: offset) else {
             return Data("{\"entries\":[]}".utf8)
         }
-        let names: [String: String] = Dictionary(
-            uniqueKeysWithValues: pipelines.values.map {
-                ($0.station.id.uuidString, $0.station.name)
-            }
-        )
         let entries = rows.map { row in
             HistoryEntry(
                 id: row.id,
                 artist: row.artist,
                 title: row.title,
                 playedAt: row.playedAt.timeIntervalSince1970,
-                station: names[row.stationID.uuidString] ?? "",
+                stationID: row.stationID.uuidString,
+                // The catalogue, not the live pipelines: an idle station is
+                // still a station the user has, and a renamed one answers
+                // to its new name from the moment it is renamed.
+                station: stationNames[row.stationID],
                 saved: row.saved,
                 youtubeURL: row.youtubeID.map { "https://www.youtube.com/watch?v=\($0)" },
                 sourceURL: row.sourceShowURL?.absoluteString
