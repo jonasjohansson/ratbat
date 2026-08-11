@@ -57,10 +57,18 @@ public actor PlaylistSource: TrackSource {
             track.title ?? track.url.lastPathComponent,
             track.url
         )
+        // `album` and `duration` come off the indexed ``Track`` — the
+        // library indexer already parsed both out of the file's tags, and
+        // dropping them here is what made `/now.json` report `"album": ""`
+        // for every library station. An empty album tag means "no album",
+        // which the wire says as null rather than "".
         return TrackSourceItem(
             url: track.url,
             artist: track.artist,
             title: track.title,
+            album: track.album.isEmpty ? nil : track.album,
+            duration: track.duration > 0 ? track.duration : nil,
+            origin: .library,
             historyID: historyID,
             isOwned: true
         )

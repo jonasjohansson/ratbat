@@ -25,11 +25,33 @@ public actor TrackResolver {
         public let matchedTitle: String  // what YouTube actually called it
         public let fileSize: Int64       // bytes
 
-        public init(cachedURL: URL, youtubeID: String, matchedTitle: String, fileSize: Int64) {
+        /// Display metadata the extractor already knew. All optional: which
+        /// of these an extractor fills varies (Bandcamp reliably has album
+        /// art and duration; a YouTube Music single often has no album at
+        /// all), and the wrapper only emits keys it actually found. The
+        /// downloaded file is never mutated to carry them — see
+        /// `_describe` in `resolve_track.py` for why.
+        public let album: String?
+        public let duration: TimeInterval?
+        /// Remote cover-art URL on the source's own CDN.
+        public let artworkURL: String?
+
+        public init(
+            cachedURL: URL,
+            youtubeID: String,
+            matchedTitle: String,
+            fileSize: Int64,
+            album: String? = nil,
+            duration: TimeInterval? = nil,
+            artworkURL: String? = nil
+        ) {
             self.cachedURL = cachedURL
             self.youtubeID = youtubeID
             self.matchedTitle = matchedTitle
             self.fileSize = fileSize
+            self.album = album
+            self.duration = duration
+            self.artworkURL = artworkURL
         }
     }
 
@@ -247,9 +269,16 @@ public actor TrackResolver {
             throw Error.downloadFailed(detail)
         }
 
+        // The display fields are optional so an older wrapper script —
+        // one deployed before this contract grew — still decodes. A
+        // resolver that can't parse its own stdout throws away a track
+        // that already downloaded fine, so the contract only ever widens.
         struct WrapperOutput: Decodable {
             let youtube_id: String
             let matched_title: String
+            let album: String?
+            let duration: Double?
+            let thumbnail: String?
         }
         let parsed: WrapperOutput
         do {
@@ -277,7 +306,10 @@ public actor TrackResolver {
             cachedURL: outURL,
             youtubeID: parsed.youtube_id,
             matchedTitle: parsed.matched_title,
-            fileSize: size
+            fileSize: size,
+            album: parsed.album,
+            duration: parsed.duration,
+            artworkURL: parsed.thumbnail
         )
     }
 

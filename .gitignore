@@ -3,6 +3,9 @@
 
 # Xcode
 build/
+# Ad-hoc `xcodebuild -derivedDataPath build-test` runs. Sibling of build/,
+# and it got swept into a commit by a `git add -A` once already.
+build-test/
 DerivedData/
 *.xcuserdata/
 *.xcworkspace/xcuserdata/

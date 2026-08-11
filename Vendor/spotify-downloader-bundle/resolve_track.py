@@ -156,24 +156,61 @@ def _download_url(url: str, output: str) -> dict:
     return info
 
 
-def download(yt_id: str, output: str) -> None:
-    """Download audio for YouTube ID to output path (m4a)."""
-    _download_url(f"https://music.youtube.com/watch?v={yt_id}", output)
+def _describe(info: dict) -> dict:
+    """Pull the display metadata Swift wants out of a yt-dlp info dict.
+
+    Deliberately read-only: we do NOT ask yt-dlp to embed metadata or
+    thumbnails into the file. Those post-processors shell out to ffmpeg
+    after the download and can fail on their own, which would turn a
+    perfectly good track into a failed resolve — and a failed resolve on
+    an always-on radio is dead air. Reporting what the extractor already
+    knows costs nothing and cannot break the download.
+
+    Every key is optional: extractors disagree about what they populate,
+    and the Swift side decodes all of these as optionals.
+    """
+    out: dict = {}
+    album = info.get("album")
+    if isinstance(album, str) and album.strip():
+        out["album"] = album.strip()
+    duration = info.get("duration")
+    if isinstance(duration, (int, float)) and duration > 0:
+        out["duration"] = float(duration)
+    thumb = info.get("thumbnail")
+    if not thumb:
+        # Some extractors only fill the `thumbnails` list. Prefer the last
+        # entry — yt-dlp sorts it worst-to-best.
+        thumbs = info.get("thumbnails") or []
+        if isinstance(thumbs, list) and thumbs:
+            last = thumbs[-1]
+            thumb = last.get("url") if isinstance(last, dict) else None
+    if isinstance(thumb, str) and thumb.startswith("http"):
+        out["thumbnail"] = thumb
+    return out
 
 
-def download_direct(url: str, output: str) -> tuple[str, str]:
+def download(yt_id: str, output: str) -> dict:
+    """Download audio for YouTube ID to output path (m4a).
+
+    Returns the display metadata dict (see `_describe`).
+    """
+    return _describe(_download_url(f"https://music.youtube.com/watch?v={yt_id}", output))
+
+
+def download_direct(url: str, output: str) -> tuple[str, str, dict]:
     """Download audio from a pre-resolved source URL.
 
-    Returns `(synthetic_id, matched_title)` — the synthetic id is
+    Returns `(synthetic_id, matched_title, metadata)` — the synthetic id is
     `"<extractor>:<extractor-track-id>"` (e.g. `"bandcamp:1234567890"`)
     so downstream dedup/annotation has a stable handle even though
-    there's no YouTube catalog entry.
+    there's no YouTube catalog entry. `metadata` is the display dict from
+    `_describe`.
     """
     info = _download_url(url, output)
     extractor = (info.get("extractor_key") or info.get("extractor") or "source").lower()
     track_id = info.get("id") or info.get("display_id") or url
     matched = info.get("track") or info.get("title") or ""
-    return f"{extractor}:{track_id}", matched
+    return f"{extractor}:{track_id}", matched, _describe(info)
 
 
 def main() -> int:
@@ -197,7 +234,7 @@ def main() -> int:
     if args.source_url:
         # Direct-URL path — no YT-Music search, yt-dlp handles the extractor.
         try:
-            synthetic_id, matched = download_direct(args.source_url, args.output)
+            synthetic_id, matched, meta = download_direct(args.source_url, args.output)
         except Exception as e:  # noqa: BLE001
             print(f"download_failed: {e}", file=sys.stderr)
             return 3
@@ -206,7 +243,9 @@ def main() -> int:
         if not matched:
             matched = args.title
         print(
-            json.dumps({"youtube_id": synthetic_id, "matched_title": matched}),
+            json.dumps(
+                {"youtube_id": synthetic_id, "matched_title": matched, **meta}
+            ),
             flush=True,
         )
         return 0
@@ -221,12 +260,15 @@ def main() -> int:
         return 2
 
     try:
-        download(yt_id, args.output)
+        meta = download(yt_id, args.output)
     except Exception as e:  # noqa: BLE001
         print(f"download_failed: {e}", file=sys.stderr)
         return 3
 
-    print(json.dumps({"youtube_id": yt_id, "matched_title": matched}), flush=True)
+    print(
+        json.dumps({"youtube_id": yt_id, "matched_title": matched, **meta}),
+        flush=True,
+    )
     return 0
 
 

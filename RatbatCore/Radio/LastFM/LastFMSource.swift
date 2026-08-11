@@ -18,10 +18,19 @@ public actor LastFMSource: TrackSource {
     public func nextURL() async throws -> TrackSourceItem? {
         do {
             let track = try await controller.nextTrack()
-            return TrackSourceItem(
+            return .generative(
                 url: track.cachedURL,
                 artist: track.artist,
                 title: track.title,
+                album: track.album,
+                duration: track.duration,
+                artworkURL: track.artworkURL,
+                // Last.fm is a recommendation index, not a place a track
+                // lives — the only URL in play is the YouTube Music match,
+                // which is reported as `youtubeURL`, not as a source page.
+                sourceURL: nil,
+                youtubeID: track.youtubeID,
+                origin: .lastFM,
                 historyID: track.historyID
             )
         } catch LastFMStationController.Error.poolExhausted {

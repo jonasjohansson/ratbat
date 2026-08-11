@@ -18,10 +18,16 @@ public actor NTSSource: TrackSource {
     public func nextURL() async throws -> TrackSourceItem? {
         do {
             let track = try await controller.nextTrack()
-            return TrackSourceItem(
+            return .generative(
                 url: track.cachedURL,
                 artist: track.artist,
                 title: track.title,
+                album: track.album,
+                duration: track.duration,
+                artworkURL: track.artworkURL,
+                sourceURL: track.sourceShowURL,
+                youtubeID: track.youtubeID,
+                origin: .nts,
                 historyID: track.historyID
             )
         } catch NTSStationController.Error.poolExhausted {

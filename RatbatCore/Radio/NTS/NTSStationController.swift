@@ -60,6 +60,12 @@ public actor NTSStationController {
         public let youtubeID: String
         public let historyID: Int64    // HistoryStore rowid — for later ♥-save
         public let sourceShowURL: URL
+        /// Display metadata the resolver's extractor already knew. `nil`
+        /// where the extractor didn't report it — an NTS tracklist entry
+        /// resolved through YouTube Music often has no album.
+        public let album: String?
+        public let duration: TimeInterval?
+        public let artworkURL: String?
     }
 
     public enum Error: Swift.Error, Sendable {
@@ -186,7 +192,10 @@ public actor NTSStationController {
                     cachedURL: resolution.cachedURL,
                     youtubeID: resolution.youtubeID,
                     historyID: rowid,
-                    sourceShowURL: sourceShowURL
+                    sourceShowURL: sourceShowURL,
+                    album: resolution.album,
+                    duration: resolution.duration,
+                    artworkURL: resolution.artworkURL
                 )
             } catch TrackResolver.Error.noYouTubeMatch {
                 // Don't record — if the YT catalog adds a match later
