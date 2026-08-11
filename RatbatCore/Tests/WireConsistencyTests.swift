@@ -52,13 +52,17 @@ final class WireConsistencyTests: XCTestCase {
         )
 
         let synthetic = try XCTUnwrap(byTitle["Synthetic"])
-        XCTAssertNil(
-            synthetic["youtubeURL"],
+        XCTAssertTrue(
+            synthetic["youtubeURL"] is NSNull,
             "a synthetic resolver id must not be dressed up as a watch URL"
         )
+        XCTAssertTrue(
+            synthetic["sourceURL"] is NSNull,
+            "no source URL was recorded, and the key still says so"
+        )
         XCTAssertEqual(
-            synthetic["sourceURL"] as? String, nil,
-            "no source URL was recorded for this row, so none is reported"
+            Set(synthetic.keys), Set(byTitle["Real"]!.keys),
+            "two rows in one payload must not have different key sets"
         )
 
         let real = try XCTUnwrap(byTitle["Real"])
