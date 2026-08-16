@@ -184,10 +184,16 @@ public struct RootView: View {
                             didAutoStart = true
                             let resume = Set(preferences.autoStartSlugs)
                                 .union(preferences.lastLiveSlugs)
-                            for station in stations.stations
-                            where resume.contains(station.slug) {
-                                await radio.startBroadcast(station: station)
-                            }
+                            // Concurrent, with retries. This was a
+                            // sequential loop: a generative station's
+                            // bootstrap (Python venv, 30-60s cold) gated
+                            // every station behind it — and the listener
+                            // and tunnel with them, since those come up as
+                            // a side effect of the first station starting.
+                            await radio.resumeStations(
+                                stations.stations,
+                                matching: resume
+                            )
                         }
                     }
                     // Mirror the unified sidebar selection back into the
