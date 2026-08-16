@@ -210,7 +210,7 @@ public final class RadioBroadcaster: ObservableObject {
     var ownerThrottleStep: TimeInterval = 0.5
     var ownerThrottleCeiling: TimeInterval = 5
     private let logger = Logger(
-        subsystem: "se.jonasjohansson.ratbat",
+        subsystem: RatbatLog.subsystem,
         category: "broadcaster"
     )
 
@@ -753,7 +753,7 @@ public final class RadioBroadcaster: ObservableObject {
                 try startHTTPServer()
             } catch {
                 self.error = "Listener failed to start: \(error.localizedDescription)"
-                logger.error("listener start failed: \(String(describing: error))")
+                logger.error("listener start failed: \(String(describing: error), privacy: .public)")
                 return
             }
         }
@@ -1754,8 +1754,40 @@ public final class RadioBroadcaster: ObservableObject {
         // can cancel in-flight client loops cleanly. The connection isn't
         // registered as a client yet (that happens once we've identified
         // its station), so only keep the task in a transient slot.
-        clientTasks[ObjectIdentifier(connection)] = task
+        let id = ObjectIdentifier(connection)
+        clientTasks[id] = task
+
+        // Reap the slot when the connection goes away.
+        //
+        // The only removals used to be `removeClient` — which is wired up
+        // in `registerClient`, i.e. for stream clients only — and
+        // `tearDownListener`. Every /now.json, /history, /events and
+        // action POST therefore left its entry behind forever, so the
+        // dictionary grew monotonically for the whole broadcast session.
+        // `registerClient` replaces this handler for stream clients; that
+        // one also clears `clientTasks`, so both paths are covered.
+        connection.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .failed, .cancelled:
+                Task { @MainActor in
+                    self?.reapConnectionTask(id)
+                }
+            default:
+                break
+            }
+        }
     }
+
+    /// Drop a finished connection's task slot. Safe for connections that
+    /// were never registered as stream clients.
+    private func reapConnectionTask(_ id: ObjectIdentifier) {
+        guard clients[id] == nil else { return }  // stream client: removeClient owns it
+        clientTasks.removeValue(forKey: id)
+    }
+
+    /// How many connection tasks are currently tracked. Test-facing: the
+    /// leak this guards against is invisible from outside.
+    var trackedConnectionTaskCount: Int { clientTasks.count }
 
     private func registerClient(_ connection: NWConnection, stationID: Station.ID) {
         let id = ObjectIdentifier(connection)
@@ -3155,7 +3187,7 @@ public final class RadioBroadcaster: ObservableObject {
         Self.encodeLoopThreadObserver?(pthread_main_np() != 0)
         let decoder = AudioDecoder()
         let log = Logger(
-            subsystem: "se.jonasjohansson.ratbat",
+            subsystem: RatbatLog.subsystem,
             category: "broadcaster.encode"
         )
 
@@ -3167,7 +3199,7 @@ public final class RadioBroadcaster: ObservableObject {
                 bitrate: bitrate
             )
         } catch {
-            log.error("encoder init failed: \(String(describing: error))")
+            log.error("encoder init failed: \(String(describing: error), privacy: .public)")
             if let owner {
                 await MainActor.run {
                     owner.error = "Encoder init failed: \(error.localizedDescription)"
@@ -3338,7 +3370,7 @@ public final class RadioBroadcaster: ObservableObject {
                         buffer.write(encoded)
                     }
                 } catch {
-                    log.error("encode failed: \(String(describing: error))")
+                    log.error("encode failed: \(String(describing: error), privacy: .public)")
                     break
                 }
 

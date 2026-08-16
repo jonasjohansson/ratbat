@@ -18,7 +18,7 @@ public actor MusicBrainzClient {
 
     private let userAgent: String
     private let session: URLSession
-    private let logger = Logger(subsystem: "se.jonasjohansson.ratbat", category: "musicbrainz")
+    private let logger = Logger(subsystem: RatbatLog.subsystem, category: "musicbrainz")
     private static let apiBase = URL(string: "https://musicbrainz.org/ws/2/")!
 
     private var recordingCache: [String: Int?] = [:]

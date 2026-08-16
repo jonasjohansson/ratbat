@@ -135,7 +135,7 @@ public actor TrackResolver {
     private let venvPython: URL
     private let wrapperScript: URL
     private let runner: Runner
-    private let logger = Logger(subsystem: "se.jonasjohansson.ratbat", category: "resolver")
+    private let logger = Logger(subsystem: RatbatLog.subsystem, category: "resolver")
 
     public init(
         venvPython: URL,

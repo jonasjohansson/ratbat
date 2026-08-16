@@ -72,7 +72,7 @@ public actor BandcampClient {
     private static let apiBase = URL(string: "https://bandcamp.com/api/discover/3/get_web")!
     private let userAgent: String
     private let session: URLSession
-    private static let logger = Logger(subsystem: "se.jonasjohansson.ratbat", category: "bandcamp")
+    private static let logger = Logger(subsystem: RatbatLog.subsystem, category: "bandcamp")
     private var lastRequestAt: Date?
 
     public init(userAgent: String, session: URLSession = .shared) {

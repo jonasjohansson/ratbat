@@ -54,7 +54,7 @@ public struct LibraryIndexer: Sendable {
     fileprivate static let enumerationThrottle: TimeInterval = 0.05
 
     fileprivate static let log = Logger(
-        subsystem: "se.jonasjohansson.ratbat",
+        subsystem: RatbatLog.subsystem,
         category: "indexer"
     )
 
