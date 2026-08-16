@@ -30,7 +30,11 @@ public actor NTSSource: TrackSource {
                 origin: .nts,
                 historyID: track.historyID
             )
-        } catch NTSStationController.Error.poolExhausted {
+        } catch let error as NTSStationController.Error where error.endsStation {
+            // `nil` means "this station is over" to the encode loop, so
+            // only genuine end-of-supply may collapse to it. A transient
+            // failure is deliberately NOT caught here: it propagates as a
+            // thrown error, which the encode loop retries with backoff.
             return nil
         }
     }

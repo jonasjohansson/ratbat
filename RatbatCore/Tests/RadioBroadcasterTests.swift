@@ -44,6 +44,129 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertNil(radio.streamURL(for: station))
     }
 
+    // MARK: - A transient failure must not end a station
+
+    /// Throws a network error the first two times, then yields a real
+    /// track. The shape of a Wi-Fi blip or a yt-dlp hiccup.
+    private actor FlakyThenGoodSource: TrackSource {
+        private var calls = 0
+        private let url: URL
+        init(url: URL) { self.url = url }
+        func nextURL() async throws -> TrackSourceItem? {
+            calls += 1
+            if calls <= 2 { throw URLError(.networkConnectionLost) }
+            return TrackSourceItem(
+                url: url,
+                artist: "Recovered",
+                title: "After The Blip",
+                album: nil,
+                duration: nil,
+                artworkURL: nil,
+                sourceURL: nil,
+                youtubeURL: nil,
+                origin: .library,
+                historyID: nil
+            )
+        }
+    }
+
+    /// The headline: a station that hits a transient source failure must
+    /// stay on air and recover, not fold.
+    ///
+    /// Before: the encode loop `break`s on any thrown error, unwinds
+    /// through `stopBroadcastRanDry`, and the station is off until the
+    /// next launch — even though the failure lasted seconds.
+    @MainActor
+    func testTransientSourceFailureDoesNotEndTheStation() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)),
+              let first = tracks.first else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let radio = RadioBroadcaster(port: 18_060)
+        defer { radio.stopAll() }
+
+        let station = Station(name: "Flaky", kind: .playlist(queue: []))
+        await radio.startBroadcast(station: station, source: FlakyThenGoodSource(url: first.url))
+
+        // Two failures at 1s and 2s of backoff, then the good track.
+        try await Task.sleep(nanoseconds: 6_000_000_000)
+
+        XCTAssertTrue(
+            radio.isBroadcasting(stationID: station.id),
+            "a transient source failure took the station off air"
+        )
+        XCTAssertNil(
+            radio.lastOffAir[station.id],
+            "station was folded down: \(String(describing: radio.lastOffAir[station.id]))"
+        )
+    }
+
+    /// Genuine exhaustion must still end the station — the retry loop must
+    /// not turn "there is nothing left to play" into an infinite spin.
+    @MainActor
+    func testGenuineExhaustionStillEndsTheStation() async throws {
+        let radio = RadioBroadcaster(port: 18_061)
+        defer { radio.stopAll() }
+        let station = Station(name: "Really Dry", kind: .playlist(queue: []))
+        await radio.startBroadcast(station: station, source: DrySource())
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+
+        XCTAssertEqual(radio.lastOffAir[station.id]?.reason, .exhausted)
+        XCTAssertFalse(radio.isBroadcasting(stationID: station.id))
+    }
+
+    /// Backoff shape, and its relationship to the other two retry loops.
+    func testSourceErrorBackoffGrowsAndCaps() {
+        XCTAssertEqual(RadioBroadcaster.sourceErrorBackoff(consecutiveFailures: 1), 1)
+        XCTAssertEqual(RadioBroadcaster.sourceErrorBackoff(consecutiveFailures: 2), 2)
+        XCTAssertEqual(RadioBroadcaster.sourceErrorBackoff(consecutiveFailures: 3), 4)
+        XCTAssertEqual(RadioBroadcaster.sourceErrorBackoff(consecutiveFailures: 99), 30, "capped")
+        // Same 30s ceiling as the open-failure backoff and the listener
+        // rebind backoff, so no combination of them can stall recovery for
+        // longer than one cap per loop iteration.
+        XCTAssertEqual(
+            RadioBroadcaster.sourceErrorBackoff(consecutiveFailures: 99),
+            RadioBroadcaster.openFailureBackoff(consecutiveFailures: 99)
+        )
+        XCTAssertEqual(
+            RadioBroadcaster.sourceErrorBackoff(consecutiveFailures: 99),
+            RadioBroadcaster.listenerRebindDelay(forAttempt: 99)
+        )
+    }
+
+    /// A candidate the resolver cannot use and a machine that cannot reach
+    /// the internet are different facts. Sharing a budget is what turned a
+    /// blip into "pool exhausted".
+    func testResolveFailureClassification() {
+        XCTAssertEqual(
+            classifyResolveFailure(TrackResolver.Error.noYouTubeMatch(artist: "A", title: "B")),
+            .genuine
+        )
+        XCTAssertEqual(classifyResolveFailure(TrackResolver.Error.timedOut(seconds: 7)), .transient)
+        XCTAssertEqual(classifyResolveFailure(TrackResolver.Error.downloadFailed("net")), .transient)
+        XCTAssertEqual(classifyResolveFailure(TrackResolver.Error.venvNotReady), .transient)
+        XCTAssertEqual(classifyResolveFailure(URLError(.timedOut)), .transient)
+        // Unknown errors default to transient: mis-classifying a blip as
+        // genuine takes a station off air; the reverse only costs a retry.
+        struct Weird: Swift.Error {}
+        XCTAssertEqual(classifyResolveFailure(Weird()), .transient)
+    }
+
+    /// Only genuine end-of-supply collapses to `nil` at the source layer.
+    /// A transient failure must stay an error so the encode loop can retry
+    /// it instead of reading it as "this station is over".
+    func testOnlyGenuineExhaustionEndsTheStationAtSourceLayer() {
+        XCTAssertTrue(BandcampStationController.Error.poolExhausted.endsStation)
+        XCTAssertTrue(BandcampStationController.Error.noTracksForTags(["x"]).endsStation)
+        XCTAssertFalse(BandcampStationController.Error.transientResolveFailure(count: 8).endsStation)
+
+        XCTAssertTrue(LastFMStationController.Error.poolExhausted.endsStation)
+        XCTAssertFalse(LastFMStationController.Error.transientResolveFailure(count: 8).endsStation)
+
+        XCTAssertTrue(NTSStationController.Error.poolExhausted.endsStation)
+        XCTAssertFalse(NTSStationController.Error.transientResolveFailure(count: 8).endsStation)
+    }
+
     // MARK: - Evidence hygiene
 
     /// Test runs logged to the same subsystem AND categories as production,
@@ -311,23 +434,35 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertEqual(record?.reason.label, "exhausted")
     }
 
-    /// A source error must be distinguishable from graceful exhaustion —
-    /// "it ran out" and "it broke" want different responses.
+    /// A throwing source must NOT be treated as graceful exhaustion.
+    ///
+    /// This test previously asserted the opposite — that a throw recorded
+    /// `.sourceError` and took the station off air. That was the defect:
+    /// a network blip and "the music ran out" are different facts, and
+    /// only the second should end a station. The station now stays live
+    /// and the fault is recorded as a retry instead.
     @MainActor
-    func testSourceErrorIsRecordedDistinctlyFromExhaustion() async throws {
-        let radio = RadioBroadcaster(port: 18_054)
+    func testThrowingSourceKeepsTheStationLiveAndRecordsTheFault() async throws {
+        let radio = RadioBroadcaster(port: 18_062)
         defer { radio.stopAll() }
 
         let station = Station(name: "Broken Station", kind: .playlist(queue: []))
         await radio.startBroadcast(station: station, source: ThrowingSource())
-        try await Task.sleep(nanoseconds: 1_200_000_000)
+        try await Task.sleep(nanoseconds: 2_500_000_000)
 
-        let record = radio.lastOffAir[station.id]
-        XCTAssertNotNil(record)
-        XCTAssertEqual(record?.reason.label, "source-error")
-        if case .sourceError = record?.reason {} else {
-            XCTFail("expected .sourceError, got \(String(describing: record?.reason))")
-        }
+        XCTAssertTrue(
+            radio.isBroadcasting(stationID: station.id),
+            "a throwing source must not end the station"
+        )
+        XCTAssertNil(radio.lastOffAir[station.id], "station must not be folded")
+
+        let retry = radio.sourceRetries[station.id]
+        XCTAssertNotNil(retry, "a station retrying past a fault must say so")
+        XCTAssertGreaterThanOrEqual(retry?.attempt ?? 0, 1)
+        XCTAssertTrue(
+            retry?.reason.contains("Boom") ?? false,
+            "the fault's reason must be retained, got: \(retry?.reason ?? "nil")"
+        )
     }
 
     // MARK: - The public endpoint outlives the last station
