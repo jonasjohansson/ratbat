@@ -170,6 +170,48 @@ public final class RadioBroadcaster: ObservableObject {
 
     @Published public private(set) var lastOffAir: [Station.ID: OffAirRecord] = [:]
 
+    // MARK: - Heartbeat
+
+    /// How often each live station records that it is still on air.
+    nonisolated public static let heartbeatInterval: TimeInterval = 60
+    /// How long heartbeat rows are kept.
+    nonisolated public static let heartbeatRetention: TimeInterval = 30 * 86_400
+
+    private var heartbeatTask: Task<Void, Never>?
+
+    /// Write one row per live station per interval, so that afterwards
+    /// "off air" and "on air but nobody queued anything" can be told
+    /// apart. history.db alone records a row only when a track plays, so
+    /// those two look identical — which is why an overnight outage could
+    /// not be dated.
+    private func startHeartbeatIfNeeded() {
+        #if os(macOS)
+        guard heartbeatTask == nil, history != nil else { return }
+        heartbeatTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let live = await MainActor.run { Array(self.broadcasting) }
+                guard !live.isEmpty else {
+                    try? await Task.sleep(nanoseconds: UInt64(Self.heartbeatInterval * 1_000_000_000))
+                    continue
+                }
+                for stationID in live {
+                    let listeners = await MainActor.run { self.listenerCount[stationID] ?? 0 }
+                    if let store = await MainActor.run(body: { self.history }) {
+                        try? await store.recordHeartbeat(station: stationID, listeners: listeners)
+                    }
+                }
+                try? await Task.sleep(nanoseconds: UInt64(Self.heartbeatInterval * 1_000_000_000))
+            }
+        }
+        #endif
+    }
+
+    private func stopHeartbeat() {
+        heartbeatTask?.cancel()
+        heartbeatTask = nil
+    }
+
     // MARK: - Launch resume
 
     /// Delay before resume attempt `attempt`. Same 1s→30s shape and
@@ -991,6 +1033,8 @@ public final class RadioBroadcaster: ObservableObject {
         #if os(macOS)
         // First-station bootstrap for the tunnel. `CloudflareTunnel.start`
         // is idempotent, but gating on count avoids spurious log churn.
+        startHeartbeatIfNeeded()
+
         if broadcasting.count == 1, publishesPublicly {
             let tunnelPort = port.rawValue
             Task { [weak self] in
@@ -1211,6 +1255,7 @@ public final class RadioBroadcaster: ObservableObject {
     /// pipelines would serve 404s to all comers, which is accurate but
     /// wasteful.
     private func tearDownListener() {
+        stopHeartbeat()
         listenerRebindTask?.cancel()
         listenerRebindTask = nil
         listenerRebindAttempt = 0
