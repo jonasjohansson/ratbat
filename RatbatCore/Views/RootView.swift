@@ -1,5 +1,6 @@
 #if os(macOS)
 import SwiftUI
+import OSLog
 
 /// Top-level macOS view that decides between onboarding (folder picker) and
 /// the library proper, based on whether ``LibraryConfig`` has a stored
@@ -75,11 +76,31 @@ public struct RootView: View {
         // and the scoring actor outlives individual broadcasts so ♥
         // and 👎 signals accumulate across the session.
         let profile = TasteProfile()
+        // A history store that fails to open used to be swallowed by
+        // `try?`. `history` is what `makeBandcampSource` /
+        // `makeLastFMSource` / `makeNTSSource` all guard on, so a broken
+        // DB silently disabled every generative station and the app
+        // carried on as though history had never existed — invisible,
+        // which is the exact failure shape this whole pass exists to kill.
+        //
+        // The migration ladder is now atomic and replayable, so this
+        // should be unreachable; if it ever fires, it must be loud.
+        let historyStore: HistoryStore?
+        do {
+            historyStore = try HistoryStore()
+        } catch {
+            historyStore = nil
+            let message = "history.db could not be opened: \(error). "
+                + "Generative stations (NTS / Last.fm / Bandcamp) are disabled."
+            Logger(subsystem: RatbatLog.subsystem, category: "history")
+                .fault("\(message, privacy: .public)")
+            RootView.historyOpenFailure = message
+        }
         let broadcaster = RadioBroadcaster(
             preferences: .shared,
             downloadService: ds,
             nts: NTSClient(),
-            history: try? HistoryStore(),
+            history: historyStore,
             libraryConfig: config,
             tasteProfile: profile
         )
@@ -88,8 +109,23 @@ public struct RootView: View {
         self.tasteProfile = profile
     }
 
+    /// Set when the history store could not be opened, so the UI can say
+    /// so instead of quietly losing three station types.
+    nonisolated(unsafe) static var historyOpenFailure: String?
+
     public var body: some View {
         VStack(spacing: 0) {
+            // Loud, not silent. Losing history means losing every
+            // generative station; the owner must be able to see that
+            // without reading a log.
+            if let failure = RootView.historyOpenFailure {
+                Text(failure)
+                    .font(.callout)
+                    .foregroundStyle(.white)
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.red)
+            }
             Group {
                 if let folder = config.musicFolder {
                     NavigationSplitView {
