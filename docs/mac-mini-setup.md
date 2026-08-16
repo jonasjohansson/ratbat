@@ -128,11 +128,38 @@ or paste that URL into a browser / VLC. If a broadcast is running on the Mini, y
 From the Mini itself:
 
 ```bash
-# Streams the subsystem-level OSLog so you can watch what Ratbat is doing.
+# Watch live. Note the absolute path: `log` is a zsh builtin, and calling
+# it bare gets you the builtin, which silently answers nothing at all.
 /usr/bin/log stream --predicate 'subsystem == "se.jonasjohansson.ratbat"' --level info --style compact
 ```
 
-Same command you ran during development on the main Mac — useful for troubleshooting pool refills, listener counts, etc.
+`log stream` only shows what happens *while you watch*, which is no use
+for "the radio went dark at some point last night". For that, read back:
+
+```bash
+# What the radio actually did, after the fact. Default level is enough:
+# lifecycle is logged at .notice and failures at .error, both of which
+# the unified log persists. --info/--debug are NOT persisted, so asking
+# for them tells you nothing about last night.
+/usr/bin/log show --last 12h --style compact \
+  --predicate 'subsystem == "se.jonasjohansson.ratbat"'
+
+# Narrow to a surface:
+#   category == "tunnel"               cloudflared lifecycle + why it died
+#   category BEGINSWITH "broadcaster"  listener, stations, encode loop
+```
+
+Test runs log to `se.jonasjohansson.ratbat.tests`, so the predicate above
+is the radio only. That split exists because a two-hour sample once held
+23,056 lines under the production subsystem, every one of them from
+`xctest` and none from the running app.
+
+The outside-in verdict history — one line per check, including the
+periodic watcher if you've loaded it — is plain text:
+
+```bash
+tail -20 ~/Library/Logs/ratbat-verify.log
+```
 
 ---
 
