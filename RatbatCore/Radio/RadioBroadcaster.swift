@@ -141,16 +141,19 @@ public final class RadioBroadcaster: ObservableObject {
     /// absent, with nothing to say when or why it went off air.
     public enum OffAirReason: Equatable, Sendable {
         /// The source returned nil — pool exhausted, playlist empty.
+        ///
+        /// There is deliberately no `sourceError` case. A thrown error is
+        /// a fault, never a statement that the music ran out, so the encode
+        /// loop retries it with backoff instead of folding the station —
+        /// see `sourceErrorBackoff`. Only `nil` ends a station.
         case exhausted
-        /// `nextURL()` threw.
-        case sourceError(String)
+
         /// The task was cancelled: a deliberate stop, or app shutdown.
         case cancelled
 
         public var label: String {
             switch self {
             case .exhausted: return "exhausted"
-            case .sourceError: return "source-error"
             case .cancelled: return "cancelled"
             }
         }
@@ -166,6 +169,35 @@ public final class RadioBroadcaster: ObservableObject {
     }
 
     @Published public private(set) var lastOffAir: [Station.ID: OffAirRecord] = [:]
+
+    /// A station currently retrying past a transient source failure.
+    ///
+    /// It is still on air and still registered, so nothing else would say
+    /// so — and a station that is live but silently retrying is exactly
+    /// the state that used to be invisible.
+    public struct SourceRetryRecord: Equatable, Sendable {
+        public let attempt: Int
+        public let reason: String
+        public let since: Date
+    }
+
+    @Published public private(set) var sourceRetries: [Station.ID: SourceRetryRecord] = [:]
+
+    func recordSourceRetry(stationID: Station.ID, attempt: Int, reason: String) {
+        // Keep the ORIGINAL `since` across a run of retries: what matters
+        // is how long this station has been struggling, not when the most
+        // recent attempt was.
+        let since = sourceRetries[stationID]?.since ?? Date()
+        sourceRetries[stationID] = SourceRetryRecord(
+            attempt: attempt,
+            reason: reason,
+            since: since
+        )
+    }
+
+    func clearSourceRetry(stationID: Station.ID) {
+        sourceRetries.removeValue(forKey: stationID)
+    }
 
     /// Record an off-air transition. Called from the encode loop's unwind.
     func recordOffAir(stationID: Station.ID, reason: OffAirReason, trackIndex: Int) {
@@ -186,6 +218,23 @@ public final class RadioBroadcaster: ObservableObject {
     ///
     /// Deliberately never gives up. A station that stops retrying cannot
     /// come back when the volume returns, and self-healing is the point.
+    /// How long to wait after `consecutiveFailures` source errors in a row.
+    ///
+    /// 1s doubling to a 30s cap — the same ceiling as
+    /// ``openFailureBackoff(consecutiveFailures:)`` and
+    /// ``listenerRebindDelay(forAttempt:)``. A shared cap matters: these
+    /// three retry loops can all be backing off at once during a general
+    /// outage, and a common ceiling means the worst case is one cap, not
+    /// the product of three.
+    ///
+    /// Starts at 1s rather than 0 because, unlike a dead file, a failed
+    /// resolve is never worth retrying instantly — whatever broke needs a
+    /// moment.
+    nonisolated public static func sourceErrorBackoff(consecutiveFailures: Int) -> TimeInterval {
+        guard consecutiveFailures > 1 else { return 1 }
+        return min(30, pow(2, Double(consecutiveFailures - 1)))
+    }
+
     nonisolated public static func openFailureBackoff(consecutiveFailures: Int) -> TimeInterval {
         guard consecutiveFailures > 3 else { return 0 }
         return min(30, 0.5 * pow(2, Double(consecutiveFailures - 4)))
@@ -3225,6 +3274,11 @@ public final class RadioBroadcaster: ObservableObject {
         var prefetch: Task<TrackSourceItem?, Error>?
         // Run-length of back-to-back failed opens, reset on any success.
         var consecutiveOpenFailures = 0
+        // Same, for source errors. Separate because they are separate
+        // faults: one means the library is unreadable, the other that the
+        // resolver or network is. Only one can fire per iteration, so
+        // their delays never compound within a single pass.
+        var consecutiveSourceErrors = 0
         // Why this loop ended. Overwritten by the two `break` paths below;
         // staying `.cancelled` means the task was torn down from outside.
         var exitReason: OffAirReason = .cancelled
@@ -3253,10 +3307,37 @@ public final class RadioBroadcaster: ObservableObject {
                 } else {
                     nextItem = try await source.nextURL()
                 }
-            } catch {
-                log.error("source error: \(String(describing: error), privacy: .public)")
-                exitReason = .sourceError(String(describing: error))
+            } catch is CancellationError {
+                exitReason = .cancelled
                 break
+            } catch {
+                // Retry rather than fold.
+                //
+                // This `break` used to end the station for ANY thrown
+                // error, and the generative controllers laundered network
+                // failures into `poolExhausted` -> nil -> the same fate.
+                // A blip lasting seconds took a station off air until the
+                // next launch. Genuine exhaustion still arrives as `nil`
+                // and still ends the station, just below.
+                consecutiveSourceErrors += 1
+                let backoff = Self.sourceErrorBackoff(
+                    consecutiveFailures: consecutiveSourceErrors
+                )
+                log.error(
+                    "source error on \(stationName, privacy: .public) (\(consecutiveSourceErrors, privacy: .public) in a row): \(String(describing: error), privacy: .public); retrying in \(backoff, privacy: .public)s"
+                )
+                if let owner {
+                    await MainActor.run {
+                        owner.recordSourceRetry(
+                            stationID: stationID,
+                            attempt: consecutiveSourceErrors,
+                            reason: String(describing: error)
+                        )
+                    }
+                }
+                prefetch = nil
+                try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
+                continue outer
             }
             prefetch = nil
 
@@ -3271,6 +3352,9 @@ public final class RadioBroadcaster: ObservableObject {
                 break
             }
             trackIndex += 1
+            // Got an item: whatever was wrong with the source has passed.
+            consecutiveSourceErrors = 0
+            if owner != nil { await MainActor.run { owner?.clearSourceRetry(stationID: stationID) } }
 
             do {
                 try decoder.open(url: item.url)

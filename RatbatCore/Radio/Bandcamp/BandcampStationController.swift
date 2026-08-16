@@ -72,6 +72,24 @@ public actor BandcampStationController {
         case poolExhausted
         case noTracksForTags([String])
         case resolveFailed(artist: String, title: String, underlying: Swift.Error)
+        /// Too many resolves failed for reasons that say nothing about
+        /// the pool — timeouts, download failures, an unreachable network.
+        /// Deliberately distinct from ``poolExhausted``: the station has
+        /// not run out of music, the machine is having a moment.
+        case transientResolveFailure(count: Int)
+
+        /// Whether this error means the station is genuinely over.
+        ///
+        /// Only end-of-supply qualifies. A transient failure must stay an
+        /// error so the encode loop retries it, instead of collapsing to
+        /// `nil` at the source layer and being read as "station over".
+        public var endsStation: Bool {
+            switch self {
+            case .poolExhausted, .noTracksForTags: return true
+            case .transientResolveFailure: return false
+            case .resolveFailed: return true
+            }
+        }
     }
 
     private let config: BandcampStationConfig
@@ -152,11 +170,17 @@ public actor BandcampStationController {
         // is the deepest of the three and can take a long time to turn over.
         await reapplyPolicyIfChanged()
 
+        // Two budgets, deliberately separate. `attempts` counts candidates
+        // the resolver genuinely cannot use; `transientFailures` counts
+        // times the machine or network was having a moment. Sharing one
+        // budget is what let a network blip masquerade as an empty pool
+        // and take the station off air.
         let maxAttempts = 30
+        let maxTransientFailures = 8
         var attempts = 0
+        var transientFailures = 0
 
-        while attempts < maxAttempts {
-            attempts += 1
+        while attempts < maxAttempts, transientFailures < maxTransientFailures {
 
             if cursor >= pool.count {
                 try await refillPool()
@@ -173,7 +197,7 @@ public actor BandcampStationController {
                 artist: candidate.artist,
                 title: candidate.title
             )
-            if seen { continue }
+            if seen { attempts += 1; continue }
 
             do {
                 // Direct-URL shortcut (Task 10): the resolver branches
@@ -223,13 +247,26 @@ public actor BandcampStationController {
                 )
             } catch TrackResolver.Error.noYouTubeMatch {
                 logger.info("no YT match for \(candidate.artist, privacy: .public) — \(candidate.title, privacy: .public); skipping")
+                attempts += 1
                 continue
             } catch {
                 logger.error("resolve failed for \(candidate.artist, privacy: .public) — \(candidate.title, privacy: .public): \(String(describing: error), privacy: .public)")
+                // Cancellation is the app shutting us down, not a
+                // resolve problem — it must propagate, not be counted.
+                if error is CancellationError { throw error }
+                switch classifyResolveFailure(error) {
+                case .genuine: attempts += 1
+                case .transient: transientFailures += 1
+                }
                 continue
             }
         }
 
+        // Which budget ran out decides what this means. Only a spent
+        // candidate budget is "the pool is empty".
+        if transientFailures >= maxTransientFailures {
+            throw Error.transientResolveFailure(count: transientFailures)
+        }
         throw Error.poolExhausted
     }
 
