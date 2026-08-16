@@ -44,6 +44,58 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertNil(radio.streamURL(for: station))
     }
 
+    // MARK: - A cancelled encode loop must not fold its successor
+
+    /// Parks for a long time, then reports exhaustion — a resolve that is
+    /// still in flight when the owner stops the station.
+    private actor ParkThenDrySource: TrackSource {
+        func nextURL() async throws -> TrackSourceItem? {
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            return nil
+        }
+    }
+
+    /// Never returns, so the station it backs stays live for the test.
+    private actor NeverSource: TrackSource {
+        func nextURL() async throws -> TrackSourceItem? {
+            try? await Task.sleep(nanoseconds: 60_000_000_000)
+            return nil
+        }
+    }
+
+    /// The exit block keys on `stationID` alone. A cancelled loop can
+    /// outlive its cancellation while parked on an unstructured prefetch,
+    /// so when it finally unwinds it folds down whatever pipeline is
+    /// registered for that station — including a freshly restarted one.
+    ///
+    /// Restarting a stuck station is the owner's most natural repair, and
+    /// this made it silently undo itself a few seconds later.
+    @MainActor
+    func testZombieEncodeLoopDoesNotFoldTheRestartedStation() async throws {
+        let radio = RadioBroadcaster(port: 18_057)
+        defer { radio.stopAll() }
+
+        let station = Station(name: "Zombie", kind: .playlist(queue: []))
+
+        // First run parks mid-resolve.
+        await radio.startBroadcast(station: station, source: ParkThenDrySource())
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        // Owner stops it and immediately starts it again — the old loop is
+        // still parked and has not unwound yet.
+        radio.stopBroadcast(stationID: station.id)
+        await radio.startBroadcast(station: station, source: NeverSource())
+        XCTAssertTrue(radio.isBroadcasting(stationID: station.id), "restart should be live")
+
+        // Outlive the parked resolve so the zombie unwinds.
+        try await Task.sleep(nanoseconds: 5_000_000_000)
+
+        XCTAssertTrue(
+            radio.isBroadcasting(stationID: station.id),
+            "the cancelled loop tore down the station that replaced it"
+        )
+    }
+
     // MARK: - The encode loop must actually be off the main actor
 
     private final class ThreadBox: @unchecked Sendable {

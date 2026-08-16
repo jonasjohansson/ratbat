@@ -252,6 +252,14 @@ public final class RadioBroadcaster: ObservableObject {
     /// accessed from the main actor; the detached tasks inside only hold
     /// weak refs to the broadcaster and reach back through `MainActor.run`.
     private final class BroadcastPipeline {
+        /// Identity for this particular run of the station.
+        ///
+        /// A cancelled encode loop can outlive its cancellation while
+        /// parked on an unstructured prefetch, so `stationID` alone does
+        /// not tell the exit block whether the pipeline it is about to
+        /// fold is still its own — or the freshly restarted one that
+        /// replaced it.
+        let token = UUID()
         /// Refreshed by ``RadioBroadcaster/registerStations(_:)`` when the
         /// user edits a live station. It used to be a `let` snapshotted at
         /// broadcast start, which is why `/now.json` and `/history` kept
@@ -760,6 +768,7 @@ public final class RadioBroadcaster: ObservableObject {
             sampleRate: sampleRate
         )
         pipelines[station.id] = pipeline
+        let pipelineToken = pipeline.token
         // A station we are broadcasting is one we can always name, even if
         // nobody registered the catalogue (older callers, tests).
         stationNames[station.id] = station.name
@@ -799,6 +808,7 @@ public final class RadioBroadcaster: ObservableObject {
                 bitrate: bitrate,
                 sampleRate: sampleRate,
                 recordPlayThrough: recordPlayThrough,
+                pipelineToken: pipelineToken,
                 owner: self
             )
         }
@@ -3068,6 +3078,7 @@ public final class RadioBroadcaster: ObservableObject {
         bitrate: Int,
         sampleRate: Double,
         recordPlayThrough: (@Sendable (Int64) async -> Void)?,
+        pipelineToken: UUID,
         owner: RadioBroadcaster?
     ) async {
         // `Thread.isMainThread` is unavailable from async contexts, so
@@ -3294,7 +3305,12 @@ public final class RadioBroadcaster: ObservableObject {
                 // UI reflects reality and the listener can cycle. A
                 // cancellation-driven exit has already mutated the state
                 // from the main actor, so this is a no-op in that case.
-                if owner.broadcasting.contains(stationID) {
+                // Identity, not just station: only fold down the
+                // pipeline this loop actually owns. Without the token a
+                // zombie loop unwinding late tore down whatever had
+                // replaced it, which silently undid the owner's restart.
+                if owner.broadcasting.contains(stationID),
+                   owner.pipelines[stationID]?.token == pipelineToken {
                     // Running dry is not the owner saying "stop". Reaching
                     // here means the loop exited on its own; a deliberate
                     // stop has already cleared `broadcasting`, so the guard
