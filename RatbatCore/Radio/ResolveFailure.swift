@@ -1,3 +1,4 @@
+#if os(macOS)
 import Foundation
 
 /// Why a candidate failed to resolve — and, crucially, whether that says
@@ -50,3 +51,4 @@ public func classifyResolveFailure(_ error: Swift.Error) -> ResolveFailureKind {
     if error is URLError { return .transient }
     return .transient
 }
+#endif
