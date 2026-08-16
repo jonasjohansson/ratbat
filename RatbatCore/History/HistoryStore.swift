@@ -159,25 +159,16 @@ public actor HistoryStore {
         try Self.execRaw("PRAGMA synchronous = NORMAL;", on: handle)
         try Self.execRaw("PRAGMA foreign_keys = ON;", on: handle)
 
-        if Self.userVersion(on: handle) < 1 {
-            try Self.migrateToV1(on: handle)
-            try Self.execRaw("PRAGMA user_version = 1;", on: handle)
-            logger.info("history.db migrated to v1 at \(self.dbURL.path, privacy: .public)")
-        }
-        if Self.userVersion(on: handle) < 2 {
-            try Self.migrateToV2(on: handle)
-            try Self.execRaw("PRAGMA user_version = 2;", on: handle)
-            logger.info("history.db migrated to v2 at \(self.dbURL.path, privacy: .public)")
-        }
-        if Self.userVersion(on: handle) < 3 {
-            try Self.migrateToV3(on: handle)
-            try Self.execRaw("PRAGMA user_version = 3;", on: handle)
-            logger.info("history.db migrated to v3 at \(self.dbURL.path, privacy: .public)")
-        }
-        if Self.userVersion(on: handle) < 4 {
-            try Self.migrateToV4(on: handle)
-            try Self.execRaw("PRAGMA user_version = 4;", on: handle)
-            logger.info("history.db migrated to v4 at \(self.dbURL.path, privacy: .public)")
+        // Each step is atomic with its own version bump, and every step is
+        // replayable, so an interrupted migration is recoverable rather
+        // than terminal. `.notice`, not `.info`, so a migration that ran
+        // is still visible in the log tomorrow.
+        for (version, step) in Self.migrations {
+            guard Self.userVersion(on: handle) < version else { continue }
+            try Self.migrationStep(to: version, on: handle, step)
+            logger.notice(
+                "history.db migrated to v\(version, privacy: .public) at \(self.dbURL.path, privacy: .public)"
+            )
         }
     }
 
@@ -686,6 +677,76 @@ public actor HistoryStore {
         }
     }
 
+    /// Does `table` already have `column`?
+    ///
+    /// Cheap insurance that makes every ADD COLUMN replayable. Without it
+    /// a re-run of an already-applied migration hits SQLite's "duplicate
+    /// column name" and the whole store fails to open.
+    private static func columnExists(
+        table: String,
+        column: String,
+        on handle: OpaquePointer
+    ) -> Bool {
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(handle, "PRAGMA table_info(\(table));", -1, &stmt, nil) == SQLITE_OK else {
+            return false
+        }
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let raw = sqlite3_column_text(stmt, 1), String(cString: raw) == column {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// `ALTER TABLE ... ADD COLUMN`, skipped if the column is already there.
+    private static func addColumn(
+        _ column: String,
+        to table: String,
+        type: String,
+        on handle: OpaquePointer
+    ) throws {
+        guard !columnExists(table: table, column: column, on: handle) else { return }
+        try execRaw("ALTER TABLE \(table) ADD COLUMN \(column) \(type);", on: handle)
+    }
+
+    /// Run one migration step and its version bump atomically.
+    ///
+    /// The steps used to run bare, with `PRAGMA user_version` set only
+    /// afterwards. A crash or a deploy's `killall Ratbat` between the two
+    /// left a database whose columns existed but whose recorded version
+    /// said they did not, and every subsequent open died on "duplicate
+    /// column name" — permanently, because the single construction site
+    /// swallowed the throw. Reproduced in
+    /// `testInterruptedMigrationCanStillBeOpened`.
+    ///
+    /// SQLite makes DDL and `user_version` transactional, so one
+    /// BEGIN/COMMIT round genuinely makes this all-or-nothing.
+    private static func migrationStep(
+        to version: Int,
+        on handle: OpaquePointer,
+        _ body: (OpaquePointer) throws -> Void
+    ) throws {
+        try execRaw("BEGIN IMMEDIATE;", on: handle)
+        do {
+            try body(handle)
+            try execRaw("PRAGMA user_version = \(version);", on: handle)
+            try execRaw("COMMIT;", on: handle)
+        } catch {
+            try? execRaw("ROLLBACK;", on: handle)
+            throw error
+        }
+    }
+
+    /// The migration ladder, in order. Adding a step means adding a row.
+    private static var migrations: [(Int, (OpaquePointer) throws -> Void)] { [
+        (1, migrateToV1),
+        (2, migrateToV2),
+        (3, migrateToV3),
+        (4, migrateToV4),
+    ] }
+
     private static func userVersion(on handle: OpaquePointer) -> Int {
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
@@ -703,18 +764,9 @@ public actor HistoryStore {
     /// `migrateToV1` once that method is also bumped; for now v1 → v2 is
     /// an additive migration so existing histories keep their data.
     private static func migrateToV2(on handle: OpaquePointer) throws {
-        try execRaw(
-            "ALTER TABLE history ADD COLUMN skipped INTEGER NOT NULL DEFAULT 0;",
-            on: handle
-        )
-        try execRaw(
-            "ALTER TABLE history ADD COLUMN skipped_at REAL;",
-            on: handle
-        )
-        try execRaw(
-            "ALTER TABLE history ADD COLUMN play_count INTEGER NOT NULL DEFAULT 0;",
-            on: handle
-        )
+        try addColumn("skipped", to: "history", type: "INTEGER NOT NULL DEFAULT 0", on: handle)
+        try addColumn("skipped_at", to: "history", type: "REAL", on: handle)
+        try addColumn("play_count", to: "history", type: "INTEGER NOT NULL DEFAULT 0", on: handle)
         try execRaw(
             "CREATE INDEX IF NOT EXISTS history_skipped ON history(station_id, skipped, artist_norm);",
             on: handle
@@ -842,10 +894,7 @@ public actor HistoryStore {
     /// v3: the boost signal — "more of this", the strong steering ♥.
     /// NULL = never boosted. Same idempotent-ALTER pattern as v2.
     private static func migrateToV3(on handle: OpaquePointer) throws {
-        try execRaw(
-            "ALTER TABLE history ADD COLUMN boosted_at REAL;",
-            on: handle
-        )
+        try addColumn("boosted_at", to: "history", type: "REAL", on: handle)
     }
 
     /// v4: the selection audit log. The mix-set filter will eventually

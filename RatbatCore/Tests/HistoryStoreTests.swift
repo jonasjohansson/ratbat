@@ -224,3 +224,82 @@ final class HistoryStoreTests: XCTestCase {
     }
 }
 #endif
+
+// MARK: - Migration replayability (batch 6 pre-check)
+
+extension HistoryStoreTests {
+    /// Reproduces an interrupted migration.
+    ///
+    /// Each step runs non-idempotent `ALTER TABLE ... ADD COLUMN` outside
+    /// any transaction and bumps `PRAGMA user_version` only afterwards, so
+    /// a crash or a deploy's `killall` between the two leaves a database
+    /// whose columns exist but whose recorded version says they do not.
+    ///
+    /// Simulated by winding `user_version` back with the columns left in
+    /// place — byte-identical to what an interrupted migration leaves.
+    func testInterruptedMigrationCanStillBeOpened() async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mig-\(UUID().uuidString).sqlite")
+
+        // Fully migrated, healthy database.
+        _ = try await HistoryStore(databaseURL: url)
+
+        // Wind the version back, leaving the new columns present.
+        let sqlite = Process()
+        sqlite.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        sqlite.arguments = [url.path, "PRAGMA user_version = 1;"]
+        try sqlite.run()
+        sqlite.waitUntilExit()
+
+        // Must still open. Re-running an already-applied ALTER must not be
+        // fatal — every generative station depends on this store, and the
+        // single construction site swallows the throw with `try?`.
+        _ = try await HistoryStore(databaseURL: url)
+    }
+
+    /// Answers the question that matters for anyone who already has a
+    /// broken history.db: does this RECOVER one, or only stop new ones?
+    ///
+    /// It recovers, because the ALTERs are now skipped when the column is
+    /// already there — so replaying the interrupted step succeeds, the
+    /// version bump lands, and the existing rows are untouched.
+    func testAlreadyBrokenDatabaseIsRecoveredNotJustPrevented() async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("recover-\(UUID().uuidString).sqlite")
+
+        // A real database with real content.
+        let original = try await HistoryStore(databaseURL: url)
+        _ = try await original.record(
+            station: UUID(),
+            artist: "Before The Break",
+            title: "Row One",
+            sourceShowURL: URL(string: "https://example.com")!,
+            youtubeID: "abc",
+            cachedPath: "/tmp/x.m4a"
+        )
+
+        // Break it exactly as an interrupted migration would.
+        let wind = Process()
+        wind.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        wind.arguments = [url.path, "PRAGMA user_version = 1;"]
+        try wind.run(); wind.waitUntilExit()
+
+        // Reopen with the fixed ladder.
+        let recovered = try await HistoryStore(databaseURL: url)
+
+        let version = Process()
+        version.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        version.arguments = [url.path, "PRAGMA user_version;"]
+        let pipe = Pipe(); version.standardOutput = pipe
+        try version.run(); version.waitUntilExit()
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertEqual(out, "4", "version was not repaired")
+
+        let rows = try await recovered.recentEntries(limit: 10)
+        XCTAssertTrue(
+            rows.contains { $0.artist == "Before The Break" },
+            "recovery must not lose existing history"
+        )
+    }
+}
