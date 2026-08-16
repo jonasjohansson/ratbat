@@ -294,12 +294,136 @@ extension HistoryStoreTests {
         try version.run(); version.waitUntilExit()
         let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        XCTAssertEqual(out, "4", "version was not repaired")
+        XCTAssertEqual(
+            out, String(HistoryStore.latestSchemaVersion),
+            "version was not repaired"
+        )
 
         let rows = try await recovered.recentEntries(limit: 10)
         XCTAssertTrue(
             rows.contains { $0.artist == "Before The Break" },
             "recovery must not lose existing history"
         )
+    }
+
+    // MARK: - Heartbeat: outage vs quiet
+
+    /// The whole point of the table.
+    ///
+    /// history.db records a row only when a track plays, so "the station
+    /// was off air" and "the station was on air and nobody queued
+    /// anything" are the same absence of rows. After the fact they are
+    /// indistinguishable, which is why an overnight outage could not be
+    /// dated.
+    ///
+    /// A heartbeat row per station per interval separates them.
+    func testHeartbeatDistinguishesOffAirFromQuiet() async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hb-\(UUID().uuidString).sqlite")
+        let store = try await HistoryStore(databaseURL: url)
+
+        let quiet = UUID()    // on air the whole window, played nothing
+        let offAir = UUID()   // not running at all
+        let playing = UUID()  // on air and playing
+
+        let now = Date()
+        let windowStart = now.addingTimeInterval(-3_600)
+        // Ends slightly ahead: the play below is recorded after `now` is
+        // captured, and a window that excludes it would make the assertion
+        // test the clock rather than the feature.
+        let windowEnd = now.addingTimeInterval(300)
+
+        // Quiet station: heartbeats, no plays.
+        for minutesAgo in stride(from: 55, through: 5, by: -10) {
+            try await store.recordHeartbeat(
+                station: quiet,
+                at: now.addingTimeInterval(-Double(minutesAgo) * 60),
+                listeners: 0
+            )
+        }
+        // Playing station: heartbeats AND a play.
+        for minutesAgo in stride(from: 55, through: 5, by: -10) {
+            try await store.recordHeartbeat(
+                station: playing,
+                at: now.addingTimeInterval(-Double(minutesAgo) * 60),
+                listeners: 1
+            )
+        }
+        _ = try await store.record(
+            station: playing,
+            artist: "Someone",
+            title: "Something",
+            sourceShowURL: URL(string: "https://example.com")!,
+            youtubeID: "y",
+            cachedPath: "/tmp/a.m4a"
+        )
+        // Off-air station: nothing at all.
+
+        // history alone cannot tell these apart — that is the defect.
+        let quietPlays = try await store.recentEntries(forStation: quiet, limit: 10).count
+        let offAirPlays = try await store.recentEntries(forStation: offAir, limit: 10).count
+        XCTAssertEqual(quietPlays, 0)
+        XCTAssertEqual(offAirPlays, 0)
+        XCTAssertEqual(quietPlays, offAirPlays, "history cannot discriminate; that is why heartbeat exists")
+
+        // The heartbeat table can.
+        let quietState = try await store.liveness(station: quiet, from: windowStart, to: windowEnd)
+        let offAirState = try await store.liveness(station: offAir, from: windowStart, to: windowEnd)
+        let playingState = try await store.liveness(station: playing, from: windowStart, to: windowEnd)
+
+        XCTAssertEqual(quietState, .onAirButQuiet, "an on-air station with no plays must not read as an outage")
+        XCTAssertEqual(offAirState, .offAir, "a station with no heartbeats in the window was off air")
+        XCTAssertEqual(playingState, .onAirAndPlaying)
+        XCTAssertNotEqual(quietState, offAirState, "the two must be distinguishable — the point of the feature")
+    }
+
+    /// A gap inside the window is datable: when did it stop, when did it
+    /// come back.
+    func testHeartbeatGapIsDatable() async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hbgap-\(UUID().uuidString).sqlite")
+        let store = try await HistoryStore(databaseURL: url)
+        let station = UUID()
+        let now = Date()
+
+        // On air 60-40 min ago, dark 40-20, back 20-0.
+        for m in [60, 55, 50, 45, 40] {
+            try await store.recordHeartbeat(station: station, at: now.addingTimeInterval(-Double(m) * 60), listeners: 0)
+        }
+        for m in [20, 15, 10, 5, 0] {
+            try await store.recordHeartbeat(station: station, at: now.addingTimeInterval(-Double(m) * 60), listeners: 0)
+        }
+
+        let gaps = try await store.offAirGaps(
+            station: station,
+            from: now.addingTimeInterval(-3_600),
+            to: now,
+            expectedInterval: 300
+        )
+        XCTAssertEqual(gaps.count, 1, "expected exactly one gap, got \(gaps)")
+        let gap = try XCTUnwrap(gaps.first)
+        XCTAssertEqual(gap.duration, 20 * 60, accuracy: 90, "gap should be ~20 minutes, was \(gap.duration)s")
+    }
+
+    /// Retention: the table must not grow forever.
+    func testHeartbeatRetentionPrunesOldRows() async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hbprune-\(UUID().uuidString).sqlite")
+        let store = try await HistoryStore(databaseURL: url)
+        let station = UUID()
+        let now = Date()
+
+        try await store.recordHeartbeat(station: station, at: now.addingTimeInterval(-40 * 86_400), listeners: 0)
+        try await store.recordHeartbeat(station: station, at: now.addingTimeInterval(-1 * 86_400), listeners: 0)
+
+        let pruned = try await store.pruneHeartbeats(olderThan: now.addingTimeInterval(-30 * 86_400))
+        XCTAssertEqual(pruned, 1, "the 40-day-old row should have been pruned")
+
+        let remaining = try await store.heartbeats(
+            station: station,
+            from: now.addingTimeInterval(-365 * 86_400),
+            to: now
+        )
+        XCTAssertEqual(remaining.count, 1)
     }
 }

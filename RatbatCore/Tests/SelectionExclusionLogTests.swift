@@ -24,9 +24,11 @@ final class SelectionExclusionLogTests: XCTestCase {
 
     // MARK: - Migration
 
-    func testFreshDatabaseLandsAtV4() async throws {
+    func testFreshDatabaseLandsAtLatestSchemaVersion() async throws {
         _ = try await HistoryStore(databaseURL: tempURL)
-        XCTAssertEqual(try readUserVersion(), 4)
+        // Assert against the ladder, not a literal: hardcoding the number
+        // meant adding a migration silently broke three unrelated tests.
+        XCTAssertEqual(try readUserVersion(), HistoryStore.latestSchemaVersion)
     }
 
     func testV3DatabaseMigratesToV4WithoutDataLoss() async throws {
@@ -36,7 +38,9 @@ final class SelectionExclusionLogTests: XCTestCase {
         XCTAssertEqual(try readUserVersion(), 3, "precondition: seeded DB is v3")
 
         let store = try await HistoryStore(databaseURL: tempURL)
-        XCTAssertEqual(try readUserVersion(), 4)
+        // Assert against the ladder, not a literal: hardcoding the number
+        // meant adding a migration silently broke three unrelated tests.
+        XCTAssertEqual(try readUserVersion(), HistoryStore.latestSchemaVersion)
 
         let survivors = try await store.recentEntries(limit: 50)
         XCTAssertEqual(survivors.map(\.artist).sorted(), ["Coil", "Gas"])
@@ -56,7 +60,9 @@ final class SelectionExclusionLogTests: XCTestCase {
         }
         // Reopening must not re-run the migration, throw, or drop the log.
         let store = try await HistoryStore(databaseURL: tempURL)
-        XCTAssertEqual(try readUserVersion(), 4)
+        // Assert against the ladder, not a literal: hardcoding the number
+        // meant adding a migration silently broke three unrelated tests.
+        XCTAssertEqual(try readUserVersion(), HistoryStore.latestSchemaVersion)
         let logged = try await store.exclusions(stationID: station, limit: 10)
         XCTAssertEqual(logged.count, 1)
         XCTAssertEqual(logged.first?.artist, "Stars of the Lid")

@@ -739,12 +739,132 @@ public actor HistoryStore {
         }
     }
 
+    /// v5: liveness. One row per station per interval while it is on air.
+    ///
+    /// history.db records a row only when a track *plays*, so "off air"
+    /// and "on air but nobody queued anything" are the same absence of
+    /// rows — which is why an overnight outage could not be dated after
+    /// the fact. A heartbeat separates the two.
+    private static func migrateToV5(on handle: OpaquePointer) throws {
+        try execRaw("""
+            CREATE TABLE IF NOT EXISTS heartbeat (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                station_id TEXT    NOT NULL,
+                at         REAL    NOT NULL,
+                listeners  INTEGER NOT NULL DEFAULT 0
+            );
+            """, on: handle)
+        try execRaw(
+            "CREATE INDEX IF NOT EXISTS heartbeat_station_at ON heartbeat(station_id, at);",
+            on: handle
+        )
+    }
+
+    // MARK: - Heartbeat
+
+    /// What a station was doing over a window, after the fact.
+    public enum Liveness: Equatable, Sendable {
+        /// Heartbeats and at least one play.
+        case onAirAndPlaying
+        /// Heartbeats but no plays — running, nothing queued. NOT an outage.
+        case onAirButQuiet
+        /// No heartbeats in the window: the station was not running.
+        case offAir
+    }
+
+    public struct HeartbeatRow: Equatable, Sendable {
+        public let at: Date
+        public let listeners: Int
+    }
+
+    /// A stretch with no heartbeats, i.e. time the station was off air.
+    public struct OffAirGap: Equatable, Sendable {
+        public let start: Date
+        public let end: Date
+        public var duration: TimeInterval { end.timeIntervalSince(start) }
+    }
+
+    public func recordHeartbeat(station: UUID, at when: Date = Date(), listeners: Int = 0) throws {
+        let stmt = try prepare("INSERT INTO heartbeat (station_id, at, listeners) VALUES (?, ?, ?);")
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, station.uuidString, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_double(stmt, 2, when.timeIntervalSince1970)
+        sqlite3_bind_int(stmt, 3, Int32(listeners))
+        guard sqlite3_step(stmt) == SQLITE_DONE else { throw Error.queryFailed(lastError()) }
+    }
+
+    public func heartbeats(station: UUID, from: Date, to: Date) throws -> [HeartbeatRow] {
+        let stmt = try prepare(
+            "SELECT at, listeners FROM heartbeat WHERE station_id = ? AND at >= ? AND at <= ? ORDER BY at ASC;"
+        )
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, station.uuidString, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_double(stmt, 2, from.timeIntervalSince1970)
+        sqlite3_bind_double(stmt, 3, to.timeIntervalSince1970)
+        var rows: [HeartbeatRow] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            rows.append(HeartbeatRow(
+                at: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 0)),
+                listeners: Int(sqlite3_column_int(stmt, 1))
+            ))
+        }
+        return rows
+    }
+
+    /// The question this table exists to answer.
+    public func liveness(station: UUID, from: Date, to: Date) throws -> Liveness {
+        guard !(try heartbeats(station: station, from: from, to: to).isEmpty) else {
+            return .offAir
+        }
+        let played = try recentEntries(forStation: station, limit: 1).contains {
+            $0.playedAt >= from && $0.playedAt <= to
+        }
+        return played ? .onAirAndPlaying : .onAirButQuiet
+    }
+
+    /// Stretches inside the window with no heartbeat for longer than
+    /// `expectedInterval` — i.e. when the station was dark, and for how long.
+    public func offAirGaps(
+        station: UUID,
+        from: Date,
+        to: Date,
+        expectedInterval: TimeInterval
+    ) throws -> [OffAirGap] {
+        let beats = try heartbeats(station: station, from: from, to: to)
+        guard !beats.isEmpty else { return [OffAirGap(start: from, end: to)] }
+        // A gap counts when two consecutive beats are more than twice the
+        // expected interval apart — one missed beat is jitter, a run of
+        // them is an outage.
+        let threshold = expectedInterval * 2
+        var gaps: [OffAirGap] = []
+        for (previous, next) in zip(beats, beats.dropFirst())
+        where next.at.timeIntervalSince(previous.at) > threshold {
+            gaps.append(OffAirGap(start: previous.at, end: next.at))
+        }
+        return gaps
+    }
+
+    /// Retention. Returns how many rows were removed.
+    @discardableResult
+    public func pruneHeartbeats(olderThan cutoff: Date) throws -> Int {
+        let stmt = try prepare("DELETE FROM heartbeat WHERE at < ?;")
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_double(stmt, 1, cutoff.timeIntervalSince1970)
+        guard sqlite3_step(stmt) == SQLITE_DONE else { throw Error.queryFailed(lastError()) }
+        return Int(sqlite3_changes(db))
+    }
+
+    /// The newest schema version. Tests assert against this rather than a
+    /// literal, so adding a migration cannot silently rot them.
+    public static var latestSchemaVersion: Int { migrations.map(\.0).max() ?? 0 }
+
     /// The migration ladder, in order. Adding a step means adding a row.
     private static var migrations: [(Int, (OpaquePointer) throws -> Void)] { [
         (1, migrateToV1),
         (2, migrateToV2),
         (3, migrateToV3),
         (4, migrateToV4),
+        (5, migrateToV5),
     ] }
 
     private static func userVersion(on handle: OpaquePointer) -> Int {
