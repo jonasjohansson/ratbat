@@ -44,6 +44,44 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertNil(radio.streamURL(for: station))
     }
 
+    // MARK: - The encode loop must actually be off the main actor
+
+    private final class ThreadBox: @unchecked Sendable {
+        var samples: [Bool] = []
+    }
+
+    /// `runEncodeLoop`, `serveClient` and `awaitListener` are `static func`
+    /// on a `@MainActor` class and were never marked `nonisolated`, so
+    /// despite `Task.detached` they hopped straight back to the main
+    /// thread — running the synchronous `AVAudioFile.read` against the
+    /// music folder, and the AAC encode, on the main actor.
+    ///
+    /// 25 other helpers in this file are `nonisolated`; these three were
+    /// simply missed. One stalled file read blocks every station's encoder
+    /// and every listener's stream, plus the whole UI.
+    @MainActor
+    func testEncodeLoopDoesNotRunOnTheMainThread() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let box = ThreadBox()
+        RadioBroadcaster.encodeLoopThreadObserver = { isMain in box.samples.append(isMain) }
+        defer { RadioBroadcaster.encodeLoopThreadObserver = nil }
+
+        let radio = RadioBroadcaster(port: 18_056)
+        let station = Station(name: "Thread Test", kind: .playlist(queue: tracks))
+        await radio.startBroadcast(station: station)
+        defer { radio.stopAll() }
+
+        try await Task.sleep(nanoseconds: 800_000_000)
+
+        XCTAssertFalse(box.samples.isEmpty, "probe never fired — encode loop did not start")
+        XCTAssertEqual(
+            box.samples.first, false,
+            "encode loop ran on the main thread: Task.detached is defeated by MainActor isolation"
+        )
+    }
+
     // MARK: - Cold start must not advertise a stream it cannot fill
 
     /// A source that takes a while — the shape of a Bandcamp/NTS first

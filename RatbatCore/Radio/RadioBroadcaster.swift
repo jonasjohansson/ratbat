@@ -122,6 +122,16 @@ public final class RadioBroadcaster: ObservableObject {
     /// `XCTestConfigurationFilePath` is set by the test runner for both
     /// `xcodebuild test` and Xcode's test action, and is absent in a
     /// normally-launched app.
+    /// Test hook: reports the thread the encode loop actually starts on.
+    ///
+    /// The loop is launched with `Task.detached`, but that only detaches if
+    /// the function is `nonisolated`. A `static func` on a `@MainActor`
+    /// class inherits the actor, so `await Self.runEncodeLoop(...)` hopped
+    /// straight back to the main thread and did the AVAudioFile reads and
+    /// the AAC encode there. This exists so that is provable rather than
+    /// argued.
+    nonisolated(unsafe) static var encodeLoopThreadObserver: (@Sendable (Bool) -> Void)?
+
     /// Why a station's encode loop stopped.
     ///
     /// Running dry is the one shutdown that is graceful by design, so it
@@ -2857,7 +2867,7 @@ public final class RadioBroadcaster: ObservableObject {
         """
     }
 
-    private static func serveClient(
+    nonisolated private static func serveClient(
         connection: NWConnection,
         buffer: AACRingBuffer,
         stationID: Station.ID,
@@ -3050,7 +3060,7 @@ public final class RadioBroadcaster: ObservableObject {
 
     // MARK: - Encode loop (detached)
 
-    private static func runEncodeLoop(
+    nonisolated private static func runEncodeLoop(
         source: TrackSource,
         stationID: Station.ID,
         stationName: String,
@@ -3060,6 +3070,9 @@ public final class RadioBroadcaster: ObservableObject {
         recordPlayThrough: (@Sendable (Int64) async -> Void)?,
         owner: RadioBroadcaster?
     ) async {
+        // `Thread.isMainThread` is unavailable from async contexts, so
+        // ask pthread directly.
+        Self.encodeLoopThreadObserver?(pthread_main_np() != 0)
         let decoder = AudioDecoder()
         let log = Logger(
             subsystem: "se.jonasjohansson.ratbat",
@@ -3310,7 +3323,7 @@ public final class RadioBroadcaster: ObservableObject {
     /// `listenerCount` every 5s. Returns immediately when already ≥1, or when
     /// the task is cancelled. Logs one line on entering idle and one on
     /// resuming, so long idles are visible in the OSLog stream.
-    private static func awaitListener(
+    nonisolated private static func awaitListener(
         stationID: Station.ID,
         owner: RadioBroadcaster?,
         log: Logger
