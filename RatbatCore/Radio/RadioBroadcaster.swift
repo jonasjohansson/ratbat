@@ -122,6 +122,65 @@ public final class RadioBroadcaster: ObservableObject {
     /// `XCTestConfigurationFilePath` is set by the test runner for both
     /// `xcodebuild test` and Xcode's test action, and is absent in a
     /// normally-launched app.
+    /// Why a station's encode loop stopped.
+    ///
+    /// Running dry is the one shutdown that is graceful by design, so it
+    /// left no crash report, no error-level log and no on-disk marker —
+    /// both the exhaustion notice and the loop exit were `.info`, which
+    /// this machine does not persist. At 09:00 the station was simply
+    /// absent, with nothing to say when or why it went off air.
+    public enum OffAirReason: Equatable, Sendable {
+        /// The source returned nil — pool exhausted, playlist empty.
+        case exhausted
+        /// `nextURL()` threw.
+        case sourceError(String)
+        /// The task was cancelled: a deliberate stop, or app shutdown.
+        case cancelled
+
+        public var label: String {
+            switch self {
+            case .exhausted: return "exhausted"
+            case .sourceError: return "source-error"
+            case .cancelled: return "cancelled"
+            }
+        }
+    }
+
+    /// When and why each station last went off air. Survives in memory for
+    /// the UI and `/now.json`; the matching log line is emitted at a level
+    /// the unified log actually keeps.
+    public struct OffAirRecord: Equatable, Sendable {
+        public let reason: OffAirReason
+        public let at: Date
+        public let trackIndex: Int
+    }
+
+    @Published public private(set) var lastOffAir: [Station.ID: OffAirRecord] = [:]
+
+    /// Record an off-air transition. Called from the encode loop's unwind.
+    func recordOffAir(stationID: Station.ID, reason: OffAirReason, trackIndex: Int) {
+        lastOffAir[stationID] = OffAirRecord(
+            reason: reason,
+            at: Date(),
+            trackIndex: trackIndex
+        )
+    }
+
+    /// How long to wait after `consecutiveFailures` failed opens in a row.
+    ///
+    /// Zero for the first few: a handful of dead entries in an otherwise
+    /// healthy library should be skipped at full speed, and a station that
+    /// hits one bad file must not stutter. Sustained failure means
+    /// something structural — the volume unmounted, the folder moved — so
+    /// back off geometrically instead of spinning a core.
+    ///
+    /// Deliberately never gives up. A station that stops retrying cannot
+    /// come back when the volume returns, and self-healing is the point.
+    nonisolated public static func openFailureBackoff(consecutiveFailures: Int) -> TimeInterval {
+        guard consecutiveFailures > 3 else { return 0 }
+        return min(30, 0.5 * pow(2, Double(consecutiveFailures - 4)))
+    }
+
     nonisolated public static var isRunningUnderXCTest: Bool {
         ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
     }
@@ -814,7 +873,22 @@ public final class RadioBroadcaster: ObservableObject {
     /// lifecycle too, not intent: the encode loop's own unwind goes through
     /// ``stopBroadcastRanDry(stationID:)`` so starvation cannot quietly
     /// delete a station.
-    private func stopBroadcast(stationID: Station.ID, forgetLive: Bool) {
+    /// - Parameter tearDownIfEmpty: whether losing the last station should
+    ///   also close the shared listener and the tunnel. Only the explicit
+    ///   shutdown gesture (``stopAll()``) passes `true`.
+    ///
+    ///   The tunnel's lifetime used to be coupled to `broadcasting.count`,
+    ///   so pool exhaustion, a source error or an ordinary station switch
+    ///   took the whole public hostname down and every listener got a
+    ///   Cloudflare origin error until someone noticed. Keeping the
+    ///   endpoint up to serve 404 is strictly better: the name still
+    ///   resolves, the failure is legible to a health check, and a station
+    ///   switch is invisible to listeners.
+    private func stopBroadcast(
+        stationID: Station.ID,
+        forgetLive: Bool,
+        tearDownIfEmpty: Bool = false
+    ) {
         guard let pipeline = pipelines[stationID] else { return }
         if forgetLive {
             preferences.forgetLive(slug: pipeline.station.slug)
@@ -837,7 +911,7 @@ public final class RadioBroadcaster: ObservableObject {
             clients.removeValue(forKey: id)
         }
 
-        if broadcasting.isEmpty {
+        if broadcasting.isEmpty, tearDownIfEmpty {
             tearDownListener()
         }
 
@@ -849,8 +923,11 @@ public final class RadioBroadcaster: ObservableObject {
     /// gesture, and the next launch should resume what was playing.
     public func stopAll() {
         for id in Array(pipelines.keys) {
-            stopBroadcast(stationID: id, forgetLive: false)
+            stopBroadcast(stationID: id, forgetLive: false, tearDownIfEmpty: true)
         }
+        // Idempotent, and covers the case where there were no pipelines
+        // left to iterate but the listener/tunnel were still up.
+        tearDownListener()
         // A full stop resets the "needs restart" banner — the next start
         // will pick up current preferences as its fresh baseline.
         needsRestart = false
@@ -2745,6 +2822,41 @@ public final class RadioBroadcaster: ObservableObject {
     /// header and pumps the pipeline's ring buffer to the client. ICY
     /// metadata (if requested) is injected every 16384 bytes using the
     /// station's current track.
+    /// How long a listener waits on a cold start before we admit the
+    /// station isn't ready. Long enough to cover a slow first resolve,
+    /// short enough that a player's own timeout doesn't beat us to it.
+    nonisolated static let coldStartTimeout: TimeInterval = 12
+
+    /// Poll for the ring's first byte. Returns false on timeout.
+    nonisolated private static func awaitFirstAudio(
+        buffer: AACRingBuffer,
+        timeout: TimeInterval
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if Task.isCancelled { return false }
+            if buffer.hasProducedAudio() { return true }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        return buffer.hasProducedAudio()
+    }
+
+    /// 503 for a station that is registered but has produced no audio yet.
+    /// `Retry-After` tells a well-behaved player to come back rather than
+    /// treat the station as permanently broken.
+    nonisolated static func serviceUnavailableResponse() -> String {
+        let body = "not ready"
+        return """
+        HTTP/1.1 503 Service Unavailable\r
+        Content-Type: text/plain\r
+        Content-Length: \(body.utf8.count)\r
+        Retry-After: 5\r
+        Connection: close\r
+        \r
+        \(body)
+        """
+    }
+
     private static func serveClient(
         connection: NWConnection,
         buffer: AACRingBuffer,
@@ -2753,6 +2865,33 @@ public final class RadioBroadcaster: ObservableObject {
         wantsMetadata: Bool,
         ownerRef: @escaping @Sendable () -> RadioBroadcaster?
     ) async {
+        // Don't promise a stream we can't yet fill.
+        //
+        // The pipeline is registered — and so serves 200 + ICY headers,
+        // and reports broadcasting:true — before the first track has
+        // resolved. A new listener's cursor starts at the live edge of an
+        // empty ring, so the player got a valid-looking `200 audio/aac`
+        // and then silence for however long the resolve took (~18s for a
+        // Bandcamp first track via yt-dlp). Most players give up, and the
+        // window is indistinguishable from a genuinely broken station to
+        // any check that only reads the status line.
+        //
+        // Wait, bounded, for the first byte. If it never comes, say so
+        // honestly with a retryable 503 instead of a 200 that lies.
+        if !buffer.hasProducedAudio() {
+            let ready = await awaitFirstAudio(
+                buffer: buffer,
+                timeout: coldStartTimeout
+            )
+            if !ready {
+                _ = await send(
+                    data: Data(serviceUnavailableResponse().utf8),
+                    on: connection
+                )
+                return
+            }
+        }
+
         let responseHeader = buildResponseHeader(
             wantsMetadata: wantsMetadata,
             stationName: stationName
@@ -2959,6 +3098,11 @@ public final class RadioBroadcaster: ObservableObject {
         // behind ~minutes of audio. At most one fetch is ever in flight;
         // it's cancelled on loop exit.
         var prefetch: Task<TrackSourceItem?, Error>?
+        // Run-length of back-to-back failed opens, reset on any success.
+        var consecutiveOpenFailures = 0
+        // Why this loop ended. Overwritten by the two `break` paths below;
+        // staying `.cancelled` means the task was torn down from outside.
+        var exitReason: OffAirReason = .cancelled
 
         // Outer loop: pull items until the source is exhausted or the
         // task is cancelled. Inner loop: pump PCM → AAC → ring buffer
@@ -2986,12 +3130,19 @@ public final class RadioBroadcaster: ObservableObject {
                 }
             } catch {
                 log.error("source error: \(String(describing: error), privacy: .public)")
+                exitReason = .sourceError(String(describing: error))
                 break
             }
             prefetch = nil
 
             guard let item = nextItem else {
-                log.info("source exhausted for \(stationName, privacy: .public)")
+                // `.notice`, not `.info`: the unified log does not persist
+                // info-level messages, so the only record of a station
+                // running dry overnight evaporated before anyone looked.
+                log.notice(
+                    "station off air: \(stationName, privacy: .public) reason=exhausted trackIndex=\(trackIndex, privacy: .public)"
+                )
+                exitReason = .exhausted
                 break
             }
             trackIndex += 1
@@ -3022,8 +3173,29 @@ public final class RadioBroadcaster: ObservableObject {
             } catch {
                 let label = item.title ?? item.url.lastPathComponent
                 log.error("open failed for \(label, privacy: .public) at \(item.url.path, privacy: .public): \(String(describing: error), privacy: .public)")
+
+                // Throttle sustained failure. Without this the loop went
+                // straight back round with no delay: with a listener
+                // attached `awaitListener` returns instantly, so an
+                // unreadable library (unmounted volume, moved folder) span
+                // as fast as the CPU allowed — pegging a core and writing
+                // a fabricated history row per iteration, because
+                // `PlaylistSource.nextURL` records the play before the
+                // file is opened. Measured at >10,000 rows in 3 seconds.
+                consecutiveOpenFailures += 1
+                let backoff = Self.openFailureBackoff(
+                    consecutiveFailures: consecutiveOpenFailures
+                )
+                if backoff > 0 {
+                    log.error(
+                        "\(consecutiveOpenFailures, privacy: .public) consecutive open failures on \(stationName, privacy: .public); backing off \(backoff, privacy: .public)s"
+                    )
+                    try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
+                }
                 continue outer
             }
+            // Opened cleanly — this run of failures is over.
+            consecutiveOpenFailures = 0
 
             // Resolve the NEXT track now, concurrently with this track's
             // playout (~minutes), so its yt-dlp download or pool refill is
@@ -3120,11 +3292,18 @@ public final class RadioBroadcaster: ObservableObject {
                     // station that starved overnight would be silently gone
                     // after the next restart — indistinguishable from the
                     // owner having turned it off.
+                    owner.recordOffAir(
+                        stationID: stationID,
+                        reason: exitReason,
+                        trackIndex: trackIndex
+                    )
                     owner.stopBroadcastRanDry(stationID: stationID)
                 }
             }
         }
-        log.info("encode loop exiting")
+        log.notice(
+            "encode loop exiting: \(stationName, privacy: .public) reason=\(exitReason.label, privacy: .public) trackIndex=\(trackIndex, privacy: .public)"
+        )
     }
 
     /// Block until at least one listener is connected to `stationID`, polling

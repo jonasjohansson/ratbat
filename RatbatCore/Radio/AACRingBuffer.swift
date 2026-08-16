@@ -130,6 +130,18 @@ final class AACRingBuffer: @unchecked Sendable {
 
     /// Cursor for a brand-new listener. Starts at "now" so they don't
     /// have to chew through a stale buffer to catch up.
+    /// Has this station ever produced a byte?
+    ///
+    /// A new listener's cursor starts at the live edge, so on a cold start
+    /// there is nothing to read and nothing to wait for except the first
+    /// write. Callers use this to avoid promising a stream they cannot yet
+    /// fill.
+    func hasProducedAudio() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return totalWritten > 0
+    }
+
     func readCursor() -> Cursor {
         lock.lock()
         defer { lock.unlock() }
