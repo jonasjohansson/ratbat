@@ -122,6 +122,16 @@ public final class RadioBroadcaster: ObservableObject {
     /// `XCTestConfigurationFilePath` is set by the test runner for both
     /// `xcodebuild test` and Xcode's test action, and is absent in a
     /// normally-launched app.
+    /// Test hook: reports the thread the encode loop actually starts on.
+    ///
+    /// The loop is launched with `Task.detached`, but that only detaches if
+    /// the function is `nonisolated`. A `static func` on a `@MainActor`
+    /// class inherits the actor, so `await Self.runEncodeLoop(...)` hopped
+    /// straight back to the main thread and did the AVAudioFile reads and
+    /// the AAC encode there. This exists so that is provable rather than
+    /// argued.
+    nonisolated(unsafe) static var encodeLoopThreadObserver: (@Sendable (Bool) -> Void)?
+
     /// Why a station's encode loop stopped.
     ///
     /// Running dry is the one shutdown that is graceful by design, so it
@@ -242,6 +252,14 @@ public final class RadioBroadcaster: ObservableObject {
     /// accessed from the main actor; the detached tasks inside only hold
     /// weak refs to the broadcaster and reach back through `MainActor.run`.
     private final class BroadcastPipeline {
+        /// Identity for this particular run of the station.
+        ///
+        /// A cancelled encode loop can outlive its cancellation while
+        /// parked on an unstructured prefetch, so `stationID` alone does
+        /// not tell the exit block whether the pipeline it is about to
+        /// fold is still its own — or the freshly restarted one that
+        /// replaced it.
+        let token = UUID()
         /// Refreshed by ``RadioBroadcaster/registerStations(_:)`` when the
         /// user edits a live station. It used to be a `let` snapshotted at
         /// broadcast start, which is why `/now.json` and `/history` kept
@@ -293,6 +311,9 @@ public final class RadioBroadcaster: ObservableObject {
     /// the listener count moves, instead of polling `/now.json`. Keyed by
     /// connection identity so a disconnect drops the right one.
     private var sseSubscribers: [ObjectIdentifier: NWConnection] = [:]
+    /// Consecutive listener rebind attempts, reset when it reaches .ready.
+    private var listenerRebindAttempt = 0
+    private var listenerRebindTask: Task<Void, Never>?
 
     /// Construct a broadcaster bound to a specific port. Primarily for
     /// tests that need deterministic ports without trampling the
@@ -750,6 +771,7 @@ public final class RadioBroadcaster: ObservableObject {
             sampleRate: sampleRate
         )
         pipelines[station.id] = pipeline
+        let pipelineToken = pipeline.token
         // A station we are broadcasting is one we can always name, even if
         // nobody registered the catalogue (older callers, tests).
         stationNames[station.id] = station.name
@@ -789,6 +811,7 @@ public final class RadioBroadcaster: ObservableObject {
                 bitrate: bitrate,
                 sampleRate: sampleRate,
                 recordPlayThrough: recordPlayThrough,
+                pipelineToken: pipelineToken,
                 owner: self
             )
         }
@@ -1022,6 +1045,9 @@ public final class RadioBroadcaster: ObservableObject {
     /// pipelines would serve 404s to all comers, which is accurate but
     /// wasteful.
     private func tearDownListener() {
+        listenerRebindTask?.cancel()
+        listenerRebindTask = nil
+        listenerRebindAttempt = 0
         #if os(macOS)
         tunnel.stop()
         #endif
@@ -1200,6 +1226,52 @@ public final class RadioBroadcaster: ObservableObject {
 
     // MARK: - HTTP server
 
+    /// Delay before rebind attempt `attempt` (1-based): 0.5s doubling to a
+    /// 30s cap. Same shape as the tunnel supervisor's backoff.
+    nonisolated public static func listenerRebindDelay(forAttempt attempt: Int) -> TimeInterval {
+        guard attempt > 1 else { return 0.5 }
+        return min(30, 0.5 * pow(2, Double(attempt - 1)))
+    }
+
+    /// Rebind the shared listener after a failure, with backoff.
+    ///
+    /// Never escalates to `stopAll()`. A listener that gives up cannot come
+    /// back when the conflicting process exits or the interface returns,
+    /// and staying off air forever is a worse outcome than retrying — the
+    /// same reasoning as the tunnel supervisor and the open-failure
+    /// backoff.
+    private func scheduleListenerRebind(reason: String) {
+        // Nothing to serve — don't churn on a listener nobody needs.
+        guard !pipelines.isEmpty else { return }
+        // One rebind in flight at a time.
+        guard listenerRebindTask == nil else { return }
+
+        listenerRebindAttempt += 1
+        let delay = Self.listenerRebindDelay(forAttempt: listenerRebindAttempt)
+        logger.error(
+            "listener \(reason, privacy: .public); rebinding in \(delay, privacy: .public)s (attempt \(self.listenerRebindAttempt, privacy: .public))"
+        )
+
+        listenerRebindTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            await MainActor.run {
+                guard let self else { return }
+                self.listenerRebindTask = nil
+                guard !self.pipelines.isEmpty else { return }
+                self.listener?.cancel()
+                self.listener = nil
+                do {
+                    try self.startHTTPServer()
+                } catch {
+                    self.logger.error(
+                        "listener rebind threw: \(String(describing: error), privacy: .public)"
+                    )
+                    self.scheduleListenerRebind(reason: "rebind threw")
+                }
+            }
+        }
+    }
+
     private func startHTTPServer() throws {
         let params = NWParameters.tcp
         // Allow re-binding immediately on restart instead of waiting for
@@ -1211,10 +1283,27 @@ public final class RadioBroadcaster: ObservableObject {
             guard let self else { return }
             Task { @MainActor in
                 switch state {
+                case .ready:
+                    self.listenerRebindAttempt = 0
+                    self.error = nil
+                    self.logger.notice(
+                        "listener ready on port \(self.port.rawValue, privacy: .public)"
+                    )
                 case .failed(let err):
+                    // Was `stopAll()`: a single transient bind problem took
+                    // every station off air with no retry and no rebind —
+                    // and since stopAll also drops the tunnel, the public
+                    // hostname went with it, permanently.
                     self.error = "Listener failed: \(err.localizedDescription)"
                     self.logger.error("listener failed: \(String(describing: err), privacy: .public)")
-                    self.stopAll()
+                    self.scheduleListenerRebind(reason: "failed")
+                case .waiting(let err):
+                    // `.waiting` is where a bind conflict or a lost
+                    // interface lands. It used to fall into `default` and
+                    // be ignored completely, so the radio sat there
+                    // silently un-bound.
+                    self.logger.error("listener waiting: \(String(describing: err), privacy: .public)")
+                    self.scheduleListenerRebind(reason: "waiting")
                 case .cancelled:
                     self.logger.info("listener cancelled")
                 default:
@@ -2857,7 +2946,7 @@ public final class RadioBroadcaster: ObservableObject {
         """
     }
 
-    private static func serveClient(
+    nonisolated private static func serveClient(
         connection: NWConnection,
         buffer: AACRingBuffer,
         stationID: Station.ID,
@@ -3050,7 +3139,7 @@ public final class RadioBroadcaster: ObservableObject {
 
     // MARK: - Encode loop (detached)
 
-    private static func runEncodeLoop(
+    nonisolated private static func runEncodeLoop(
         source: TrackSource,
         stationID: Station.ID,
         stationName: String,
@@ -3058,8 +3147,12 @@ public final class RadioBroadcaster: ObservableObject {
         bitrate: Int,
         sampleRate: Double,
         recordPlayThrough: (@Sendable (Int64) async -> Void)?,
+        pipelineToken: UUID,
         owner: RadioBroadcaster?
     ) async {
+        // `Thread.isMainThread` is unavailable from async contexts, so
+        // ask pthread directly.
+        Self.encodeLoopThreadObserver?(pthread_main_np() != 0)
         let decoder = AudioDecoder()
         let log = Logger(
             subsystem: "se.jonasjohansson.ratbat",
@@ -3281,7 +3374,12 @@ public final class RadioBroadcaster: ObservableObject {
                 // UI reflects reality and the listener can cycle. A
                 // cancellation-driven exit has already mutated the state
                 // from the main actor, so this is a no-op in that case.
-                if owner.broadcasting.contains(stationID) {
+                // Identity, not just station: only fold down the
+                // pipeline this loop actually owns. Without the token a
+                // zombie loop unwinding late tore down whatever had
+                // replaced it, which silently undid the owner's restart.
+                if owner.broadcasting.contains(stationID),
+                   owner.pipelines[stationID]?.token == pipelineToken {
                     // Running dry is not the owner saying "stop". Reaching
                     // here means the loop exited on its own; a deliberate
                     // stop has already cleared `broadcasting`, so the guard
@@ -3310,7 +3408,7 @@ public final class RadioBroadcaster: ObservableObject {
     /// `listenerCount` every 5s. Returns immediately when already ≥1, or when
     /// the task is cancelled. Logs one line on entering idle and one on
     /// resuming, so long idles are visible in the OSLog stream.
-    private static func awaitListener(
+    nonisolated private static func awaitListener(
         stationID: Station.ID,
         owner: RadioBroadcaster?,
         log: Logger

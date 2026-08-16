@@ -44,6 +44,150 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertNil(radio.streamURL(for: station))
     }
 
+    // MARK: - A listener failure must be survivable
+
+    /// The listener's only failure response was `stopAll()` — no retry, no
+    /// rebind, no re-arm — and `.waiting`, which is where a bind conflict
+    /// or a lost interface lands, fell into `default: break` and was
+    /// ignored entirely.
+    ///
+    /// Since batch 1 made `stopAll()` also tear down the tunnel, a
+    /// transient bind conflict took the whole public endpoint down for
+    /// good. Here the port is occupied first, so the broadcaster's listener
+    /// cannot bind; once it is freed the broadcaster must recover on its
+    /// own rather than staying dark.
+    @MainActor
+    func testListenerRecoversFromABindConflict() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let port: UInt16 = 18_058
+
+        // Occupy the port with a plain listener that does NOT share it.
+        let squatterParams = NWParameters.tcp
+        let squatter = try NWListener(using: squatterParams, on: NWEndpoint.Port(rawValue: port)!)
+        squatter.newConnectionHandler = { $0.cancel() }
+        squatter.start(queue: .global())
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        let radio = RadioBroadcaster(port: port)
+        defer { radio.stopAll() }
+        let station = Station(name: "Rebind", kind: .playlist(queue: tracks))
+        await radio.startBroadcast(station: station)
+        try await Task.sleep(nanoseconds: 800_000_000)
+
+        // The station must still be considered live — a bind problem is
+        // not a reason to erase the broadcast.
+        XCTAssertTrue(
+            radio.isBroadcasting(stationID: station.id),
+            "a bind conflict killed the broadcast outright"
+        )
+
+        // Free the port; the broadcaster should rebind by itself.
+        squatter.cancel()
+
+        var served = false
+        for _ in 0..<20 {
+            try await Task.sleep(nanoseconds: 500_000_000)
+            if let r = await Self.probeEndpoint(port: port, path: "/now.json", timeout: 1),
+               r.contains("HTTP/1.1 200") {
+                served = true
+                break
+            }
+        }
+        XCTAssertTrue(served, "listener never rebound after the port was freed")
+    }
+
+    // MARK: - A cancelled encode loop must not fold its successor
+
+    /// Parks for a long time, then reports exhaustion — a resolve that is
+    /// still in flight when the owner stops the station.
+    private actor ParkThenDrySource: TrackSource {
+        func nextURL() async throws -> TrackSourceItem? {
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            return nil
+        }
+    }
+
+    /// Never returns, so the station it backs stays live for the test.
+    private actor NeverSource: TrackSource {
+        func nextURL() async throws -> TrackSourceItem? {
+            try? await Task.sleep(nanoseconds: 60_000_000_000)
+            return nil
+        }
+    }
+
+    /// The exit block keys on `stationID` alone. A cancelled loop can
+    /// outlive its cancellation while parked on an unstructured prefetch,
+    /// so when it finally unwinds it folds down whatever pipeline is
+    /// registered for that station — including a freshly restarted one.
+    ///
+    /// Restarting a stuck station is the owner's most natural repair, and
+    /// this made it silently undo itself a few seconds later.
+    @MainActor
+    func testZombieEncodeLoopDoesNotFoldTheRestartedStation() async throws {
+        let radio = RadioBroadcaster(port: 18_057)
+        defer { radio.stopAll() }
+
+        let station = Station(name: "Zombie", kind: .playlist(queue: []))
+
+        // First run parks mid-resolve.
+        await radio.startBroadcast(station: station, source: ParkThenDrySource())
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        // Owner stops it and immediately starts it again — the old loop is
+        // still parked and has not unwound yet.
+        radio.stopBroadcast(stationID: station.id)
+        await radio.startBroadcast(station: station, source: NeverSource())
+        XCTAssertTrue(radio.isBroadcasting(stationID: station.id), "restart should be live")
+
+        // Outlive the parked resolve so the zombie unwinds.
+        try await Task.sleep(nanoseconds: 5_000_000_000)
+
+        XCTAssertTrue(
+            radio.isBroadcasting(stationID: station.id),
+            "the cancelled loop tore down the station that replaced it"
+        )
+    }
+
+    // MARK: - The encode loop must actually be off the main actor
+
+    private final class ThreadBox: @unchecked Sendable {
+        var samples: [Bool] = []
+    }
+
+    /// `runEncodeLoop`, `serveClient` and `awaitListener` are `static func`
+    /// on a `@MainActor` class and were never marked `nonisolated`, so
+    /// despite `Task.detached` they hopped straight back to the main
+    /// thread — running the synchronous `AVAudioFile.read` against the
+    /// music folder, and the AAC encode, on the main actor.
+    ///
+    /// 25 other helpers in this file are `nonisolated`; these three were
+    /// simply missed. One stalled file read blocks every station's encoder
+    /// and every listener's stream, plus the whole UI.
+    @MainActor
+    func testEncodeLoopDoesNotRunOnTheMainThread() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let box = ThreadBox()
+        RadioBroadcaster.encodeLoopThreadObserver = { isMain in box.samples.append(isMain) }
+        defer { RadioBroadcaster.encodeLoopThreadObserver = nil }
+
+        let radio = RadioBroadcaster(port: 18_056)
+        let station = Station(name: "Thread Test", kind: .playlist(queue: tracks))
+        await radio.startBroadcast(station: station)
+        defer { radio.stopAll() }
+
+        try await Task.sleep(nanoseconds: 800_000_000)
+
+        XCTAssertFalse(box.samples.isEmpty, "probe never fired — encode loop did not start")
+        XCTAssertEqual(
+            box.samples.first, false,
+            "encode loop ran on the main thread: Task.detached is defeated by MainActor isolation"
+        )
+    }
+
     // MARK: - Cold start must not advertise a stream it cannot fill
 
     /// A source that takes a while — the shape of a Bandcamp/NTS first
