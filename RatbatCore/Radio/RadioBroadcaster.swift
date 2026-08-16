@@ -829,7 +829,22 @@ public final class RadioBroadcaster: ObservableObject {
     /// lifecycle too, not intent: the encode loop's own unwind goes through
     /// ``stopBroadcastRanDry(stationID:)`` so starvation cannot quietly
     /// delete a station.
-    private func stopBroadcast(stationID: Station.ID, forgetLive: Bool) {
+    /// - Parameter tearDownIfEmpty: whether losing the last station should
+    ///   also close the shared listener and the tunnel. Only the explicit
+    ///   shutdown gesture (``stopAll()``) passes `true`.
+    ///
+    ///   The tunnel's lifetime used to be coupled to `broadcasting.count`,
+    ///   so pool exhaustion, a source error or an ordinary station switch
+    ///   took the whole public hostname down and every listener got a
+    ///   Cloudflare origin error until someone noticed. Keeping the
+    ///   endpoint up to serve 404 is strictly better: the name still
+    ///   resolves, the failure is legible to a health check, and a station
+    ///   switch is invisible to listeners.
+    private func stopBroadcast(
+        stationID: Station.ID,
+        forgetLive: Bool,
+        tearDownIfEmpty: Bool = false
+    ) {
         guard let pipeline = pipelines[stationID] else { return }
         if forgetLive {
             preferences.forgetLive(slug: pipeline.station.slug)
@@ -852,7 +867,7 @@ public final class RadioBroadcaster: ObservableObject {
             clients.removeValue(forKey: id)
         }
 
-        if broadcasting.isEmpty {
+        if broadcasting.isEmpty, tearDownIfEmpty {
             tearDownListener()
         }
 
@@ -864,8 +879,11 @@ public final class RadioBroadcaster: ObservableObject {
     /// gesture, and the next launch should resume what was playing.
     public func stopAll() {
         for id in Array(pipelines.keys) {
-            stopBroadcast(stationID: id, forgetLive: false)
+            stopBroadcast(stationID: id, forgetLive: false, tearDownIfEmpty: true)
         }
+        // Idempotent, and covers the case where there were no pipelines
+        // left to iterate but the listener/tunnel were still up.
+        tearDownListener()
         // A full stop resets the "needs restart" banner — the next start
         // will pick up current preferences as its fresh baseline.
         needsRestart = false

@@ -44,6 +44,68 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertNil(radio.streamURL(for: station))
     }
 
+    // MARK: - The public endpoint outlives the last station
+
+    /// The tunnel's lifetime used to be coupled to `broadcasting.count`:
+    /// the last station stopping ran `tearDownListener()`, which cancels
+    /// the NWListener *and* stops cloudflared. So pool exhaustion, a source
+    /// error, or a plain station switch took the entire public hostname
+    /// down — every listener got a Cloudflare origin error, indefinitely,
+    /// while Ratbat.app sat there looking healthy.
+    ///
+    /// Serving 404 on a live hostname is strictly better: the name still
+    /// resolves, the outage is legible, and a station switch is invisible.
+    @MainActor
+    func testStoppingTheLastStationKeepsTheEndpointServing() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let port: UInt16 = 18_051
+        let radio = RadioBroadcaster(port: port)
+        defer { radio.stopAll() }
+
+        let station = Station(name: "Only Station", kind: .playlist(queue: tracks))
+        await radio.startBroadcast(station: station)
+        try await Task.sleep(nanoseconds: 600_000_000)
+
+        // The one and only station goes away — the shape of pool
+        // exhaustion, a source error, and the stop half of a switch.
+        radio.stopBroadcast(stationID: station.id)
+        XCTAssertTrue(radio.broadcasting.isEmpty)
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        let response = await Self.probeEndpoint(port: port, path: "/now.json")
+        XCTAssertNotNil(
+            response,
+            "listener was torn down — the public hostname just went dark"
+        )
+        XCTAssertTrue(
+            response?.contains("HTTP/1.1 200") ?? false,
+            "endpoint must keep answering after the last station stops, got: \(response ?? "nil")"
+        )
+    }
+
+    /// The explicit shutdown gesture still tears everything down, so
+    /// quitting doesn't leave a tunnel pointing at a dead port.
+    @MainActor
+    func testStopAllStillTearsTheListenerDown() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let port: UInt16 = 18_052
+        let radio = RadioBroadcaster(port: port)
+
+        let station = Station(name: "Doomed", kind: .playlist(queue: tracks))
+        await radio.startBroadcast(station: station)
+        try await Task.sleep(nanoseconds: 600_000_000)
+
+        radio.stopAll()
+        try await Task.sleep(nanoseconds: 500_000_000)
+
+        let response = await Self.probeEndpoint(port: port, path: "/now.json")
+        XCTAssertNil(response, "stopAll must close the listener, got: \(response ?? "nil")")
+    }
+
     // MARK: - An unreadable library must not hot-spin the encode loop
 
     /// Backoff shape: a handful of bad files in an otherwise fine library
@@ -1206,6 +1268,72 @@ final class RadioBroadcasterTests: XCTestCase {
     /// UTF-8. Raw sockets rather than URLSession because URLSession drops
     /// custom `Icy-*` request headers, hides non-standard response
     /// headers, and auto-follows 302s so we can't assert on the redirect.
+    /// Is anything listening on `port`? Returns the response text, or nil
+    /// if the port is closed.
+    ///
+    /// Not `fetchRawResponse`: that only resumes on `.ready`, `.failed` or
+    /// `.cancelled`, and a refused TCP connection on macOS reports
+    /// `.waiting` (Network.framework keeps retrying rather than failing).
+    /// Probing a closed port with it hangs forever — which it did, for
+    /// seven minutes, before this helper existed.
+    nonisolated static func probeEndpoint(
+        port: UInt16,
+        path: String,
+        timeout: TimeInterval = 3
+    ) async -> String? {
+        let connection = NWConnection(
+            host: NWEndpoint.Host("127.0.0.1"),
+            port: NWEndpoint.Port(rawValue: port)!,
+            using: .tcp
+        )
+        defer { connection.cancel() }
+
+        let latch = OnceLatch()
+        let reachable: Bool = await withCheckedContinuation { cont in
+            connection.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    if latch.fire() { cont.resume(returning: true) }
+                // `.waiting` is a refused/unreachable port, not a transient
+                // hiccup, when the peer is 127.0.0.1.
+                case .waiting, .failed, .cancelled:
+                    if latch.fire() { cont.resume(returning: false) }
+                default:
+                    break
+                }
+            }
+            connection.start(queue: .global(qos: .userInitiated))
+            Task {
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                if latch.fire() { cont.resume(returning: false) }
+            }
+        }
+        guard reachable else { return nil }
+
+        let sendLatch = OnceLatch()
+        _ = await withCheckedContinuation { cont in
+            connection.send(
+                content: Data("GET \(path) HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".utf8),
+                completion: .contentProcessed { _ in
+                    if sendLatch.fire() { cont.resume(returning: true) }
+                }
+            )
+        }
+
+        let recvLatch = OnceLatch()
+        let data: Data? = await withCheckedContinuation { cont in
+            connection.receive(minimumIncompleteLength: 1, maximumLength: 8_192) { chunk, _, _, _ in
+                if recvLatch.fire() { cont.resume(returning: chunk) }
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                if recvLatch.fire() { cont.resume(returning: nil) }
+            }
+        }
+        guard let data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
     /// Open a stream connection and *hold it*, so the broadcaster counts a
     /// live listener. `fetchRawResponse` closes as soon as it has headers,
     /// which is not enough: `awaitListener` only stops throttling the
