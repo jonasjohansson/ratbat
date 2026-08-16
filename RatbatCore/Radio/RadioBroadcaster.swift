@@ -122,6 +122,21 @@ public final class RadioBroadcaster: ObservableObject {
     /// `XCTestConfigurationFilePath` is set by the test runner for both
     /// `xcodebuild test` and Xcode's test action, and is absent in a
     /// normally-launched app.
+    /// How long to wait after `consecutiveFailures` failed opens in a row.
+    ///
+    /// Zero for the first few: a handful of dead entries in an otherwise
+    /// healthy library should be skipped at full speed, and a station that
+    /// hits one bad file must not stutter. Sustained failure means
+    /// something structural — the volume unmounted, the folder moved — so
+    /// back off geometrically instead of spinning a core.
+    ///
+    /// Deliberately never gives up. A station that stops retrying cannot
+    /// come back when the volume returns, and self-healing is the point.
+    nonisolated public static func openFailureBackoff(consecutiveFailures: Int) -> TimeInterval {
+        guard consecutiveFailures > 3 else { return 0 }
+        return min(30, 0.5 * pow(2, Double(consecutiveFailures - 4)))
+    }
+
     nonisolated public static var isRunningUnderXCTest: Bool {
         ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
     }
@@ -2959,6 +2974,8 @@ public final class RadioBroadcaster: ObservableObject {
         // behind ~minutes of audio. At most one fetch is ever in flight;
         // it's cancelled on loop exit.
         var prefetch: Task<TrackSourceItem?, Error>?
+        // Run-length of back-to-back failed opens, reset on any success.
+        var consecutiveOpenFailures = 0
 
         // Outer loop: pull items until the source is exhausted or the
         // task is cancelled. Inner loop: pump PCM → AAC → ring buffer
@@ -3022,8 +3039,29 @@ public final class RadioBroadcaster: ObservableObject {
             } catch {
                 let label = item.title ?? item.url.lastPathComponent
                 log.error("open failed for \(label, privacy: .public) at \(item.url.path, privacy: .public): \(String(describing: error), privacy: .public)")
+
+                // Throttle sustained failure. Without this the loop went
+                // straight back round with no delay: with a listener
+                // attached `awaitListener` returns instantly, so an
+                // unreadable library (unmounted volume, moved folder) span
+                // as fast as the CPU allowed — pegging a core and writing
+                // a fabricated history row per iteration, because
+                // `PlaylistSource.nextURL` records the play before the
+                // file is opened. Measured at >10,000 rows in 3 seconds.
+                consecutiveOpenFailures += 1
+                let backoff = Self.openFailureBackoff(
+                    consecutiveFailures: consecutiveOpenFailures
+                )
+                if backoff > 0 {
+                    log.error(
+                        "\(consecutiveOpenFailures, privacy: .public) consecutive open failures on \(stationName, privacy: .public); backing off \(backoff, privacy: .public)s"
+                    )
+                    try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
+                }
                 continue outer
             }
+            // Opened cleanly — this run of failures is over.
+            consecutiveOpenFailures = 0
 
             // Resolve the NEXT track now, concurrently with this track's
             // playout (~minutes), so its yt-dlp download or pool refill is

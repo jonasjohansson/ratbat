@@ -44,6 +44,83 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertNil(radio.streamURL(for: station))
     }
 
+    // MARK: - An unreadable library must not hot-spin the encode loop
+
+    /// Backoff shape: a handful of bad files in an otherwise fine library
+    /// must be skipped at full speed, but a library that is *entirely*
+    /// unreadable must back off instead of spinning.
+    func testOpenFailureBackoffSkipsFastThenEscalatesAndCaps() {
+        // Scattered bad files — no delay, so a 5000-track playlist with a
+        // few dead entries still finds the next playable track instantly.
+        XCTAssertEqual(RadioBroadcaster.openFailureBackoff(consecutiveFailures: 1), 0)
+        XCTAssertEqual(RadioBroadcaster.openFailureBackoff(consecutiveFailures: 3), 0)
+        // Sustained failure — the volume is gone, not just one file.
+        XCTAssertEqual(RadioBroadcaster.openFailureBackoff(consecutiveFailures: 4), 0.5)
+        XCTAssertEqual(RadioBroadcaster.openFailureBackoff(consecutiveFailures: 5), 1)
+        XCTAssertEqual(RadioBroadcaster.openFailureBackoff(consecutiveFailures: 6), 2)
+        XCTAssertEqual(RadioBroadcaster.openFailureBackoff(consecutiveFailures: 20), 30, "capped")
+    }
+
+    #if os(macOS)
+    /// Reproduction of the hot spin.
+    ///
+    /// When every file in a playlist is unopenable — the usual cause being
+    /// an external or network volume that went away — the encode loop used
+    /// to `continue outer` with no delay at all. With a listener attached
+    /// `awaitListener` returns instantly, so the loop ran as fast as the
+    /// CPU allowed: a pegged core, and a fabricated history row on every
+    /// iteration, because `PlaylistSource.nextURL` records a play before
+    /// the file is ever opened.
+    ///
+    /// The listener sees an open `200 audio/aac` that never delivers a
+    /// byte, so this is invisible to any check that only reads the status
+    /// line.
+    @MainActor
+    func testUnreadableLibraryDoesNotHotSpinTheEncodeLoop() async throws {
+        let tempDB = FileManager.default.temporaryDirectory
+            .appendingPathComponent("spin-\(UUID().uuidString).sqlite")
+        let store = try await HistoryStore(databaseURL: tempDB)
+        let prefs = BroadcastPreferences()
+        prefs.port = 18_050
+        defer { prefs.port = 18_000 }
+        let radio = RadioBroadcaster(preferences: prefs, history: store)
+
+        // Nothing here exists on disk, so `decoder.open` throws every time.
+        let tracks = (0..<200).map { i in
+            Track(
+                url: URL(fileURLWithPath: "/nonexistent/ratbat-spin-\(i).m4a"),
+                title: "Gone \(i)",
+                artist: "Unmounted Volume",
+                album: "Missing",
+                duration: 100
+            )
+        }
+        let station = Station(name: "Spin Test", kind: .playlist(queue: tracks))
+        await radio.startBroadcast(station: station)
+        defer { radio.stopAll() }
+
+        // Without a held-open listener the loop parks in awaitListener's
+        // 5s poll and the spin can't reproduce at all.
+        let holder = await Self.holdOpenStreamConnection(
+            port: 18_050,
+            path: "/stream/\(station.slug).aac"
+        )
+        defer { holder?.cancel() }
+
+        try await Task.sleep(nanoseconds: 3_000_000_000)
+
+        let rows = try await store.recentEntries(forStation: station.id, limit: 10_000).count
+
+        // With backoff: ~3 instant failures then 0.5/1/2s waits, so well
+        // under 20 in 3 seconds. Without it: hundreds to thousands.
+        XCTAssertLessThan(
+            rows, 20,
+            "encode loop hot-spun on an unreadable library: \(rows) fabricated plays in 3s"
+        )
+        XCTAssertGreaterThan(rows, 0, "loop should still have tried, not stalled")
+    }
+    #endif
+
     // MARK: - Test runs must not touch the production tunnel
 
     #if os(macOS)
@@ -1129,6 +1206,66 @@ final class RadioBroadcasterTests: XCTestCase {
     /// UTF-8. Raw sockets rather than URLSession because URLSession drops
     /// custom `Icy-*` request headers, hides non-standard response
     /// headers, and auto-follows 302s so we can't assert on the redirect.
+    /// Open a stream connection and *hold it*, so the broadcaster counts a
+    /// live listener. `fetchRawResponse` closes as soon as it has headers,
+    /// which is not enough: `awaitListener` only stops throttling the
+    /// encode loop while a client is actually attached.
+    ///
+    /// Caller must `cancel()` the returned connection.
+    nonisolated static func holdOpenStreamConnection(
+        port: UInt16,
+        path: String
+    ) async -> NWConnection? {
+        let connection = NWConnection(
+            host: NWEndpoint.Host("127.0.0.1"),
+            port: NWEndpoint.Port(rawValue: port)!,
+            using: .tcp
+        )
+        let readyLatch = OnceLatch()
+        let ready: Bool = await withCheckedContinuation { cont in
+            connection.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    if readyLatch.fire() { cont.resume(returning: true) }
+                case .failed, .cancelled:
+                    if readyLatch.fire() { cont.resume(returning: false) }
+                default:
+                    break
+                }
+            }
+            connection.start(queue: .global(qos: .userInitiated))
+        }
+        guard ready else {
+            connection.cancel()
+            return nil
+        }
+
+        let request = "GET \(path) HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        let sendLatch = OnceLatch()
+        _ = await withCheckedContinuation { cont in
+            connection.send(
+                content: Data(request.utf8),
+                completion: .contentProcessed { _ in
+                    if sendLatch.fire() { cont.resume(returning: true) }
+                }
+            )
+        }
+
+        // Keep draining in the background so the socket stays alive and
+        // the server doesn't block on a full send buffer.
+        Task.detached {
+            while true {
+                let more: Bool = await withCheckedContinuation { cont in
+                    connection.receive(minimumIncompleteLength: 1, maximumLength: 8_192) { data, _, isComplete, error in
+                        cont.resume(returning: !(isComplete || error != nil || data == nil))
+                    }
+                }
+                if !more { break }
+            }
+        }
+        return connection
+    }
+
     nonisolated private static func fetchRawResponse(
         port: UInt16,
         path: String,
