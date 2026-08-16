@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Periodic outside-in listening check.
+
+  NOT installed by install.sh. Loading a LaunchAgent is an operator
+  action, and this pass deliberately stops short of changing what runs on
+  the machine:
+
+    cp docs/launchagents/se.jonasjohansson.ratbat.watch.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/se.jonasjohansson.ratbat.watch.plist
+
+  Edit ProgramArguments if the repo lives somewhere else.
+
+  KeepAlive is true because a watchdog that can die silently is the exact
+  failure this whole pass exists to prevent — the same reason slapp's
+  tunnel survived a `killall` that Ratbat's did not.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>se.jonasjohansson.ratbat.watch</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/jonas/GitHub/org/jonasjohansson/ratbat/scripts/watch-listening.sh</string>
+        <string>300</string>
+        <string>https://radio.jonasjohansson.se</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/jonas/Library/Logs/ratbat-watch.err.log</string>
+    <key>StandardOutPath</key>
+    <string>/Users/jonas/Library/Logs/ratbat-watch.out.log</string>
+</dict>
+</plist>

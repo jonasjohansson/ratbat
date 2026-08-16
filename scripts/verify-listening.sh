@@ -11,6 +11,14 @@
 # So: resolve the public hostname, go out through Cloudflare, come back
 # through the tunnel, and confirm real AAC bytes arrive.
 #
+# Every broadcasting station is checked, not just the first one. Checking
+# one meant a deploy went green while a second station was silent.
+#
+# Each run appends a one-line verdict to $RATBAT_VERIFY_LOG (default
+# ~/Library/Logs/ratbat-verify.log) so there is an artifact afterwards:
+# a check that leaves no trace can only ever answer "is it up right now",
+# never "when did it break".
+#
 # Usage:
 #   scripts/verify-listening.sh [BASE_URL] [TIMEOUT_SECONDS]
 #
@@ -31,6 +39,16 @@ DEADLINE_SECS="${2:-90}"
 MIN_BYTES=16384
 SAMPLE_SECS=6
 
+VERIFY_LOG="${RATBAT_VERIFY_LOG:-$HOME/Library/Logs/ratbat-verify.log}"
+mkdir -p "$(dirname "$VERIFY_LOG")" 2>/dev/null || true
+
+# One line per run, appended. Survives reboots and log rotation windows,
+# which the unified log does not reliably do for a once-per-deploy event.
+record() {
+  printf '%s base=%s verdict=%s code=%s detail=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$BASE" "$1" "$2" "$3" >> "$VERIFY_LOG" 2>/dev/null || true
+}
+
 command -v curl >/dev/null || { echo "verify-listening: curl not found" >&2; exit 1; }
 command -v python3 >/dev/null || { echo "verify-listening: python3 not found" >&2; exit 1; }
 
@@ -46,6 +64,7 @@ while :; do
   elapsed=$(( $(date +%s) - started ))
   if [ "$elapsed" -ge "$DEADLINE_SECS" ]; then
     echo "✗ giving up after ${elapsed}s / ${attempt} attempts: ${last_reason}" >&2
+    record fail "$last_code" "$(printf '%s' "$last_reason" | tr ' ' '-')"
     exit "$last_code"
   fi
 
@@ -71,19 +90,21 @@ while :; do
   fi
 
   # --- 2. Is anything actually broadcasting, and where? ---
-  stream_path=$(printf '%s' "$now_json" | python3 -c '
+  stream_paths=$(printf '%s' "$now_json" | python3 -c '
 import json, sys
 try:
     doc = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
+# Every broadcasting station. Verifying only the first one meant a green
+# deploy while another station was silent — and which station came first
+# was an accident of ordering, not a decision.
 for s in doc.get("stations", []):
     if s.get("broadcasting") and s.get("streamURL"):
         print(s["streamURL"])
-        break
 ' 2>/dev/null)
 
-  if [ -z "$stream_path" ]; then
+  if [ -z "$stream_paths" ]; then
     last_reason="reached the origin, but no station reports broadcasting"
     last_code=3
     echo "  attempt ${attempt}: ${last_reason}"
@@ -91,53 +112,60 @@ for s in doc.get("stations", []):
     continue
   fi
 
-  # --- 3. Do real audio bytes arrive over the public URL? ---
+  # --- 3. Do real audio bytes arrive, for EVERY live station? ---
   # curl exits 28 when the range request is still streaming at the
   # timeout, which is the healthy case for a live stream — so read the
   # observed values rather than trusting the exit code.
-  read -r code ctype bytes <<<"$(curl -sS \
-      -o /tmp/verify-listening.$$ \
-      -w '%{http_code} %{content_type} %{size_download}' \
-      --max-time "$SAMPLE_SECS" \
-      -r 0-$((MIN_BYTES * 8)) \
-      "$BASE$stream_path" 2>/dev/null)"
-  rm -f "/tmp/verify-listening.$$"
+  all_ok=1
+  results=""
+  while IFS= read -r stream_path; do
+    [ -n "$stream_path" ] || continue
+    read -r code ctype bytes <<<"$(curl -sS \
+        -o /tmp/verify-listening.$$ \
+        -w '%{http_code} %{content_type} %{size_download}' \
+        --max-time "$SAMPLE_SECS" \
+        -r 0-$((MIN_BYTES * 8)) \
+        "$BASE$stream_path" 2>/dev/null)"
+    rm -f "/tmp/verify-listening.$$"
 
-  code="${code:-000}"
-  ctype="${ctype:-none}"
-  bytes="${bytes:-0}"
+    code="${code:-000}"; ctype="${ctype:-none}"; bytes="${bytes:-0}"
 
-  if [ "$code" != "200" ] && [ "$code" != "206" ]; then
-    last_reason="$stream_path returned HTTP $code"
-    last_code=4
-    echo "  attempt ${attempt}: ${last_reason}"
-    sleep 5
-    continue
-  fi
-
-  case "$ctype" in
-    audio/*) ;;
-    *)
-      last_reason="$stream_path returned content-type '$ctype', expected audio/*"
-      last_code=4
-      echo "  attempt ${attempt}: ${last_reason}"
-      sleep 5
+    if [ "$code" != "200" ] && [ "$code" != "206" ]; then
+      last_reason="$stream_path returned HTTP $code"
+      last_code=4; all_ok=0
+      results="${results}    ✗ ${stream_path} status=${code}\n"
       continue
-      ;;
-  esac
+    fi
+    case "$ctype" in
+      audio/*) ;;
+      *)
+        last_reason="$stream_path returned content-type '$ctype', expected audio/*"
+        last_code=4; all_ok=0
+        results="${results}    ✗ ${stream_path} content-type=${ctype}\n"
+        continue
+        ;;
+    esac
+    if [ "$bytes" -lt "$MIN_BYTES" ]; then
+      last_reason="$stream_path sent only ${bytes} bytes in ${SAMPLE_SECS}s (need >= ${MIN_BYTES}) — live but silent"
+      last_code=4; all_ok=0
+      results="${results}    ✗ ${stream_path} bytes=${bytes} (live but silent)\n"
+      continue
+    fi
+    results="${results}    ✓ ${stream_path} status=${code} ${ctype} ${bytes}B/${SAMPLE_SECS}s\n"
+  done <<EOF
+$stream_paths
+EOF
 
-  if [ "$bytes" -lt "$MIN_BYTES" ]; then
-    last_reason="$stream_path sent only ${bytes} bytes in ${SAMPLE_SECS}s (need >= ${MIN_BYTES}) — live but silent"
-    last_code=4
+  if [ "$all_ok" -ne 1 ]; then
     echo "  attempt ${attempt}: ${last_reason}"
+    printf '%b' "$results"
     sleep 5
     continue
   fi
 
-  echo "✓ listening confirmed from outside"
-  echo "    url          : ${BASE}${stream_path}"
-  echo "    status       : ${code}"
-  echo "    content-type : ${ctype}"
-  echo "    bytes        : ${bytes} in ${SAMPLE_SECS}s"
+  station_count=$(printf '%s\n' "$stream_paths" | grep -c .)
+  echo "✓ listening confirmed from outside — ${station_count} station(s)"
+  printf '%b' "$results"
+  record ok 0 "${station_count}-stations-audible"
   exit 0
 done
