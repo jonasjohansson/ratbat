@@ -44,6 +44,60 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertNil(radio.streamURL(for: station))
     }
 
+    // MARK: - A listener failure must be survivable
+
+    /// The listener's only failure response was `stopAll()` — no retry, no
+    /// rebind, no re-arm — and `.waiting`, which is where a bind conflict
+    /// or a lost interface lands, fell into `default: break` and was
+    /// ignored entirely.
+    ///
+    /// Since batch 1 made `stopAll()` also tear down the tunnel, a
+    /// transient bind conflict took the whole public endpoint down for
+    /// good. Here the port is occupied first, so the broadcaster's listener
+    /// cannot bind; once it is freed the broadcaster must recover on its
+    /// own rather than staying dark.
+    @MainActor
+    func testListenerRecoversFromABindConflict() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let port: UInt16 = 18_058
+
+        // Occupy the port with a plain listener that does NOT share it.
+        let squatterParams = NWParameters.tcp
+        let squatter = try NWListener(using: squatterParams, on: NWEndpoint.Port(rawValue: port)!)
+        squatter.newConnectionHandler = { $0.cancel() }
+        squatter.start(queue: .global())
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        let radio = RadioBroadcaster(port: port)
+        defer { radio.stopAll() }
+        let station = Station(name: "Rebind", kind: .playlist(queue: tracks))
+        await radio.startBroadcast(station: station)
+        try await Task.sleep(nanoseconds: 800_000_000)
+
+        // The station must still be considered live — a bind problem is
+        // not a reason to erase the broadcast.
+        XCTAssertTrue(
+            radio.isBroadcasting(stationID: station.id),
+            "a bind conflict killed the broadcast outright"
+        )
+
+        // Free the port; the broadcaster should rebind by itself.
+        squatter.cancel()
+
+        var served = false
+        for _ in 0..<20 {
+            try await Task.sleep(nanoseconds: 500_000_000)
+            if let r = await Self.probeEndpoint(port: port, path: "/now.json", timeout: 1),
+               r.contains("HTTP/1.1 200") {
+                served = true
+                break
+            }
+        }
+        XCTAssertTrue(served, "listener never rebound after the port was freed")
+    }
+
     // MARK: - A cancelled encode loop must not fold its successor
 
     /// Parks for a long time, then reports exhaustion — a resolve that is

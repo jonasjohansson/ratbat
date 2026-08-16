@@ -311,6 +311,9 @@ public final class RadioBroadcaster: ObservableObject {
     /// the listener count moves, instead of polling `/now.json`. Keyed by
     /// connection identity so a disconnect drops the right one.
     private var sseSubscribers: [ObjectIdentifier: NWConnection] = [:]
+    /// Consecutive listener rebind attempts, reset when it reaches .ready.
+    private var listenerRebindAttempt = 0
+    private var listenerRebindTask: Task<Void, Never>?
 
     /// Construct a broadcaster bound to a specific port. Primarily for
     /// tests that need deterministic ports without trampling the
@@ -1042,6 +1045,9 @@ public final class RadioBroadcaster: ObservableObject {
     /// pipelines would serve 404s to all comers, which is accurate but
     /// wasteful.
     private func tearDownListener() {
+        listenerRebindTask?.cancel()
+        listenerRebindTask = nil
+        listenerRebindAttempt = 0
         #if os(macOS)
         tunnel.stop()
         #endif
@@ -1220,6 +1226,52 @@ public final class RadioBroadcaster: ObservableObject {
 
     // MARK: - HTTP server
 
+    /// Delay before rebind attempt `attempt` (1-based): 0.5s doubling to a
+    /// 30s cap. Same shape as the tunnel supervisor's backoff.
+    nonisolated public static func listenerRebindDelay(forAttempt attempt: Int) -> TimeInterval {
+        guard attempt > 1 else { return 0.5 }
+        return min(30, 0.5 * pow(2, Double(attempt - 1)))
+    }
+
+    /// Rebind the shared listener after a failure, with backoff.
+    ///
+    /// Never escalates to `stopAll()`. A listener that gives up cannot come
+    /// back when the conflicting process exits or the interface returns,
+    /// and staying off air forever is a worse outcome than retrying — the
+    /// same reasoning as the tunnel supervisor and the open-failure
+    /// backoff.
+    private func scheduleListenerRebind(reason: String) {
+        // Nothing to serve — don't churn on a listener nobody needs.
+        guard !pipelines.isEmpty else { return }
+        // One rebind in flight at a time.
+        guard listenerRebindTask == nil else { return }
+
+        listenerRebindAttempt += 1
+        let delay = Self.listenerRebindDelay(forAttempt: listenerRebindAttempt)
+        logger.error(
+            "listener \(reason, privacy: .public); rebinding in \(delay, privacy: .public)s (attempt \(self.listenerRebindAttempt, privacy: .public))"
+        )
+
+        listenerRebindTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            await MainActor.run {
+                guard let self else { return }
+                self.listenerRebindTask = nil
+                guard !self.pipelines.isEmpty else { return }
+                self.listener?.cancel()
+                self.listener = nil
+                do {
+                    try self.startHTTPServer()
+                } catch {
+                    self.logger.error(
+                        "listener rebind threw: \(String(describing: error), privacy: .public)"
+                    )
+                    self.scheduleListenerRebind(reason: "rebind threw")
+                }
+            }
+        }
+    }
+
     private func startHTTPServer() throws {
         let params = NWParameters.tcp
         // Allow re-binding immediately on restart instead of waiting for
@@ -1231,10 +1283,27 @@ public final class RadioBroadcaster: ObservableObject {
             guard let self else { return }
             Task { @MainActor in
                 switch state {
+                case .ready:
+                    self.listenerRebindAttempt = 0
+                    self.error = nil
+                    self.logger.notice(
+                        "listener ready on port \(self.port.rawValue, privacy: .public)"
+                    )
                 case .failed(let err):
+                    // Was `stopAll()`: a single transient bind problem took
+                    // every station off air with no retry and no rebind —
+                    // and since stopAll also drops the tunnel, the public
+                    // hostname went with it, permanently.
                     self.error = "Listener failed: \(err.localizedDescription)"
                     self.logger.error("listener failed: \(String(describing: err), privacy: .public)")
-                    self.stopAll()
+                    self.scheduleListenerRebind(reason: "failed")
+                case .waiting(let err):
+                    // `.waiting` is where a bind conflict or a lost
+                    // interface lands. It used to fall into `default` and
+                    // be ignored completely, so the radio sat there
+                    // silently un-bound.
+                    self.logger.error("listener waiting: \(String(describing: err), privacy: .public)")
+                    self.scheduleListenerRebind(reason: "waiting")
                 case .cancelled:
                     self.logger.info("listener cancelled")
                 default:
