@@ -44,6 +44,59 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertNil(radio.streamURL(for: station))
     }
 
+    // MARK: - Going off air must leave a trace
+
+    /// A source that is dry from the first call — a pool refill that came
+    /// back empty, which is how stations starve at 03:00.
+    private actor DrySource: TrackSource {
+        func nextURL() async throws -> TrackSourceItem? { nil }
+    }
+
+    /// A source that throws — a network blip during a discover call.
+    private actor ThrowingSource: TrackSource {
+        struct Boom: Error {}
+        func nextURL() async throws -> TrackSourceItem? { throw Boom() }
+    }
+
+    /// Running dry was the one shutdown that was graceful by design, and
+    /// therefore invisible: no crash report, no error-level log, no on-disk
+    /// marker. Both the exhaustion notice and the loop exit were `.info`,
+    /// which macOS does not persist, so by morning there was nothing left
+    /// to say when or why the station stopped.
+    @MainActor
+    func testExhaustedSourceRecordsWhyItWentOffAir() async throws {
+        let radio = RadioBroadcaster(port: 18_053)
+        defer { radio.stopAll() }
+
+        let station = Station(name: "Dry Station", kind: .playlist(queue: []))
+        await radio.startBroadcast(station: station, source: DrySource())
+        try await Task.sleep(nanoseconds: 1_200_000_000)
+
+        let record = radio.lastOffAir[station.id]
+        XCTAssertNotNil(record, "a station going off air must leave a record")
+        XCTAssertEqual(record?.reason, .exhausted)
+        XCTAssertEqual(record?.reason.label, "exhausted")
+    }
+
+    /// A source error must be distinguishable from graceful exhaustion —
+    /// "it ran out" and "it broke" want different responses.
+    @MainActor
+    func testSourceErrorIsRecordedDistinctlyFromExhaustion() async throws {
+        let radio = RadioBroadcaster(port: 18_054)
+        defer { radio.stopAll() }
+
+        let station = Station(name: "Broken Station", kind: .playlist(queue: []))
+        await radio.startBroadcast(station: station, source: ThrowingSource())
+        try await Task.sleep(nanoseconds: 1_200_000_000)
+
+        let record = radio.lastOffAir[station.id]
+        XCTAssertNotNil(record)
+        XCTAssertEqual(record?.reason.label, "source-error")
+        if case .sourceError = record?.reason {} else {
+            XCTFail("expected .sourceError, got \(String(describing: record?.reason))")
+        }
+    }
+
     // MARK: - The public endpoint outlives the last station
 
     /// The tunnel's lifetime used to be coupled to `broadcasting.count`:

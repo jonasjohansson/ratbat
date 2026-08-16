@@ -122,6 +122,50 @@ public final class RadioBroadcaster: ObservableObject {
     /// `XCTestConfigurationFilePath` is set by the test runner for both
     /// `xcodebuild test` and Xcode's test action, and is absent in a
     /// normally-launched app.
+    /// Why a station's encode loop stopped.
+    ///
+    /// Running dry is the one shutdown that is graceful by design, so it
+    /// left no crash report, no error-level log and no on-disk marker —
+    /// both the exhaustion notice and the loop exit were `.info`, which
+    /// this machine does not persist. At 09:00 the station was simply
+    /// absent, with nothing to say when or why it went off air.
+    public enum OffAirReason: Equatable, Sendable {
+        /// The source returned nil — pool exhausted, playlist empty.
+        case exhausted
+        /// `nextURL()` threw.
+        case sourceError(String)
+        /// The task was cancelled: a deliberate stop, or app shutdown.
+        case cancelled
+
+        public var label: String {
+            switch self {
+            case .exhausted: return "exhausted"
+            case .sourceError: return "source-error"
+            case .cancelled: return "cancelled"
+            }
+        }
+    }
+
+    /// When and why each station last went off air. Survives in memory for
+    /// the UI and `/now.json`; the matching log line is emitted at a level
+    /// the unified log actually keeps.
+    public struct OffAirRecord: Equatable, Sendable {
+        public let reason: OffAirReason
+        public let at: Date
+        public let trackIndex: Int
+    }
+
+    @Published public private(set) var lastOffAir: [Station.ID: OffAirRecord] = [:]
+
+    /// Record an off-air transition. Called from the encode loop's unwind.
+    func recordOffAir(stationID: Station.ID, reason: OffAirReason, trackIndex: Int) {
+        lastOffAir[stationID] = OffAirRecord(
+            reason: reason,
+            at: Date(),
+            trackIndex: trackIndex
+        )
+    }
+
     /// How long to wait after `consecutiveFailures` failed opens in a row.
     ///
     /// Zero for the first few: a handful of dead entries in an otherwise
@@ -2994,6 +3038,9 @@ public final class RadioBroadcaster: ObservableObject {
         var prefetch: Task<TrackSourceItem?, Error>?
         // Run-length of back-to-back failed opens, reset on any success.
         var consecutiveOpenFailures = 0
+        // Why this loop ended. Overwritten by the two `break` paths below;
+        // staying `.cancelled` means the task was torn down from outside.
+        var exitReason: OffAirReason = .cancelled
 
         // Outer loop: pull items until the source is exhausted or the
         // task is cancelled. Inner loop: pump PCM → AAC → ring buffer
@@ -3021,12 +3068,19 @@ public final class RadioBroadcaster: ObservableObject {
                 }
             } catch {
                 log.error("source error: \(String(describing: error), privacy: .public)")
+                exitReason = .sourceError(String(describing: error))
                 break
             }
             prefetch = nil
 
             guard let item = nextItem else {
-                log.info("source exhausted for \(stationName, privacy: .public)")
+                // `.notice`, not `.info`: the unified log does not persist
+                // info-level messages, so the only record of a station
+                // running dry overnight evaporated before anyone looked.
+                log.notice(
+                    "station off air: \(stationName, privacy: .public) reason=exhausted trackIndex=\(trackIndex, privacy: .public)"
+                )
+                exitReason = .exhausted
                 break
             }
             trackIndex += 1
@@ -3176,11 +3230,18 @@ public final class RadioBroadcaster: ObservableObject {
                     // station that starved overnight would be silently gone
                     // after the next restart — indistinguishable from the
                     // owner having turned it off.
+                    owner.recordOffAir(
+                        stationID: stationID,
+                        reason: exitReason,
+                        trackIndex: trackIndex
+                    )
                     owner.stopBroadcastRanDry(stationID: stationID)
                 }
             }
         }
-        log.info("encode loop exiting")
+        log.notice(
+            "encode loop exiting: \(stationName, privacy: .public) reason=\(exitReason.label, privacy: .public) trackIndex=\(trackIndex, privacy: .public)"
+        )
     }
 
     /// Block until at least one listener is connected to `stationID`, polling
