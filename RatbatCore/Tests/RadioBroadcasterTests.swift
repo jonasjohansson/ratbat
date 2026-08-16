@@ -44,6 +44,135 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertNil(radio.streamURL(for: station))
     }
 
+    // MARK: - Launch resume must not be one-shot or head-of-line blocked
+
+    func testResumeRetryDelayGrowsAndCaps() {
+        XCTAssertEqual(RadioBroadcaster.resumeRetryDelay(forAttempt: 1), 1)
+        XCTAssertEqual(RadioBroadcaster.resumeRetryDelay(forAttempt: 2), 2)
+        XCTAssertEqual(RadioBroadcaster.resumeRetryDelay(forAttempt: 3), 4)
+        XCTAssertEqual(RadioBroadcaster.resumeRetryDelay(forAttempt: 99), 30, "same 30s ceiling as the rest")
+    }
+
+    /// Resume awaited each station in turn. A generative station's
+    /// `startBroadcast` awaits `downloadService.ensureReady()` — the Python
+    /// venv bootstrap, 30–60s on a cold start — so one slow station gated
+    /// every station behind it, and the listener and tunnel with them.
+    ///
+    /// Observed for real during the 065c4f0 deploy: one station was live
+    /// and audible while the second still returned 502.
+    @MainActor
+    func testResumeStartsStationsConcurrentlyNotSequentially() async throws {
+        let radio = RadioBroadcaster(port: 18_063)
+        defer { radio.stopAll() }
+
+        let slow = Station(name: "Slow Bootstrap", kind: .playlist(queue: []))
+        let fast = Station(name: "Fast", kind: .playlist(queue: []))
+        let started = StartRecorder()
+
+        let began = Date()
+        await radio.resumeStations(
+            [slow, fast],
+            matching: [slow.slug, fast.slug],
+            maxAttempts: 1
+        ) { station in
+            if station.slug == slow.slug {
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+            }
+            await started.record(station.slug)
+        }
+        let elapsed = Date().timeIntervalSince(began)
+
+        let seen = await started.slugs
+        XCTAssertEqual(Set(seen), Set([slow.slug, fast.slug]), "both stations must be started")
+        // Sequential would be ~1.5s + ~0 = 1.5s with `fast` only reached
+        // AFTER the slow one. Concurrent finishes in ~1.5s total but
+        // `fast` lands almost immediately.
+        XCTAssertEqual(seen.first, fast.slug, "the fast station was gated behind the slow one")
+        XCTAssertLessThan(elapsed, 2.5, "resume took \(elapsed)s")
+    }
+
+    /// Resume ran once per launch with no retry, so a station that failed
+    /// to start was gone until the next launch — the same "no second
+    /// chance" shape as the tunnel that never came back.
+    @MainActor
+    func testResumeRetriesAStationThatFailsToStart() async throws {
+        let radio = RadioBroadcaster(port: 18_064)
+        defer { radio.stopAll() }
+
+        let flaky = Station(name: "Flaky Resume", kind: .playlist(queue: []))
+        let attempts = AttemptCounter()
+
+        await radio.resumeStations(
+            [flaky],
+            matching: [flaky.slug],
+            maxAttempts: 4,
+            retryDelayOverride: 0
+        ) { _ in
+            await attempts.bump()
+        } isLive: { _ in
+            // Fails twice, then "starts".
+            await attempts.count >= 3
+        }
+
+        let n = await attempts.count
+        XCTAssertGreaterThanOrEqual(n, 3, "resume gave up after \(n) attempt(s)")
+    }
+
+    private actor StartRecorder {
+        private(set) var slugs: [String] = []
+        func record(_ slug: String) { slugs.append(slug) }
+    }
+    private actor AttemptCounter {
+        private(set) var count = 0
+        func bump() { count += 1 }
+    }
+
+    // MARK: - The first listener must not wait on a 5s poll
+
+    /// `awaitListener` idled the encode loop and woke on a 5-second poll,
+    /// so the first listener on an idle station — the normal state of a
+    /// personal radio — waited 0–5s with no bytes flowing.
+    @MainActor
+    func testFirstListenerWakesTheEncodeLoopImmediately() async throws {
+        let radio = RadioBroadcaster(port: 18_065)
+        defer { radio.stopAll() }
+        let stationID = UUID()
+
+        let began = Date()
+        let waiter = Task { @MainActor in
+            await radio.awaitFirstListener(stationID: stationID)
+            return Date().timeIntervalSince(began)
+        }
+        // Let it actually suspend before signalling.
+        try await Task.sleep(nanoseconds: 200_000_000)
+        radio.signalListenerArrived(stationID: stationID)
+
+        let waited = await waiter.value
+        XCTAssertLessThan(waited, 1.0, "first listener waited \(waited)s — still polling")
+    }
+
+    /// Cancellation must free the waiter, or a stopped station leaves its
+    /// encode task suspended forever.
+    @MainActor
+    func testAwaitFirstListenerUnblocksOnCancellation() async throws {
+        let radio = RadioBroadcaster(port: 18_066)
+        defer { radio.stopAll() }
+        let stationID = UUID()
+
+        let waiter = Task { @MainActor in
+            await radio.awaitFirstListener(stationID: stationID)
+        }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        waiter.cancel()
+
+        let done = Task { @MainActor in
+            await waiter.value
+            return true
+        }
+        let finished = await done.value
+        XCTAssertTrue(finished, "cancelled waiter never resumed")
+    }
+
     // MARK: - A transient failure must not end a station
 
     /// Throws a network error the first two times, then yields a real

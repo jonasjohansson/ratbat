@@ -170,6 +170,120 @@ public final class RadioBroadcaster: ObservableObject {
 
     @Published public private(set) var lastOffAir: [Station.ID: OffAirRecord] = [:]
 
+    // MARK: - Launch resume
+
+    /// Delay before resume attempt `attempt`. Same 1s→30s shape and
+    /// ceiling as the other retry loops in this file.
+    nonisolated public static func resumeRetryDelay(forAttempt attempt: Int) -> TimeInterval {
+        guard attempt > 1 else { return 1 }
+        return min(30, pow(2, Double(attempt - 1)))
+    }
+
+    /// Bring back the stations that were live before, concurrently and
+    /// with retries.
+    ///
+    /// This used to be a plain `for … { await startBroadcast(…) }` at the
+    /// call site, run once per launch behind a `didAutoStart` flag. Two
+    /// problems, both of which cost airtime:
+    ///
+    /// - **Head-of-line blocking.** A generative station's
+    ///   `startBroadcast` awaits `downloadService.ensureReady()`, the
+    ///   Python venv bootstrap — 30–60s on a cold start. Every station
+    ///   behind it waited, and so did the listener and tunnel, which only
+    ///   come up as a side effect of the first station starting. Seen for
+    ///   real during the 065c4f0 deploy: one station audible while the
+    ///   second still returned 502.
+    /// - **One shot.** A station that failed to start was gone until the
+    ///   next launch, with nothing to notice or retry — the same shape as
+    ///   the tunnel that never came back.
+    ///
+    /// `start` and `isLive` are injectable so the policy is testable
+    /// without a venv, a network, or a real generative source.
+    @MainActor
+    public func resumeStations(
+        _ all: [Station],
+        matching slugs: Set<String>,
+        maxAttempts: Int = 4,
+        retryDelayOverride: TimeInterval? = nil,
+        start: (@Sendable @MainActor (Station) async -> Void)? = nil,
+        isLive: (@Sendable @MainActor (Station) async -> Bool)? = nil
+    ) async {
+        let wanted = all.filter { slugs.contains($0.slug) }
+        guard !wanted.isEmpty else { return }
+
+        let doStart = start ?? { [weak self] station in
+            await self?.startBroadcast(station: station)
+        }
+        let checkLive = isLive ?? { [weak self] station in
+            self?.isBroadcasting(stationID: station.id) ?? false
+        }
+
+        logger.notice(
+            "resuming \(wanted.count, privacy: .public) station(s) concurrently"
+        )
+
+        var running: [Task<Void, Never>] = []
+        for station in wanted {
+            running.append(
+                Task { @MainActor in
+                    for attempt in 1...max(1, maxAttempts) {
+                        await doStart(station)
+                        if await checkLive(station) { return }
+                        guard attempt < max(1, maxAttempts) else { break }
+                        let delay = retryDelayOverride
+                            ?? Self.resumeRetryDelay(forAttempt: attempt)
+                        if delay > 0 {
+                            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                        }
+                    }
+                    self.logger.error(
+                        "resume gave up on \(station.slug, privacy: .public) after \(max(1, maxAttempts), privacy: .public) attempts"
+                    )
+                }
+            )
+        }
+        // Await them all so the caller knows resume is settled — but they
+        // ran concurrently, so one slow bootstrap no longer gates the rest.
+        for task in running { await task.value }
+    }
+
+    // MARK: - First-listener signalling
+
+    /// Encode loops parked waiting for a first listener, by station.
+    private var listenerWaiters: [Station.ID: [CheckedContinuation<Void, Never>]] = [:]
+
+    /// Suspend until a listener connects to `stationID`.
+    ///
+    /// Replaces a 5-second polling sleep, which meant the first listener on
+    /// an idle station — the normal state of a personal radio — waited 0–5s
+    /// with no bytes flowing.
+    @MainActor
+    public func awaitFirstListener(stationID: Station.ID) async {
+        if (listenerCount[stationID] ?? 0) > 0 { return }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                if Task.isCancelled || (listenerCount[stationID] ?? 0) > 0 {
+                    cont.resume()
+                    return
+                }
+                listenerWaiters[stationID, default: []].append(cont)
+            }
+        } onCancel: {
+            // Without this a stopped station leaves its encode task
+            // suspended forever.
+            Task { @MainActor [weak self] in
+                self?.signalListenerArrived(stationID: stationID)
+            }
+        }
+    }
+
+    /// Wake everything parked on `stationID`. Idempotent.
+    @MainActor
+    public func signalListenerArrived(stationID: Station.ID) {
+        guard let waiters = listenerWaiters.removeValue(forKey: stationID) else { return }
+        for waiter in waiters { waiter.resume() }
+    }
+
     /// A station currently retrying past a transient source failure.
     ///
     /// It is still on air and still registered, so nothing else would say
@@ -967,6 +1081,9 @@ public final class RadioBroadcaster: ObservableObject {
         }
 
         pipeline.encodeTask?.cancel()
+        // Free anything parked on this station, or its encode task stays
+        // suspended forever.
+        signalListenerArrived(stationID: stationID)
         pipelines.removeValue(forKey: stationID)
         broadcasting.remove(stationID)
         listenerCount.removeValue(forKey: stationID)
@@ -1842,6 +1959,8 @@ public final class RadioBroadcaster: ObservableObject {
         let id = ObjectIdentifier(connection)
         clients[id] = (connection, stationID)
         listenerCount[stationID, default: 0] += 1
+        // Wake the encode loop now rather than up to 5s later.
+        signalListenerArrived(stationID: stationID)
         logger.info(
             "client connected to \(stationID.uuidString.prefix(8), privacy: .public), total \(self.listenerCount[stationID] ?? 0, privacy: .public)"
         )
@@ -3534,15 +3653,16 @@ public final class RadioBroadcaster: ObservableObject {
 
         let shortID = stationID.uuidString.prefix(8)
         log.info("idling \(shortID, privacy: .public) — no listeners, will resume on connect")
-        let pollNanos: UInt64 = 5_000_000_000
-        while !Task.isCancelled {
-            try? await Task.sleep(nanoseconds: pollNanos)
-            if Task.isCancelled { return }
-            let count = await MainActor.run { owner?.listenerCount[stationID] ?? 0 }
-            if count > 0 {
-                log.info("resuming \(shortID, privacy: .public) — \(count, privacy: .public) listener(s)")
-                return
-            }
-        }
+
+        // Signal, not poll. This was a 5-second polling sleep, so the
+        // first listener on an idle station — the normal state of a
+        // personal radio — waited 0–5s before a single byte moved.
+        // `registerClient` now wakes us the moment a client attaches, and
+        // teardown/cancellation wake us too so the task cannot be stranded.
+        guard let owner else { return }
+        await owner.awaitFirstListener(stationID: stationID)
+        if Task.isCancelled { return }
+        let count = await MainActor.run { owner.listenerCount[stationID] }
+        log.info("resuming \(shortID, privacy: .public) — \(count ?? 0, privacy: .public) listener(s)")
     }
 }
