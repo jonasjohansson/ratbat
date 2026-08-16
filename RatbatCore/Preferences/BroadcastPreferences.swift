@@ -82,8 +82,17 @@ public final class BroadcastPreferences: ObservableObject {
     /// Target share of plays that should be music the owner does not already
     /// own, in [0, 1]. See ``SelectionPolicy`` for the exact meaning — it is a
     /// deterministic ratio over plays, not a per-track probability.
+    ///
+    /// Stored as a Double because `@AppStorage` cannot hold an Optional.
+    /// ANY NEGATIVE VALUE MEANS "unset" — the dial is off and the upstream
+    /// ranking is left alone. That sentinel is why the shipped default is
+    /// -1 and not 0.0: a 0.0 dial is an active reorder (it leads with owned
+    /// music), so shipping 0.0 would change what an existing listener hears.
     @AppStorage("ratbat.selection.newMusicShare")
-    private var newMusicShareRaw: Double = 0.7
+    private var newMusicShareRaw: Double = BroadcastPreferences.newMusicShareUnset
+
+    /// Sentinel for "the owner has never set the dial".
+    static let newMusicShareUnset: Double = -1
 
     /// Whether to drop candidates that ``MixSetRule`` classifies as mix sets.
     /// Ships off: it removes music, and the shadow records written while it is
@@ -146,7 +155,7 @@ public final class BroadcastPreferences: ObservableObject {
     public var selectionPolicy: SelectionPolicy {
         get {
             SelectionPolicy(
-                newMusicShare: newMusicShareRaw,
+                newMusicShare: newMusicShareRaw < 0 ? nil : newMusicShareRaw,
                 excludeMixSets: excludeMixSetsRaw,
                 mixSetMinimumDuration: MixSetRule.defaultMinimumDuration
             )
@@ -159,7 +168,7 @@ public final class BroadcastPreferences: ObservableObject {
                 excludeMixSets: newValue.excludeMixSets,
                 mixSetMinimumDuration: newValue.mixSetMinimumDuration
             )
-            newMusicShareRaw = clamped.newMusicShare
+            newMusicShareRaw = clamped.newMusicShare ?? BroadcastPreferences.newMusicShareUnset
             excludeMixSetsRaw = clamped.excludeMixSets
         }
     }
@@ -280,7 +289,7 @@ public final class BroadcastPreferences: ObservableObject {
         // `selectionPolicy` reading back whatever the previous caller set.
         // Assign the defaults through the wrappers so the reset is observable
         // on `self`, which is what callers (and the tests) actually check.
-        newMusicShareRaw = SelectionPolicy.default.newMusicShare
+        newMusicShareRaw = SelectionPolicy.default.newMusicShare ?? BroadcastPreferences.newMusicShareUnset
         excludeMixSetsRaw = SelectionPolicy.default.excludeMixSets
         revision &+= 1
     }

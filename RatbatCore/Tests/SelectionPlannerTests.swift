@@ -139,6 +139,57 @@ final class SelectionPlannerTests: XCTestCase {
 
     // MARK: - The dial
 
+    /// The shipped defaults must be a NO-OP. Someone who upgrades and touches
+    /// nothing has to hear exactly what they heard before: same tracks, same
+    /// order, nothing dropped, nothing logged.
+    ///
+    /// This is the guard on that promise. It goes red if the shipped dial
+    /// default is changed to any value that reorders — including 0.0, which
+    /// is NOT inert (share 0.0 leads with owned and appends new, which is an
+    /// active reorder, just in the opposite direction from 1.0).
+    func testShippedDefaultsDoNotAlterSelectionAtAll() {
+        // Deliberately interleaved so ANY newness-based reorder is visible:
+        // leading-with-new and leading-with-owned both break this order.
+        let pool = [
+            Candidate(artist: "Owned1", title: "t1", duration: nil),
+            Candidate(artist: "New1", title: "t2", duration: nil),
+            Candidate(artist: "Owned2", title: "t3", duration: nil),
+            Candidate(artist: "New2", title: "t4", duration: nil),
+        ]
+        let plan = SelectionPlanner.plan(
+            pool,
+            policy: .default,
+            phase: (0, 0),
+            sourceKind: "bandcamp",
+            ownedArtistKeys: ["owned1", "owned2"],
+            subject: subject
+        )
+        XCTAssertEqual(
+            plan.ordered, pool,
+            "shipped defaults must leave the upstream ranking exactly as it was"
+        )
+        XCTAssertTrue(plan.exclusions.isEmpty, "shipped defaults must not log an exclusion")
+        XCTAssertEqual(plan.shortfall, 0, "shipped defaults must not report a shortfall")
+    }
+
+    /// Companion to the above: the mechanism still works, it is just off by
+    /// default. Guards against making the planner inert unconditionally.
+    func testTheDialStillWorksWhenTheOwnerSetsIt() {
+        let pool = [
+            Candidate(artist: "Owned1", title: "t1", duration: nil),
+            Candidate(artist: "New1", title: "t2", duration: nil),
+        ]
+        let plan = SelectionPlanner.plan(
+            pool,
+            policy: SelectionPolicy(newMusicShare: 1.0),
+            phase: (0, 0),
+            sourceKind: "bandcamp",
+            ownedArtistKeys: ["owned1"],
+            subject: subject
+        )
+        XCTAssertEqual(plan.ordered.map(\.artist), ["New1", "Owned1"])
+    }
+
     func testPlanOrdersByNewnessAndNeverRemoves() {
         let pool = [
             Candidate(artist: "Owned1", title: "t1", duration: nil),

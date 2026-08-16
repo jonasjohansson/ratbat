@@ -86,16 +86,18 @@ final class BroadcastPreferencesTests: XCTestCase {
         }
     }
 
-    func testSelectionPolicyDefaults() {
+    /// Ships inert: the dial is unset (nil, not 0.0 — 0.0 is an active
+    /// reorder) and the mix-set toggle is off, so an upgrade changes nothing.
+    func testSelectionPolicyDefaultsAreInert() {
         let p = BroadcastPreferences.shared.selectionPolicy
-        XCTAssertEqual(p.newMusicShare, 0.7, accuracy: 0.0001)
+        XCTAssertNil(p.newMusicShare, "the dial must ship unset, not at a value")
         XCTAssertFalse(p.excludeMixSets)
     }
 
     func testSelectionPolicyRoundTrips() {
         let prefs = BroadcastPreferences.shared
         prefs.selectionPolicy = SelectionPolicy(newMusicShare: 0.25, excludeMixSets: true)
-        XCTAssertEqual(prefs.selectionPolicy.newMusicShare, 0.25, accuracy: 0.0001)
+        XCTAssertEqual(prefs.selectionPolicy.newMusicShare ?? -1, 0.25, accuracy: 0.0001)
         XCTAssertTrue(prefs.selectionPolicy.excludeMixSets)
         XCTAssertEqual(
             UserDefaults.standard.double(forKey: "ratbat.selection.newMusicShare"),
@@ -106,7 +108,7 @@ final class BroadcastPreferencesTests: XCTestCase {
     func testSelectionPolicyClampsOutOfRangeShare() {
         let prefs = BroadcastPreferences.shared
         prefs.selectionPolicy = SelectionPolicy(newMusicShare: 9)
-        XCTAssertEqual(prefs.selectionPolicy.newMusicShare, 1.0, accuracy: 0.0001)
+        XCTAssertEqual(prefs.selectionPolicy.newMusicShare ?? -1, 1.0, accuracy: 0.0001)
     }
 
     /// Both settings take effect at the next pool refill, so neither may raise
@@ -123,7 +125,7 @@ final class BroadcastPreferencesTests: XCTestCase {
         let prefs = BroadcastPreferences.shared
         prefs.selectionPolicy = SelectionPolicy(newMusicShare: 0.1, excludeMixSets: true)
         prefs.resetToDefaults()
-        XCTAssertEqual(prefs.selectionPolicy.newMusicShare, 0.7, accuracy: 0.0001)
+        XCTAssertNil(prefs.selectionPolicy.newMusicShare)
         XCTAssertFalse(prefs.selectionPolicy.excludeMixSets)
     }
 

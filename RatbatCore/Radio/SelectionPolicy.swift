@@ -15,7 +15,14 @@ public struct SelectionPolicy: Sendable, Hashable, Codable {
     /// own, in [0, 1]. See ``SelectionOrdering/orderByNewness(_:share:phase:isNew:)``
     /// for exactly what "share" means — it is a deterministic ratio over plays,
     /// not a per-track coin flip.
-    public var newMusicShare: Double
+    ///
+    /// `nil` means "no preference — leave the upstream ranking alone", and is
+    /// what ships. It is deliberately NOT the same as 0.0: a 0.0 dial is an
+    /// active reorder that leads with owned music and appends new, so shipping
+    /// 0.0 would change what an existing listener hears. `nil` is the only
+    /// value that is genuinely inert, and the mechanism stays dormant behind
+    /// it until the owner sets a value in Settings.
+    public var newMusicShare: Double?
 
     /// When true, candidates classified by ``MixSetRule`` are removed from the
     /// pool before selection. When false the classification still runs and is
@@ -26,20 +33,23 @@ public struct SelectionPolicy: Sendable, Hashable, Codable {
     /// Long-form threshold handed to ``MixSetRule``.
     public var mixSetMinimumDuration: TimeInterval
 
+    /// Ships inert: no dial, no mix-set filtering. An owner who upgrades and
+    /// touches nothing hears exactly what they heard before.
     public static let `default` = SelectionPolicy(
-        newMusicShare: 0.7,
+        newMusicShare: nil,
         excludeMixSets: false,
         mixSetMinimumDuration: MixSetRule.defaultMinimumDuration
     )
 
     /// `newMusicShare` is clamped here rather than at the call sites so a bad
-    /// value cannot reach the ordering, whatever wrote it.
+    /// value cannot reach the ordering, whatever wrote it. `nil` passes
+    /// through untouched — it means "off", not "zero".
     public init(
-        newMusicShare: Double = 0.7,
+        newMusicShare: Double? = nil,
         excludeMixSets: Bool = false,
         mixSetMinimumDuration: TimeInterval = MixSetRule.defaultMinimumDuration
     ) {
-        self.newMusicShare = min(1, max(0, newMusicShare))
+        self.newMusicShare = newMusicShare.map { min(1, max(0, $0)) }
         self.excludeMixSets = excludeMixSets
         self.mixSetMinimumDuration = mixSetMinimumDuration
     }

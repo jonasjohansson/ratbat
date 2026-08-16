@@ -255,9 +255,22 @@ public enum SelectionPlanner {
             subject: subject
         )
 
+        // Dial off (the shipped default): leave the upstream ranking exactly
+        // as it was. Returning early rather than calling orderByNewness with
+        // some "neutral" share, because there is no neutral share — 0.0 leads
+        // with owned and 1.0 leads with new, and both are reorders.
+        guard let share = policy.newMusicShare else {
+            return SelectionPlan(
+                ordered: filtered.kept,
+                exclusions: filtered.exclusions,
+                shortfall: 0,
+                stoodDown: filtered.stoodDown
+            )
+        }
+
         let ordering = SelectionOrdering.orderByNewness(
             filtered.kept,
-            share: policy.newMusicShare,
+            share: share,
             phase: phase,
             isNew: { !ownedArtistKeys.contains(SelectionOrdering.artistKey(subject($0).artist)) }
         )
@@ -266,7 +279,7 @@ public enum SelectionPlanner {
         if ordering.shortfall > 0 {
             // The dial never removes, so this drops nothing — but without
             // it "my 100% dial does nothing" has no answer on disk.
-            let explanation = "dial shortfall: asked for \(Int((policy.newMusicShare * 100).rounded()))% new "
+            let explanation = "dial shortfall: asked for \(Int((share * 100).rounded()))% new "
                 + "over \(ordering.newSupply) new / \(ordering.ownedSupply) owned candidate(s); "
                 + "\(ordering.shortfall) slot(s) served from the other bucket."
             rows.append(SelectionExclusionRecord(

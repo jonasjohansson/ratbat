@@ -5,9 +5,12 @@ final class SelectionPolicyTests: XCTestCase {
 
     // MARK: - Policy value
 
-    func testDefaultsAreTheShippedDefaults() {
+    /// The shipped policy is inert. `newMusicShare` is nil, NOT 0.0 —
+    /// 0.0 is an active reorder that leads with owned music, so it would
+    /// change what an existing listener hears. Nil is the only off.
+    func testDefaultsAreInert() {
         let p = SelectionPolicy.default
-        XCTAssertEqual(p.newMusicShare, 0.7, accuracy: 0.0001)
+        XCTAssertNil(p.newMusicShare, "the dial ships unset")
         XCTAssertFalse(p.excludeMixSets, "the toggle ships off — it removes music")
         XCTAssertEqual(p.mixSetMinimumDuration, 1200)
     }
@@ -15,6 +18,7 @@ final class SelectionPolicyTests: XCTestCase {
     func testShareIsClampedAtTheBoundary() {
         XCTAssertEqual(SelectionPolicy(newMusicShare: 4.2).newMusicShare, 1.0)
         XCTAssertEqual(SelectionPolicy(newMusicShare: -1).newMusicShare, 0.0)
+        XCTAssertNil(SelectionPolicy(newMusicShare: nil).newMusicShare, "nil means off, not zero")
     }
 
     func testArtistKeyIsTrimmedAndCaseFolded() {
