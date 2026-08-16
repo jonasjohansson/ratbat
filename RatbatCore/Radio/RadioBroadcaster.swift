@@ -2822,6 +2822,41 @@ public final class RadioBroadcaster: ObservableObject {
     /// header and pumps the pipeline's ring buffer to the client. ICY
     /// metadata (if requested) is injected every 16384 bytes using the
     /// station's current track.
+    /// How long a listener waits on a cold start before we admit the
+    /// station isn't ready. Long enough to cover a slow first resolve,
+    /// short enough that a player's own timeout doesn't beat us to it.
+    nonisolated static let coldStartTimeout: TimeInterval = 12
+
+    /// Poll for the ring's first byte. Returns false on timeout.
+    nonisolated private static func awaitFirstAudio(
+        buffer: AACRingBuffer,
+        timeout: TimeInterval
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if Task.isCancelled { return false }
+            if buffer.hasProducedAudio() { return true }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        return buffer.hasProducedAudio()
+    }
+
+    /// 503 for a station that is registered but has produced no audio yet.
+    /// `Retry-After` tells a well-behaved player to come back rather than
+    /// treat the station as permanently broken.
+    nonisolated static func serviceUnavailableResponse() -> String {
+        let body = "not ready"
+        return """
+        HTTP/1.1 503 Service Unavailable\r
+        Content-Type: text/plain\r
+        Content-Length: \(body.utf8.count)\r
+        Retry-After: 5\r
+        Connection: close\r
+        \r
+        \(body)
+        """
+    }
+
     private static func serveClient(
         connection: NWConnection,
         buffer: AACRingBuffer,
@@ -2830,6 +2865,33 @@ public final class RadioBroadcaster: ObservableObject {
         wantsMetadata: Bool,
         ownerRef: @escaping @Sendable () -> RadioBroadcaster?
     ) async {
+        // Don't promise a stream we can't yet fill.
+        //
+        // The pipeline is registered — and so serves 200 + ICY headers,
+        // and reports broadcasting:true — before the first track has
+        // resolved. A new listener's cursor starts at the live edge of an
+        // empty ring, so the player got a valid-looking `200 audio/aac`
+        // and then silence for however long the resolve took (~18s for a
+        // Bandcamp first track via yt-dlp). Most players give up, and the
+        // window is indistinguishable from a genuinely broken station to
+        // any check that only reads the status line.
+        //
+        // Wait, bounded, for the first byte. If it never comes, say so
+        // honestly with a retryable 503 instead of a 200 that lies.
+        if !buffer.hasProducedAudio() {
+            let ready = await awaitFirstAudio(
+                buffer: buffer,
+                timeout: coldStartTimeout
+            )
+            if !ready {
+                _ = await send(
+                    data: Data(serviceUnavailableResponse().utf8),
+                    on: connection
+                )
+                return
+            }
+        }
+
         let responseHeader = buildResponseHeader(
             wantsMetadata: wantsMetadata,
             stationName: stationName

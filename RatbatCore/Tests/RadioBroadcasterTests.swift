@@ -44,6 +44,46 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertNil(radio.streamURL(for: station))
     }
 
+    // MARK: - Cold start must not advertise a stream it cannot fill
+
+    /// A source that takes a while — the shape of a Bandcamp/NTS first
+    /// track, where yt-dlp can spend ~18s before a byte exists.
+    private actor SlowSource: TrackSource {
+        func nextURL() async throws -> TrackSourceItem? {
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            return nil
+        }
+    }
+
+    /// The pipeline is registered — and therefore serves `200` + ICY
+    /// headers, and reports `broadcasting: true` — before the first track
+    /// has resolved, while a new listener's cursor starts at the live edge
+    /// of an empty ring. So the player got a valid-looking `200 audio/aac`
+    /// and then silence for as long as the resolve took, and most give up.
+    ///
+    /// Worse for this pass: that window is indistinguishable from a
+    /// genuinely broken station to any check that reads the status line.
+    @MainActor
+    func testColdStartDoesNotAdvertise200BeforeAnyAudioExists() async throws {
+        let port: UInt16 = 18_055
+        let radio = RadioBroadcaster(port: port)
+        defer { radio.stopAll() }
+
+        let station = Station(name: "Slow Start", kind: .playlist(queue: []))
+        await radio.startBroadcast(station: station, source: SlowSource())
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        let response = await Self.probeEndpoint(
+            port: port,
+            path: "/stream/\(station.slug).aac",
+            timeout: 2
+        )
+        XCTAssertFalse(
+            response?.contains("HTTP/1.1 200") ?? false,
+            "sent 200 before any audio existed: \(response ?? "nil")"
+        )
+    }
+
     // MARK: - Going off air must leave a trace
 
     /// A source that is dry from the first call — a pool refill that came
