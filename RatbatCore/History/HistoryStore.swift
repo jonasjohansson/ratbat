@@ -125,7 +125,7 @@ public actor HistoryStore {
     // query-time access still goes through actor-isolated methods, which
     // is where the synchronization matters.
     private nonisolated(unsafe) var db: OpaquePointer?
-    private let logger = Logger(subsystem: "se.jonasjohansson.ratbat", category: "history")
+    private let logger = Logger(subsystem: RatbatLog.subsystem, category: "history")
     private let dbURL: URL
 
     /// Production: default app-support path.

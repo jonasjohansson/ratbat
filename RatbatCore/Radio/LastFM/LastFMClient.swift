@@ -78,7 +78,7 @@ public actor LastFMClient {
     private let apiBase = URL(string: "https://ws.audioscrobbler.com/2.0/")!
     private let userAgent = "Ratbat/1.0 (personal radio)"
     private let apiKey: String
-    private let logger = Logger(subsystem: "se.jonasjohansson.ratbat", category: "lastfm")
+    private let logger = Logger(subsystem: RatbatLog.subsystem, category: "lastfm")
 
     public init(apiKey: String, session: URLSession = .shared) {
         self.apiKey = apiKey

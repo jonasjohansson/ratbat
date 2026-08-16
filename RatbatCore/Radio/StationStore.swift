@@ -25,7 +25,7 @@ enum StationStore {
     static let currentVersion = 1
 
     static let logger = Logger(
-        subsystem: "se.jonasjohansson.ratbat",
+        subsystem: RatbatLog.subsystem,
         category: "station-store"
     )
 

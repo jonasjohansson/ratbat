@@ -34,7 +34,7 @@ public struct SourceCandidate: Sendable, Hashable {
 /// ``BandcampStationController``. Stateless namespace — all state is
 /// carried through parameters.
 public enum FacetedPipeline {
-    static let logger = Logger(subsystem: "se.jonasjohansson.ratbat", category: "faceted-pipeline")
+    static let logger = Logger(subsystem: RatbatLog.subsystem, category: "faceted-pipeline")
 
     // MARK: - Tag mode (stage 2)
 

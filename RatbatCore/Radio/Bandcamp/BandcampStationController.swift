@@ -80,7 +80,7 @@ public actor BandcampStationController {
     private let history: HistoryStore
     private let resolver: TrackResolver
     private let tasteProfile: TasteProfile
-    private let logger = Logger(subsystem: "se.jonasjohansson.ratbat", category: "bandcamp-station")
+    private let logger = Logger(subsystem: RatbatLog.subsystem, category: "bandcamp-station")
 
     /// `source_kind` stamped on this station's exclusion rows.
     private static let sourceKind = "bandcamp"

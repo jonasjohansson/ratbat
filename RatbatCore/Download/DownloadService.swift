@@ -60,7 +60,7 @@ public final class DownloadService: ObservableObject {
 
     // MARK: - Private state
 
-    private let logger = Logger(subsystem: "se.jonasjohansson.ratbat", category: "downloader")
+    private let logger = Logger(subsystem: RatbatLog.subsystem, category: "downloader")
     private var processes: [Batch.ID: Process] = [:]
 
     public init() {}

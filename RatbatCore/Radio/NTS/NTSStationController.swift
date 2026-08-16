@@ -82,7 +82,7 @@ public actor NTSStationController {
     private let history: HistoryStore
     private let resolver: TrackResolver
     private let tasteProfile: TasteProfile
-    private let logger = Logger(subsystem: "se.jonasjohansson.ratbat", category: "nts-station")
+    private let logger = Logger(subsystem: RatbatLog.subsystem, category: "nts-station")
 
     /// `source_kind` stamped on this station's exclusion rows.
     private static let sourceKind = "nts"

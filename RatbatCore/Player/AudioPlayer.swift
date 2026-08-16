@@ -38,7 +38,7 @@ public final class AudioPlayer: ObservableObject {
 
     private let player: AVPlayer
     private let logger = Logger(
-        subsystem: "se.jonasjohansson.ratbat",
+        subsystem: RatbatLog.subsystem,
         category: "player"
     )
 

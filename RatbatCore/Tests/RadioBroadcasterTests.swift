@@ -44,6 +44,55 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertNil(radio.streamURL(for: station))
     }
 
+    // MARK: - Evidence hygiene
+
+    /// Test runs logged to the same subsystem AND categories as production,
+    /// with identical message text. Over a two-hour window on the mac-mini
+    /// there were 23,056 lines under `se.jonasjohansson.ratbat` — every one
+    /// from `xctest`, none from the running app. The durable evidence store
+    /// was ~100% manufactured by CI, and indistinguishable from the real
+    /// failures it mimics.
+    func testTestRunsLogToASeparateSubsystem() {
+        XCTAssertEqual(RatbatLog.subsystem, RatbatLog.testSubsystem)
+        XCTAssertNotEqual(RatbatLog.subsystem, RatbatLog.productionSubsystem)
+    }
+
+    /// Non-stream requests leaked a `clientTasks` entry each.
+    ///
+    /// `removeClient` is only wired up by `registerClient`, which runs for
+    /// stream clients, so /now.json, /history, /events and the action POSTs
+    /// never removed theirs — the dictionary grew for the whole session.
+    @MainActor
+    func testNonStreamRequestsDoNotLeakConnectionTasks() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let port: UInt16 = 18_059
+        let radio = RadioBroadcaster(port: port)
+        defer { radio.stopAll() }
+        let station = Station(name: "Leak Test", kind: .playlist(queue: tracks))
+        await radio.startBroadcast(station: station)
+        try await Task.sleep(nanoseconds: 600_000_000)
+
+        let baseline = radio.trackedConnectionTaskCount
+
+        for _ in 0..<25 {
+            _ = await Self.probeEndpoint(port: port, path: "/now.json", timeout: 2)
+        }
+        // Let the cancellations land.
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+
+        let after = radio.trackedConnectionTaskCount
+        // Measured: 3 entries survive 25 requests without the reaper, 0 with
+        // it. Fewer than 25 because `ObjectIdentifier` reuses the addresses
+        // of deallocated connections, so some entries overwrite each other
+        // — the growth is real but slower than one-per-request.
+        XCTAssertLessThanOrEqual(
+            after, baseline,
+            "leaked connection tasks: \(baseline) -> \(after) after 25 /now.json requests"
+        )
+    }
+
     // MARK: - A listener failure must be survivable
 
     /// The listener's only failure response was `stopAll()` — no retry, no

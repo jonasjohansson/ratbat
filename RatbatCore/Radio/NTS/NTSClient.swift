@@ -100,7 +100,7 @@ public actor NTSClient {
     private let apiBase = URL(string: "https://www.nts.live/api/v2")!
     private let siteBase = URL(string: "https://www.nts.live")!
     private let userAgent = "Ratbat/1.0 (personal radio)"
-    private let logger = Logger(subsystem: "se.jonasjohansson.ratbat", category: "nts")
+    private let logger = Logger(subsystem: RatbatLog.subsystem, category: "nts")
 
     public init(session: URLSession = .shared) {
         self.session = session

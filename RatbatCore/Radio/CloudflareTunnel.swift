@@ -147,7 +147,7 @@ public final class CloudflareTunnel: ObservableObject {
     private let restartOnUnexpectedExit: Bool
 
     private let logger = Logger(
-        subsystem: "se.jonasjohansson.ratbat",
+        subsystem: RatbatLog.subsystem,
         category: "tunnel"
     )
 
