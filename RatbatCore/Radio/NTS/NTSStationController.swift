@@ -84,6 +84,19 @@ public actor NTSStationController {
     private let tasteProfile: TasteProfile
     private let logger = Logger(subsystem: "se.jonasjohansson.ratbat", category: "nts-station")
 
+    /// `source_kind` stamped on this station's exclusion rows.
+    private static let sourceKind = "nts"
+
+    /// Live read of the listener's two dials.
+    ///
+    /// A provider, not a value. ``BroadcastPreferences`` is `@MainActor`
+    /// and this is an actor, so the policy has to cross a boundary — and
+    /// crossing it ONCE at construction (the shape every other preference
+    /// in this codebase uses) would freeze both settings for the whole
+    /// broadcast. It is re-read at every pool refill instead, so moving a
+    /// dial mid-broadcast takes effect without a restart.
+    private let selectionPolicy: @Sendable () async -> SelectionPolicy
+
     /// Carries the NTS show-URL for the artist/title pair through the
     /// pipeline — ``SourceCandidate`` has no such field, but we need it
     /// when recording history so "where did this come from?" is
@@ -92,9 +105,33 @@ public actor NTSStationController {
     /// and the candidate out the back of the pipeline doesn't matter.
     private var showURLByCandidate: [DedupKey: URL] = [:]
 
+    /// Track duration for the artist/title pair, when NTS supplies one.
+    /// It currently never does — the tracklist API's `duration` key is
+    /// null on every row we have sampled — so this side table is expected
+    /// to stay empty and the mix-set title arm carries the entire load on
+    /// this source. Wired anyway so the duration arm starts working the
+    /// day NTS populates the field. Rebuilt each refill, like the show URLs.
+    private var durationByCandidate: [DedupKey: TimeInterval] = [:]
+
     /// Survivors of the last pipeline pass.
     private var pool: [SourceCandidate] = []
     private var cursor: Int = 0
+
+    /// The policy the current ``pool`` was built under, so a dial that has
+    /// not moved cannot trigger a re-filter.
+    private var poolPolicy: SelectionPolicy?
+
+    /// Owned-artist keys captured at the last refill. The dial's ordering
+    /// and the phase counters below both read THIS set, so ownership can
+    /// not be judged one way when ordering and another way when counting.
+    private var ownedArtistKeys: Set<String> = []
+
+    /// Plays realised on this station: `playedNew` of `playedTotal` were by
+    /// artists the owner has nothing by. Fed into the next refill so
+    /// candidates rejected AFTER ordering — already played, resolve failed
+    /// — are corrected for instead of accumulating as permanent drift.
+    private var playedNew = 0
+    private var playedTotal = 0
 
     /// Cached list of shows matching the station's tags. We drain up to
     /// eight shows per pool refill so NTS isn't hammered on every single
@@ -115,7 +152,8 @@ public actor NTSStationController {
         lastFM: LastFMClient?,
         history: HistoryStore,
         resolver: TrackResolver,
-        tasteProfile: TasteProfile
+        tasteProfile: TasteProfile,
+        selectionPolicy: @escaping @Sendable () async -> SelectionPolicy = { .default }
     ) {
         self.config = config
         self.nts = nts
@@ -124,6 +162,7 @@ public actor NTSStationController {
         self.history = history
         self.resolver = resolver
         self.tasteProfile = tasteProfile
+        self.selectionPolicy = selectionPolicy
     }
 
     /// Produce the next resolved track for this station.
@@ -137,6 +176,11 @@ public actor NTSStationController {
     ///   can't be refilled (no more shows, or the `maxAttempts` cap
     ///   was hit without a successful resolve).
     public func nextTrack() async throws -> ResolvedTrack {
+        // Has a dial moved since this pool was built? Re-choose from what
+        // is left rather than waiting for the pool to drain — "I turned it
+        // off and nothing happened" is the complaint this prevents.
+        await reapplyPolicyIfChanged()
+
         let maxAttempts = 30
         var attempts = 0
 
@@ -186,6 +230,13 @@ public actor NTSStationController {
                     cachedPath: resolution.cachedURL.path
                 )
                 logger.info("resolved \(candidate.artist, privacy: .public) — \(candidate.title, privacy: .public)")
+                // Irreversible commit point: this track is about to play,
+                // so it counts toward the dial's realised ratio. Read from
+                // the SAME owned key set the ordering used.
+                playedTotal += 1
+                if !ownedArtistKeys.contains(SelectionOrdering.artistKey(candidate.artist)) {
+                    playedNew += 1
+                }
                 return ResolvedTrack(
                     artist: candidate.artist,
                     title: candidate.title,
@@ -215,7 +266,7 @@ public actor NTSStationController {
 
     /// Drain the next batch of NTS shows, collapse their tracklists into
     /// a ``SourceCandidate`` list, then run the full faceted pipeline.
-    private func refillPool() async throws {
+    internal func refillPool() async throws {
         if showCursor >= shows.count {
             try await refreshShows()
         }
@@ -235,6 +286,7 @@ public actor NTSStationController {
             var candidate: SourceCandidate
             var matchedTags: Set<String>
             var showURL: URL
+            var durationSeconds: TimeInterval?
         }
         var seeds: [SeedRecord] = []
         var seedIndex: [DedupKey: Int] = [:]
@@ -280,7 +332,8 @@ public actor NTSStationController {
                         seeds.append(SeedRecord(
                             candidate: cand,
                             matchedTags: showTagsLower,
-                            showURL: show.url
+                            showURL: show.url,
+                            durationSeconds: row.durationSeconds
                         ))
                     }
                 }
@@ -297,12 +350,16 @@ public actor NTSStationController {
         // Rebuild the show-URL side-table so history.record can source
         // the original NTS page.
         showURLByCandidate.removeAll(keepingCapacity: true)
+        durationByCandidate.removeAll(keepingCapacity: true)
         for seed in seeds {
             let key = DedupKey(
                 artist: seed.candidate.artist.lowercased(),
                 title: seed.candidate.title.lowercased()
             )
             showURLByCandidate[key] = seed.showURL
+            if let seconds = seed.durationSeconds {
+                durationByCandidate[key] = seconds
+            }
         }
 
         // Stage 2: tag mode via the shared pipeline. `.any` is a no-op
@@ -435,6 +492,7 @@ public actor NTSStationController {
             // rather than pre-draining recursively here.
             pool = []
             cursor = 0
+            poolPolicy = nil
             throw Error.noTracklistsAvailable
         }
 
@@ -442,6 +500,7 @@ public actor NTSStationController {
         // LastFM/Bandcamp so the three generative stations feel
         // consistent. When `shufflePool` is off we keep scrape order
         // (newest show first), skipping the wildcard split.
+        let ranked: [SourceCandidate]
         if config.shufflePool {
             let wildcardCount = max(1, Int(Double(scored.count) * wildcardFraction))
             let topCount = max(scored.count - wildcardCount, 0)
@@ -449,15 +508,112 @@ public actor NTSStationController {
             var wildcardSlice = Array(scored.suffix(wildcardCount)).map { $0.cand }
             wildcardSlice.shuffle()
 
-            pool = interleave(topSlice, wildcardSlice)
-            pool = softShuffle(pool, window: 4)
-            cursor = 0
-            logger.info("stage9 pool ready: \(self.pool.count) candidates (wildcards: \(wildcardCount))")
+            ranked = softShuffle(interleave(topSlice, wildcardSlice), window: 4)
+            logger.info("stage9 ranked: \(ranked.count) candidates (wildcards: \(wildcardCount))")
         } else {
-            pool = scored.map { $0.cand }
-            cursor = 0
-            logger.info("stage9 pool ready: \(self.pool.count) candidates (order preserved)")
+            ranked = scored.map { $0.cand }
+            logger.info("stage9 ranked: \(ranked.count) candidates (order preserved)")
         }
+
+        // Stage 10: the listener's two dials, applied while the pool is
+        // being BUILT. Picking a track and then filtering it out afterwards
+        // produces gaps and repeats; choosing correctly does not.
+        await applySelectionPolicy(to: ranked)
+    }
+
+    // MARK: - Selection policy (stage 10)
+
+    /// Re-reads the policy, applies it to a freshly ranked pool, installs
+    /// the result and logs whatever the rule decided.
+    private func applySelectionPolicy(to ranked: [SourceCandidate]) async {
+        let policy = await selectionPolicy()
+        // ONE actor hop per refill, not one await per candidate. The same
+        // set then drives the phase counters at the commit point.
+        ownedArtistKeys = await tasteProfile.ownedArtistKeys()
+
+        let plan = SelectionPlanner.plan(
+            ranked.map { SelectionInput(candidate: $0, subject: selectionSubject(for: $0)) },
+            policy: policy,
+            phase: (new: playedNew, total: playedTotal),
+            sourceKind: Self.sourceKind,
+            ownedArtistKeys: ownedArtistKeys,
+            subject: { $0.subject }
+        )
+
+        pool = plan.ordered.map(\.candidate)
+        cursor = 0
+        // Recorded at the END of every refill, not only in the mid-pool
+        // re-filter branch below. Leaving it stale makes the very next
+        // nextTrack() see a "changed" policy and re-filter a pool that was
+        // just built, double-counting hit_count on every candidate it
+        // re-sights — and the audit log then overstates how often the rule
+        // actually fired.
+        poolPolicy = policy
+        logger.info("stage10 policy: \(self.pool.count) candidates (exclusions: \(plan.exclusions.count), shortfall: \(plan.shortfall))")
+        await record(plan.exclusions)
+    }
+
+    /// Re-applies the policy to the UNPLAYED remainder when a dial has
+    /// moved since this pool was built. No-op when it has not.
+    private func reapplyPolicyIfChanged() async {
+        guard let built = poolPolicy, cursor < pool.count else { return }
+        let policy = await selectionPolicy()
+        guard built != policy else { return }
+
+        let remainder = Array(pool[cursor...])
+        let plan = SelectionPlanner.plan(
+            remainder.map { SelectionInput(candidate: $0, subject: selectionSubject(for: $0)) },
+            policy: policy,
+            phase: (new: playedNew, total: playedTotal),
+            sourceKind: Self.sourceKind,
+            ownedArtistKeys: ownedArtistKeys,
+            subject: { $0.subject }
+        )
+        // Keep the already-played prefix so `cursor` stays valid.
+        pool = Array(pool[..<cursor]) + plan.ordered.map(\.candidate)
+        poolPolicy = policy
+        logger.info("policy changed mid-pool: \(remainder.count) → \(plan.ordered.count) remaining")
+        await record(plan.exclusions)
+    }
+
+    /// What the mix-set rule gets to see about a candidate. NTS supplies no
+    /// duration in practice, so this is a title-arm-only source until the
+    /// tracklist API starts populating `duration`.
+    private func selectionSubject(for candidate: SourceCandidate) -> SelectionSubject {
+        let key = DedupKey(
+            artist: candidate.artist.lowercased(),
+            title: candidate.title.lowercased()
+        )
+        let seconds = durationByCandidate[key]
+        return SelectionSubject(
+            artist: candidate.artist,
+            title: candidate.title,
+            durationSeconds: seconds,
+            durationSource: seconds == nil ? nil : "tracklist",
+            sourceURL: showURLByCandidate[key]
+        )
+    }
+
+    private func record(_ rows: [SelectionExclusionRecord]) async {
+        guard !rows.isEmpty else { return }
+        do {
+            try await history.recordExclusions(
+                rows.map(HistoryStore.ExclusionInput.init),
+                stationID: config.id
+            )
+        } catch {
+            // Best-effort: the audit log must never take the station down.
+            logger.error("failed to record selection exclusions: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    // MARK: - Test seams
+
+    /// The current pool. `internal`, so invisible outside the module.
+    internal func poolSnapshot() -> [SourceCandidate] { pool }
+
+    internal func reapplyPolicyIfChangedForTesting() async {
+        await reapplyPolicyIfChanged()
     }
 
     /// Fetch the show list for each configured tag, dedup by URL,

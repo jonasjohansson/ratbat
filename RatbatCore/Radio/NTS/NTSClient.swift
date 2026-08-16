@@ -48,6 +48,29 @@ public actor NTSClient {
         public let title: String
         public let showURL: URL
         public let position: Int        // 1-based order in the show
+        /// Track length in seconds, when NTS supplies one.
+        ///
+        /// Expect `nil`. The tracklist API has carried a `duration` key for
+        /// as long as we have sampled it and it is null on every row —
+        /// 21/21 in `tracklist-dream-catalogue.json`, and `duration_estimate`
+        /// is null there too. It is decoded anyway so the mix-set rule's
+        /// duration arm starts working the day NTS populates it; until then
+        /// the title arm carries the entire load on this source.
+        public let durationSeconds: TimeInterval?
+
+        public init(
+            artist: String,
+            title: String,
+            showURL: URL,
+            position: Int,
+            durationSeconds: TimeInterval? = nil
+        ) {
+            self.artist = artist
+            self.title = title
+            self.showURL = showURL
+            self.position = position
+            self.durationSeconds = durationSeconds
+        }
     }
 
     public enum Error: Swift.Error, Sendable, Equatable {
@@ -214,12 +237,22 @@ public actor NTSClient {
                 artist: artist,
                 title: title,
                 showURL: showURL,
-                position: idx + 1
+                position: idx + 1,
+                durationSeconds: row.duration
             ))
         }
         // Re-number to guarantee contiguous 1..n if any rows were skipped.
         return out.enumerated().map { offset, t in
-            Tracklisting(artist: t.artist, title: t.title, showURL: t.showURL, position: offset + 1)
+            // Re-number to guarantee contiguous 1..n. Every field has to be
+            // carried across explicitly here; a new one that is forgotten is
+            // silently dropped at this line, not at the decoder.
+            Tracklisting(
+                artist: t.artist,
+                title: t.title,
+                showURL: t.showURL,
+                position: offset + 1,
+                durationSeconds: t.durationSeconds
+            )
         }
     }
 
@@ -392,6 +425,9 @@ public actor NTSClient {
     private struct TrackRaw: Decodable {
         let artist: String?
         let title: String?
+        /// Null on every row we have ever sampled. Optional so a populated
+        /// value works and a null one does not fail the envelope.
+        let duration: Double?
     }
 }
 

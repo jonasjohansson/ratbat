@@ -67,8 +67,30 @@ public actor LastFMStationController {
     private let tasteProfile: TasteProfile
     private let logger = Logger(subsystem: "se.jonasjohansson.ratbat", category: "lastfm-station")
 
+    /// `source_kind` stamped on this station's exclusion rows.
+    private static let sourceKind = "lastfm"
+
+    /// Live read of the listener's two dials. A provider, not a value:
+    /// ``BroadcastPreferences`` is `@MainActor` and this is an actor, and a
+    /// policy snapshotted at construction would be frozen for the whole
+    /// broadcast. Re-read at every pool refill.
+    private let selectionPolicy: @Sendable () async -> SelectionPolicy
+
     private var pool: [SourceCandidate] = []
     private var cursor: Int = 0
+
+    /// The policy the current ``pool`` was built under, so a dial that has
+    /// not moved cannot trigger a re-filter.
+    private var poolPolicy: SelectionPolicy?
+
+    /// Owned-artist keys captured at the last refill — read by both the
+    /// dial's ordering and the phase counters, so the two cannot disagree.
+    private var ownedArtistKeys: Set<String> = []
+
+    /// Plays realised on this station, carried into the next refill so
+    /// candidates rejected after ordering self-correct rather than drift.
+    private var playedNew = 0
+    private var playedTotal = 0
 
     /// Reservation ratio: what fraction of the pool is unscored wildcards
     /// vs taste-sorted top picks. 0.2 = 20% wildcards, matches the design
@@ -81,7 +103,8 @@ public actor LastFMStationController {
         musicBrainz: MusicBrainzClient,
         history: HistoryStore,
         resolver: TrackResolver,
-        tasteProfile: TasteProfile
+        tasteProfile: TasteProfile,
+        selectionPolicy: @escaping @Sendable () async -> SelectionPolicy = { .default }
     ) {
         self.config = config
         self.client = client
@@ -89,6 +112,7 @@ public actor LastFMStationController {
         self.history = history
         self.resolver = resolver
         self.tasteProfile = tasteProfile
+        self.selectionPolicy = selectionPolicy
     }
 
     // MARK: - Public
@@ -100,6 +124,10 @@ public actor LastFMStationController {
     /// transient resolver failures, refills the pool when empty, caps
     /// the retry loop at `maxAttempts` so a bad stretch can't hang.
     public func nextTrack() async throws -> ResolvedTrack {
+        // A dial moved since this pool was built? Re-choose from what is
+        // left instead of waiting for the pool to drain.
+        await reapplyPolicyIfChanged()
+
         let maxAttempts = 30
         var attempts = 0
 
@@ -139,6 +167,13 @@ public actor LastFMStationController {
                     cachedPath: resolution.cachedURL.path
                 )
                 logger.info("resolved \(candidate.artist, privacy: .public) — \(candidate.title, privacy: .public)")
+                // Irreversible commit point: this track is about to play,
+                // so it counts toward the dial's realised ratio. Same owned
+                // key set the ordering used.
+                playedTotal += 1
+                if !ownedArtistKeys.contains(SelectionOrdering.artistKey(candidate.artist)) {
+                    playedNew += 1
+                }
                 return ResolvedTrack(
                     artist: candidate.artist,
                     title: candidate.title,
@@ -376,6 +411,7 @@ public actor LastFMStationController {
         if scored.isEmpty {
             pool = []
             cursor = 0
+            poolPolicy = nil
             throw Error.noTracksForTags(config.query.genreTags)
         }
 
@@ -392,14 +428,101 @@ public actor LastFMStationController {
         var wildcardSlice = Array(scored.suffix(wildcardCount)).map { $0.cand }
         wildcardSlice.shuffle()
 
-        pool = interleave(topSlice, wildcardSlice)
+        var ranked = interleave(topSlice, wildcardSlice)
         if config.shufflePool {
             // Mild final shuffle within 4-track windows so the first
             // couple of plays aren't always the single top-scored pick.
-            pool = softShuffle(pool, window: 4)
+            ranked = softShuffle(ranked, window: 4)
         }
+        logger.info("stage9 ranked: \(ranked.count) candidates (wildcards: \(wildcardCount))")
+
+        // Stage 10: the listener's two dials, applied while the pool is
+        // being BUILT rather than after a track has already been chosen.
+        await applySelectionPolicy(to: ranked)
+    }
+
+    // MARK: - Selection policy (stage 10)
+
+    private func applySelectionPolicy(to ranked: [SourceCandidate]) async {
+        let policy = await selectionPolicy()
+        // ONE actor hop per refill, not one await per candidate.
+        ownedArtistKeys = await tasteProfile.ownedArtistKeys()
+
+        let plan = SelectionPlanner.plan(
+            ranked.map { SelectionInput(candidate: $0, subject: selectionSubject(for: $0)) },
+            policy: policy,
+            phase: (new: playedNew, total: playedTotal),
+            sourceKind: Self.sourceKind,
+            ownedArtistKeys: ownedArtistKeys,
+            subject: { $0.subject }
+        )
+
+        pool = plan.ordered.map(\.candidate)
         cursor = 0
-        logger.info("stage9 pool ready: \(self.pool.count) candidates (wildcards: \(wildcardCount))")
+        // Set at the END of the refill, not only in the re-filter branch:
+        // a stale value makes the next nextTrack() re-filter a pool that
+        // was just built and double-count hit_count on every candidate.
+        poolPolicy = policy
+        logger.info("stage10 policy: \(self.pool.count) candidates (exclusions: \(plan.exclusions.count), shortfall: \(plan.shortfall))")
+        await record(plan.exclusions)
+    }
+
+    /// Re-applies the policy to the UNPLAYED remainder when a dial moved
+    /// since this pool was built. No-op when it did not.
+    private func reapplyPolicyIfChanged() async {
+        guard let built = poolPolicy, cursor < pool.count else { return }
+        let policy = await selectionPolicy()
+        guard built != policy else { return }
+
+        let remainder = Array(pool[cursor...])
+        let plan = SelectionPlanner.plan(
+            remainder.map { SelectionInput(candidate: $0, subject: selectionSubject(for: $0)) },
+            policy: policy,
+            phase: (new: playedNew, total: playedTotal),
+            sourceKind: Self.sourceKind,
+            ownedArtistKeys: ownedArtistKeys,
+            subject: { $0.subject }
+        )
+        pool = Array(pool[..<cursor]) + plan.ordered.map(\.candidate)
+        poolPolicy = policy
+        logger.info("policy changed mid-pool: \(remainder.count) → \(plan.ordered.count) remaining")
+        await record(plan.exclusions)
+    }
+
+    /// What the mix-set rule gets to see about a candidate.
+    ///
+    /// The duration is always nil, and not defensively so: Last.fm's API
+    /// surface has no duration field at all — ``LastFMClient/TrackCandidate``
+    /// is `(artist, title, listeners, playcount)` and nothing downstream
+    /// adds one before the track is chosen. This is a title-arm-only
+    /// source, with nothing to corroborate the word list.
+    private func selectionSubject(for candidate: SourceCandidate) -> SelectionSubject {
+        SelectionSubject(
+            artist: candidate.artist,
+            title: candidate.title,
+            durationSeconds: nil,
+            durationSource: nil,
+            sourceURL: candidate.resolvedURL
+        )
+    }
+
+    private func record(_ rows: [SelectionExclusionRecord]) async {
+        guard !rows.isEmpty else { return }
+        do {
+            try await history.recordExclusions(
+                rows.map(HistoryStore.ExclusionInput.init),
+                stationID: config.id
+            )
+        } catch {
+            // Best-effort: the audit log must never take the station down.
+            logger.error("failed to record selection exclusions: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    // MARK: - Test seams
+
+    internal func selectionSubjectForTesting(_ candidate: SourceCandidate) -> SelectionSubject {
+        selectionSubject(for: candidate)
     }
 
     // MARK: - Helpers

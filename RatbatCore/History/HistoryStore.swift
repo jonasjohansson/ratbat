@@ -1045,4 +1045,24 @@ public actor HistoryStore {
             .joined(separator: " ")
     }
 }
+
+extension HistoryStore.ExclusionInput {
+    /// Adapter from the cross-platform ``SelectionExclusionRecord`` the
+    /// four sources emit. The two types are structurally identical; they
+    /// are separate because this one is macOS-only and ``PlaylistSource``,
+    /// which produces these rows, compiles for iOS too.
+    public init(_ record: SelectionExclusionRecord) {
+        self.init(
+            artist: record.artist,
+            title: record.title,
+            durationSeconds: record.durationSeconds,
+            durationSource: record.durationSource,
+            arm: record.arm,
+            matchedText: record.matchedText,
+            sourceKind: record.sourceKind,
+            sourceURL: record.sourceURL,
+            enforced: record.enforced
+        )
+    }
+}
 #endif
