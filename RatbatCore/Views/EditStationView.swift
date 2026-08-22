@@ -6,8 +6,9 @@ import SwiftUI
 /// The counterpart to the three "Add station" sheets, and deliberately the
 /// same controls in the same order — a station you edit should look like
 /// the station you created. It is one view for all three sources rather
-/// than three near-identical ones; the only per-source difference is the
-/// tag palette and, for Bandcamp, the sort dimension.
+/// than three near-identical ones; the only per-source differences are the
+/// tag palette, Bandcamp's sort dimension, and Last.fm's popularity tier
+/// and Comfort ↔ Explore dial.
 ///
 /// ## The restart is stated, not sprung
 ///
@@ -29,10 +30,15 @@ public struct EditStationView: View {
     @State private var name: String
     @State private var query: FacetedQuery
     @State private var sort: BandcampClient.Sort
+    /// Comfort ↔ Explore dial, Last.fm only. Initialised from the config
+    /// so the slider shows where the dial currently sits; carries a
+    /// placeholder default for the other sources, where it never renders.
+    @State private var exploration: Double
     @State private var saving = false
 
     private let palette: [String]
     private let isBandcamp: Bool
+    private let isLastFM: Bool
     private let sourceLabel: String
 
     /// Returns `nil` for a playlist-backed station: a fixed queue has no
@@ -50,20 +56,26 @@ public struct EditStationView: View {
             self._query = State(initialValue: config.query)
             self.palette = StationTagPalette.nts
             self.isBandcamp = false
+            self.isLastFM = false
             self.sourceLabel = "NTS"
             self._sort = State(initialValue: .date)
+            self._exploration = State(initialValue: 0.25)
         case .lastFM(let config):
             self._query = State(initialValue: config.query)
             self.palette = StationTagPalette.lastFM
             self.isBandcamp = false
+            self.isLastFM = true
             self.sourceLabel = "Last.fm"
             self._sort = State(initialValue: .date)
+            self._exploration = State(initialValue: config.exploration)
         case .bandcamp(let config):
             self._query = State(initialValue: config.query)
             self.palette = StationTagPalette.bandcamp
             self.isBandcamp = true
+            self.isLastFM = false
             self.sourceLabel = "Bandcamp"
             self._sort = State(initialValue: config.sort)
+            self._exploration = State(initialValue: 0.25)
         }
         self.station = station
         self.stations = stations
@@ -106,10 +118,33 @@ public struct EditStationView: View {
                         }
                         .pickerStyle(.segmented)
                     }
+                    // Last.fm's extra knobs, mirroring AddLastFMStationView
+                    // so editing can't do less than creating.
+                    if isLastFM {
+                        Picker("Popularity", selection: $query.popularity) {
+                            Text("Hits — top 10%").tag(PopularityTier.hits)
+                            Text("Middle — 10–50%").tag(PopularityTier.middle)
+                            Text("Deep cuts — bottom 50%").tag(PopularityTier.deepCuts)
+                        }
+                        .pickerStyle(.menu)
+                    }
                     Toggle(
                         "Only surprise me — exclude my library",
                         isOn: $query.excludeOwnedLibrary
                     )
+                    if isLastFM {
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack {
+                                Text("Comfort").font(.caption).foregroundStyle(.secondary)
+                                Slider(value: $exploration, in: 0...1)
+                                Text("Explore").font(.caption).foregroundStyle(.secondary)
+                            }
+                            Text("Comfort leans on artists you already love; Explore pushes more unfamiliar picks.")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.top, 2)
+                    }
                 }
                 .padding(.top, 4)
             }
@@ -156,6 +191,9 @@ public struct EditStationView: View {
         var updated = stations.updateQuery(station.id, to: query)
         if isBandcamp {
             updated = stations.updateBandcampSort(station.id, to: sort) ?? updated
+        }
+        if isLastFM {
+            updated = stations.updateExploration(station.id, to: exploration) ?? updated
         }
         guard let updated else {
             saving = false

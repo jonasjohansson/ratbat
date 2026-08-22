@@ -187,6 +187,24 @@ public struct RootView: View {
                         // BEFORE loading the library so any saved stations
                         // are visible in the sidebar as soon as it appears.
                         stations.setStorage(root: folder)
+                        // Keep the slug-keyed preference lists in step with
+                        // the catalogue. Slugs derive from names, and the
+                        // auto-start / last-live lists live in per-machine
+                        // UserDefaults the manager can't see — so a rename
+                        // re-keys auto-start membership and a delete clears
+                        // both lists, instead of silently orphaning entries
+                        // a later same-named station would inherit.
+                        // Re-fires on reload; reassignment is harmless.
+                        stations.slugDidChange = { old, new in
+                            if BroadcastPreferences.shared.isAutoStart(slug: old) {
+                                BroadcastPreferences.shared.setAutoStart(false, slug: old)
+                                BroadcastPreferences.shared.setAutoStart(true, slug: new)
+                            }
+                        }
+                        stations.slugWasDeleted = { slug in
+                            BroadcastPreferences.shared.setAutoStart(false, slug: slug)
+                            BroadcastPreferences.shared.forgetLive(slug: slug)
+                        }
                         // The broadcaster names history rows and live
                         // stations from this catalogue — without it a row
                         // for an idle station comes back nameless.

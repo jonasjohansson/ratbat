@@ -3,7 +3,11 @@ import XCTest
 
 /// Covers the multi-station ``StationManager`` API added in Task 3.5:
 /// list mutation (create/rename/delete), slug-collision handling, and
-/// persistence round-tripping through ``StationStore``.
+/// persistence round-tripping through ``StationStore``. The web-control
+/// pass added the slug lifecycle closures (``StationManager/slugDidChange``,
+/// ``StationManager/slugWasDeleted``) and the interim
+/// ``StationManager/updateExploration(_:to:)`` setter — covered at the
+/// bottom of this file.
 @MainActor
 final class StationManagerTests: XCTestCase {
     private var tempRoot: URL!
@@ -142,5 +146,102 @@ final class StationManagerTests: XCTestCase {
 
         manager.setStorage(root: tempRoot)
         XCTAssertEqual(manager.stations.count, 0)
+    }
+
+    // MARK: - Slug lifecycle closures
+
+    func testRenameFiresSlugDidChangeWithOldAndNewSlugs() {
+        let manager = StationManager()
+        let station = manager.create(from: makePlaylist(name: "Jazz"))
+        var observed: (old: String, new: String)?
+        manager.slugDidChange = { observed = (old: $0, new: $1) }
+
+        manager.rename(station.id, to: "Midnight Mood")
+        XCTAssertEqual(observed?.old, "radio-based-on-jazz")
+        XCTAssertEqual(observed?.new, "midnight-mood")
+    }
+
+    func testRenameWithUnchangedSlugDoesNotFireSlugDidChange() {
+        let manager = StationManager()
+        let station = manager.create(from: makePlaylist(name: "Jazz"))
+        manager.rename(station.id, to: "Jazz Radio")
+
+        var fired = false
+        manager.slugDidChange = { _, _ in fired = true }
+        // "Jazz Radio!" is a different name but derives the same slug —
+        // slug-keyed membership is still valid, so no re-key signal.
+        manager.rename(station.id, to: "Jazz Radio!")
+
+        XCTAssertEqual(manager.stations[0].name, "Jazz Radio!")
+        XCTAssertFalse(fired)
+    }
+
+    func testDeleteFiresSlugWasDeleted() {
+        let manager = StationManager()
+        let station = manager.create(from: makePlaylist(name: "Jazz"))
+
+        // Simulate the RootView wiring contract: the closure clears the
+        // deleted slug from slug-keyed membership (auto-start / last-live
+        // in production; a plain set here).
+        var membership: Set<String> = [station.slug]
+        manager.slugWasDeleted = { membership.remove($0) }
+
+        manager.delete(station.id)
+        XCTAssertTrue(membership.isEmpty)
+    }
+
+    func testDeleteUnknownIdDoesNotFireSlugWasDeleted() {
+        let manager = StationManager()
+        _ = manager.create(from: makePlaylist(name: "Jazz"))
+
+        var fired = false
+        manager.slugWasDeleted = { _ in fired = true }
+        manager.delete(UUID())
+        XCTAssertFalse(fired)
+    }
+
+    // MARK: - Exploration
+
+    func testUpdateExplorationClampsAndPreservesIdentity() {
+        let manager = StationManager()
+        let station = manager.createLastFM(LastFMStationConfig(
+            name: "Deep Cuts",
+            query: FacetedQuery(genreTags: ["jazz"]),
+            exploration: 0.5
+        ))
+        guard case .lastFM(let originalConfig) = station.kind else {
+            return XCTFail("expected a Last.fm station")
+        }
+
+        let raised = manager.updateExploration(station.id, to: 1.7)
+        XCTAssertEqual(raised?.id, station.id)
+        guard case .lastFM(let raisedConfig) = raised?.kind else {
+            return XCTFail("expected the station to stay Last.fm-backed")
+        }
+        XCTAssertEqual(raisedConfig.exploration, 1.0)
+        // Config id keys HistoryStore dedup/affinity — must survive edits.
+        XCTAssertEqual(raisedConfig.id, originalConfig.id)
+
+        let lowered = manager.updateExploration(station.id, to: -3)
+        guard case .lastFM(let loweredConfig) = lowered?.kind else {
+            return XCTFail("expected the station to stay Last.fm-backed")
+        }
+        XCTAssertEqual(loweredConfig.exploration, 0.0)
+    }
+
+    func testUpdateExplorationNoOpsOnNonLastFMKinds() {
+        let manager = StationManager()
+        let playlistStation = manager.create(from: makePlaylist(name: "Fixed"))
+        let ntsStation = manager.createNTS(NTSStationConfig(
+            name: "Ambient",
+            query: FacetedQuery(genreTags: ["ambient"])
+        ))
+
+        XCTAssertNil(manager.updateExploration(playlistStation.id, to: 0.5))
+        XCTAssertNil(manager.updateExploration(ntsStation.id, to: 0.5))
+        XCTAssertNil(manager.updateExploration(UUID(), to: 0.5))
+        // The catalogue is untouched — answering nil is a true no-op.
+        XCTAssertEqual(manager.stations[0].kind, playlistStation.kind)
+        XCTAssertEqual(manager.stations[1].kind, ntsStation.kind)
     }
 }

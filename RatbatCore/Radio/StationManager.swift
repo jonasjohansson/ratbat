@@ -33,6 +33,23 @@ public final class StationManager: ObservableObject {
     /// update the in-memory list but disk I/O is skipped.
     private var storageRoot: URL?
 
+    /// Fired whenever a mutation changes a station's computed ``Station/slug``
+    /// (old slug first, new slug second). Slugs key state that lives *outside*
+    /// the catalogue — notably ``BroadcastPreferences``'s auto-start list —
+    /// and that state has no other way to learn a slug moved: preferences
+    /// are per-machine `UserDefaults` while stations sync across machines
+    /// via the shared drive, so nothing else observes both stores. Wired
+    /// once in `RootView`; a closure rather than Combine because there is
+    /// exactly one interested party and no UI to drive.
+    public var slugDidChange: ((_ old: String, _ new: String) -> Void)?
+
+    /// Fired when ``delete(_:)`` removes a station, with the slug it held.
+    /// The delete counterpart to ``slugDidChange``: without it, deleting a
+    /// station orphans its slug in the auto-start / last-live lists, and a
+    /// later station created with the same name silently inherits both
+    /// (review G3). Same wiring site and rationale as ``slugDidChange``.
+    public var slugWasDeleted: ((_ slug: String) -> Void)?
+
     public init() {}
 
     // MARK: - Storage
@@ -81,14 +98,23 @@ public final class StationManager: ObservableObject {
     /// name is empty after trimming. If the new name would collide on slug
     /// with another station, bumps it with a `(2)`-style suffix just like
     /// ``create(from:)``.
+    ///
+    /// Fires ``slugDidChange`` when the rename moves the computed slug —
+    /// and only then: a rename that keeps the slug (punctuation-only edits
+    /// collapse in the derivation) leaves slug-keyed state valid as-is.
     public func rename(_ id: Station.ID, to newName: String) {
         guard let index = stations.firstIndex(where: { $0.id == id }) else { return }
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         let unique = uniquifyName(trimmed, ignoring: id)
         guard stations[index].name != unique else { return }
+        let oldSlug = stations[index].slug
         stations[index].name = unique
         persist()
+        let newSlug = stations[index].slug
+        if oldSlug != newSlug {
+            slugDidChange?(oldSlug, newSlug)
+        }
     }
 
     /// Replace a generative station's faceted query, in place.
@@ -153,11 +179,41 @@ public final class StationManager: ObservableObject {
     }
     #endif
 
-    /// Remove a station. No-op if the id isn't found.
+    /// Change a Last.fm station's Comfort ↔ Explore dial in place.
+    ///
+    /// Lives outside ``updateQuery(_:to:)`` for the same reason
+    /// ``updateBandcampSort(_:to:)`` does: exploration isn't part of the
+    /// shared ``FacetedQuery`` — it's the one knob only Last.fm has. An
+    /// interim seam until the general `applyUpdate` lands with the web
+    /// CRUD API; the edit sheet needs *some* setter so editing can't do
+    /// less than creating.
+    ///
+    /// The value is clamped to `[0, 1]` via
+    /// ``LastFMStationConfig/clampExploration(_:)`` — the config's `var`
+    /// bypasses its init, so the clamp must be applied here. Station and
+    /// config ids are preserved (the config id keys ``HistoryStore``
+    /// dedup and taste affinity, same invariant as ``updateQuery(_:to:)``).
+    ///
+    /// Returns `nil` for an unknown id or a non-Last.fm station.
+    @discardableResult
+    public func updateExploration(_ id: Station.ID, to exploration: Double) -> Station? {
+        guard let index = stations.firstIndex(where: { $0.id == id }),
+              case .lastFM(var config) = stations[index].kind else { return nil }
+        config.exploration = LastFMStationConfig.clampExploration(exploration)
+        stations[index].kind = .lastFM(config: config)
+        persist()
+        return stations[index]
+    }
+
+    /// Remove a station. No-op if the id isn't found. Fires
+    /// ``slugWasDeleted`` with the removed station's slug so slug-keyed
+    /// state elsewhere (auto-start, last-live) can forget it.
     public func delete(_ id: Station.ID) {
         guard let index = stations.firstIndex(where: { $0.id == id }) else { return }
+        let slug = stations[index].slug
         stations.remove(at: index)
         persist()
+        slugWasDeleted?(slug)
     }
 
     /// Create a new NTS-backed station from a config and persist immediately.
