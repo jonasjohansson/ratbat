@@ -46,6 +46,7 @@ public struct RootView: View {
     @State private var showingAddNTSStation: Bool = false
     @State private var showingAddLastFMStation: Bool = false
     @State private var showingAddBandcampStation: Bool = false
+    @State private var showingAddLibraryRadioStation: Bool = false
     /// Station whose facets the user is editing, if any. Holds the id
     /// rather than the value so the sheet always renders the CURRENT
     /// station — a rename or edit that lands while the sheet is open
@@ -171,6 +172,9 @@ public struct RootView: View {
                     .sheet(isPresented: $showingAddBandcampStation) {
                         AddBandcampStationView(stations: stations)
                     }
+                    .sheet(isPresented: $showingAddLibraryRadioStation) {
+                        AddLibraryRadioStationView(stations: stations)
+                    }
                     // Editing a generative station's tags. `item:` rather
                     // than `isPresented:` so the sheet can't be raised
                     // without a station to edit. The body is a separate
@@ -230,6 +234,23 @@ public struct RootView: View {
                         // lifecycle closures above keep consistent.
                         radio.setAutoStart = { enabled, slug in
                             BroadcastPreferences.shared.setAutoStart(enabled, slug: slug)
+                        }
+                        // Library Radio's pool: a live read of the
+                        // indexed library, deduped by URL because the
+                        // playlist tree is hierarchical — "All Songs"
+                        // already unions every folder, so a flatMap
+                        // repeats each track once per ancestor folder.
+                        // Wired before the library load on purpose: the
+                        // closure reads the view model at call time, so
+                        // it simply answers [] until the scan lands.
+                        radio.libraryTracks = {
+                            var seen = Set<URL>()
+                            var unique: [Track] = []
+                            for track in libraryVM.playlists.flatMap({ $0.tracks })
+                            where seen.insert(track.url).inserted {
+                                unique.append(track)
+                            }
+                            return unique
                         }
                         // The broadcaster names history rows and live
                         // stations from this catalogue — without it a row
@@ -386,6 +407,9 @@ public struct RootView: View {
             }
             Button("New Bandcamp Station…") {
                 showingAddBandcampStation = true
+            }
+            Button("New Library Radio…") {
+                showingAddLibraryRadioStation = true
             }
         } label: {
             Image(systemName: "plus.circle.dashed")
@@ -559,6 +583,22 @@ public struct RootView: View {
                 },
                 onEdit: { editingStation = EditTarget(id: bandcampStation.0.id) }
             )
+        } else if let libraryRadioStation = resolvedLibraryRadioStation {
+            LibraryRadioStationDetailView(
+                station: libraryRadioStation.0,
+                config: libraryRadioStation.1,
+                radio: radio,
+                onBroadcastToggle: {
+                    Task {
+                        if radio.isBroadcasting(stationID: libraryRadioStation.0.id) {
+                            radio.stopBroadcast(stationID: libraryRadioStation.0.id)
+                        } else {
+                            await radio.startBroadcast(station: libraryRadioStation.0)
+                        }
+                    }
+                },
+                onEdit: { editingStation = EditTarget(id: libraryRadioStation.0.id) }
+            )
         } else if let playlist = resolvedDetailPlaylist {
             LibraryView(playlist: playlist) { tracks, startIndex in
                 // Queue the whole playlist and start from the picked
@@ -618,6 +658,17 @@ public struct RootView: View {
         guard case let .some(.station(id)) = sidebarSelection,
               let station = stations.stations.first(where: { $0.id == id }),
               let config = station.bandcampConfig
+        else { return nil }
+        return (station, config)
+    }
+
+    /// When the sidebar selection resolves to a Library Radio station,
+    /// return it + its config. Mirrors the other resolved-station
+    /// helpers — same shape, different config type.
+    private var resolvedLibraryRadioStation: (Station, LibraryRadioStationConfig)? {
+        guard case let .some(.station(id)) = sidebarSelection,
+              let station = stations.stations.first(where: { $0.id == id }),
+              let config = station.libraryRadioConfig
         else { return nil }
         return (station, config)
     }

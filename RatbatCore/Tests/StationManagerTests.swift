@@ -276,6 +276,8 @@ final class StationManagerTests: XCTestCase {
         XCTAssertNotEqual(first.slug, second.slug)
     }
 
+    /// Every GENERATIVE kind — Library Radio is exempt by design (empty
+    /// tags = whole library) and covered in its own matrix below.
     func testCreateStationThrowsOnEmptyTagsForEveryKind() {
         let manager = StationManager()
         let empty = FacetedQuery(genreTags: [])
@@ -361,6 +363,7 @@ final class StationManagerTests: XCTestCase {
                 case .nts(let c): return c.id
                 case .lastFM(let c): return c.id
                 case .bandcamp(let c): return c.id
+                case .libraryRadio(let c): return c.id
                 }
             }()
             XCTAssertEqual(configID, original.id, "config id keys history — it must not move")
@@ -478,5 +481,97 @@ final class StationManagerTests: XCTestCase {
         XCTAssertEqual(second.stations[0].id, station.id)
         XCTAssertEqual(second.stations[0].name, "After")
         XCTAssertEqual(second.stations[0].ntsConfig?.query, newQuery)
+    }
+
+    // MARK: - Library Radio (S4)
+
+    /// Library Radio is the deliberate exception to the one-tag rule: an
+    /// empty filter means "the whole library". The name falls back to
+    /// "Library Radio" rather than suggestedName's generic "New Station",
+    /// and a stored `excludeOwnedLibrary: true` — a station configured to
+    /// play nothing, since every candidate is owned — is normalized to
+    /// false at the write surface.
+    func testCreateLibraryRadioAllowsEmptyTagsAndNormalizesTheQuery() throws {
+        let manager = StationManager()
+        let station = try manager.createStation(
+            .libraryRadio(
+                query: FacetedQuery(genreTags: [], excludeOwnedLibrary: true),
+                shufflePool: true
+            ),
+            name: nil
+        )
+        XCTAssertEqual(station.name, "Library Radio")
+        guard case .libraryRadio(let config) = station.kind else {
+            return XCTFail("expected a Library Radio station")
+        }
+        XCTAssertEqual(config.id, station.id, "config id doubles as station id (history invariant)")
+        XCTAssertTrue(config.query.genreTags.isEmpty)
+        XCTAssertFalse(config.query.excludeOwnedLibrary, "the meaningless flag is normalized off")
+
+        // Tagged creates keep the suggested-name behavior of the siblings.
+        let tagged = try manager.createStation(
+            .libraryRadio(query: FacetedQuery(genreTags: ["ambient"]), shufflePool: false),
+            name: nil
+        )
+        XCTAssertEqual(tagged.name, FacetedQuery(genreTags: ["ambient"]).suggestedName)
+        XCTAssertEqual(tagged.libraryRadioConfig?.shufflePool, false)
+    }
+
+    /// The applyUpdate matrix for the new kind, per the wire contract:
+    /// `name` / `query` (empty tags allowed) / `shufflePool` apply;
+    /// `exploration` and `sort` are `wrongKind`; identity is preserved
+    /// and the normalization rides every query write.
+    func testApplyUpdateLibraryRadioMatrix() throws {
+        let manager = StationManager()
+        let station = try manager.createStation(
+            .libraryRadio(query: FacetedQuery(genreTags: ["techno"]), shufflePool: true),
+            name: "Mine"
+        )
+
+        // The whole-library edit: clearing every tag is a VALID update
+        // here (the emptyGenreTags carve-out), and the flag normalizes.
+        let cleared = try manager.applyUpdate(station.id, StationUpdate(
+            name: "Everything",
+            query: FacetedQuery(genreTags: [], excludeOwnedLibrary: true),
+            shufflePool: false
+        ))
+        XCTAssertEqual(cleared.id, station.id)
+        guard case .libraryRadio(let config) = cleared.kind else {
+            return XCTFail("kind must not change")
+        }
+        XCTAssertEqual(cleared.name, "Everything")
+        XCTAssertTrue(config.query.genreTags.isEmpty)
+        XCTAssertFalse(config.query.excludeOwnedLibrary)
+        XCTAssertFalse(config.shufflePool)
+
+        // The knobs this kind does not have answer wrongKind, exactly as
+        // the wire contract promises (exploration/sort → 409 upstream).
+        XCTAssertThrowsError(try manager.applyUpdate(
+            station.id, StationUpdate(exploration: 0.5)
+        )) { error in
+            XCTAssertEqual(error as? StationManager.StationEditError, .wrongKind)
+        }
+        XCTAssertThrowsError(try manager.applyUpdate(
+            station.id, StationUpdate(sort: .pop)
+        )) { error in
+            XCTAssertEqual(error as? StationManager.StationEditError, .wrongKind)
+        }
+    }
+
+    /// The new kind persists and reloads like every sibling — under
+    /// store version 1, which must not move (risk R2).
+    func testLibraryRadioPersistsThroughTheManager() throws {
+        let first = StationManager()
+        first.setStorage(root: tempRoot)
+        let station = try first.createStation(
+            .libraryRadio(query: FacetedQuery(genreTags: ["dub"]), shufflePool: true),
+            name: "Reloaded"
+        )
+
+        let second = StationManager()
+        second.setStorage(root: tempRoot)
+        XCTAssertEqual(second.stations.count, 1)
+        XCTAssertEqual(second.stations[0].id, station.id)
+        XCTAssertEqual(second.stations[0].libraryRadioConfig?.query.genreTags, ["dub"])
     }
 }

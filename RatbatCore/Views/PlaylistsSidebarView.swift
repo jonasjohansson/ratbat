@@ -335,6 +335,9 @@ public struct PlaylistsSidebarView: View {
             // distinct from the waveform (NTS) and chart (Last.fm)
             // glyphs next to it in the sidebar.
             return isLive ? "opticaldisc.fill" : "opticaldisc"
+        case .libraryRadio:
+            // A house with a note: radio made of what already lives here.
+            return isLive ? "music.house.fill" : "music.house"
         }
     }
 }

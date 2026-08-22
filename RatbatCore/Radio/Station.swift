@@ -2,7 +2,7 @@ import Foundation
 
 /// A radio station the broadcaster can serve.
 ///
-/// Four concrete kinds ship today:
+/// Five concrete kinds ship today:
 /// - ``Kind/playlist(queue:)`` — a fixed queue derived from a user's
 ///   library ``Playlist``, reshuffled by ``PlaylistSource`` on each start.
 /// - ``Kind/nts(config:)`` — a generative, NTS-backed station driven by
@@ -12,6 +12,9 @@ import Foundation
 /// - ``Kind/bandcamp(config:)`` — a generative, Bandcamp-backed station
 ///   driven by a ``BandcampStationConfig`` (macOS-only; the scraping
 ///   client that powers it is Foundation-heavy and guarded out on iOS).
+/// - ``Kind/libraryRadio(config:)`` — a self-seeding station over the
+///   owner's own indexed library, driven by a
+///   ``LibraryRadioStationConfig`` (taste-scored, owned tracks only).
 ///
 /// The `Kind` enum is the source-of-truth for where tracks come from;
 /// the old `seed: Seed` marker field has been retired. Convenience
@@ -54,6 +57,15 @@ public struct Station: Identifiable, Hashable, Sendable, Codable {
         /// persisted seed, controller + pool rebuild per broadcast start.
         case bandcamp(config: BandcampStationConfig)
         #endif
+        /// Self-seeding station over the owner's own indexed library
+        /// (signal-model design §4): the taste profile scores the pool,
+        /// the facets filter it, and only owned files ever play. NOT
+        /// platform-gated, deliberately — gating `.bandcamp` is what
+        /// makes iOS builds drop macOS-authored entries from the shared
+        /// stations file, and this kind's config is plain Foundation, so
+        /// there is no reason to re-create that problem. (Broadcasting it
+        /// is still macOS-only; iOS merely keeps the entry decodable.)
+        case libraryRadio(config: LibraryRadioStationConfig)
     }
 
     public init(id: UUID = UUID(), name: String, kind: Kind) {
@@ -94,6 +106,13 @@ public struct Station: Identifiable, Hashable, Sendable, Codable {
     }
     #endif
 
+    /// Library Radio config, or `nil` for other kinds. Cross-platform,
+    /// like the case it mirrors.
+    public var libraryRadioConfig: LibraryRadioStationConfig? {
+        if case let .libraryRadio(c) = kind { return c }
+        return nil
+    }
+
     // MARK: - Factories
 
     /// Build a station seeded from a playlist. Auto-names as
@@ -129,6 +148,14 @@ public struct Station: Identifiable, Hashable, Sendable, Codable {
         Station(id: config.id, name: config.name, kind: .bandcamp(config: config))
     }
     #endif
+
+    /// Build a station from a ``LibraryRadioStationConfig``. Reuses the
+    /// config's `id` as the station id — the invariant every kind keeps
+    /// so ``HistoryStore`` dedup, skips, saves and taste affinity stay
+    /// attached across restarts and edits.
+    public static func fromLibraryRadio(_ config: LibraryRadioStationConfig) -> Station {
+        Station(id: config.id, name: config.name, kind: .libraryRadio(config: config))
+    }
 
     // MARK: - Slug
 

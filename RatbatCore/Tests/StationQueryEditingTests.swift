@@ -189,6 +189,7 @@ final class StationQueryEditingTests: XCTestCase {
         case .nts(let c): return c.query
         case .lastFM(let c): return c.query
         case .bandcamp(let c): return c.query
+        case .libraryRadio(let c): return c.query
         }
     }
 
@@ -198,6 +199,7 @@ final class StationQueryEditingTests: XCTestCase {
         case .nts(let c): return c.id
         case .lastFM(let c): return c.id
         case .bandcamp(let c): return c.id
+        case .libraryRadio(let c): return c.id
         }
     }
 

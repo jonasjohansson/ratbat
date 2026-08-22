@@ -100,6 +100,17 @@ final class StationKindTests: XCTestCase {
         XCTAssertEqual(decoded.bandcampConfig?.query.genreTags, ["t"])
     }
 
+    func testStationKind_libraryRadio_roundTrips() throws {
+        let cfg = LibraryRadioStationConfig(
+            name: "Home", query: FacetedQuery(genreTags: ["ambient"]), shufflePool: false
+        )
+        let station = Station.fromLibraryRadio(cfg)
+        XCTAssertEqual(station.id, cfg.id, "config id doubles as station id")
+        let data = try JSONEncoder().encode(station)
+        let decoded = try JSONDecoder().decode(Station.self, from: data)
+        XCTAssertEqual(decoded.libraryRadioConfig, cfg)
+    }
+
     /// A createNTS-authored station survives a save/load round-trip
     /// through ``StationStore`` — the Kind enum's `.nts` case must be
     /// covered by the file format's Codable schema.

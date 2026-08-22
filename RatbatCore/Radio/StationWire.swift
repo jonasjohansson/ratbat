@@ -74,6 +74,10 @@ public enum StationDraft: Sendable {
     #if os(macOS)
     case bandcamp(query: FacetedQuery, sort: BandcampClient.Sort, shufflePool: Bool)
     #endif
+    /// Library Radio: the one draft whose query may carry ZERO genre
+    /// tags — an empty filter means "the whole library", which is the
+    /// kind's reason to exist. Cross-platform like its config.
+    case libraryRadio(query: FacetedQuery, shufflePool: Bool)
 
     /// The shared faceted query every draft carries — validation reads it
     /// without switching on kind.
@@ -84,6 +88,7 @@ public enum StationDraft: Sendable {
         #if os(macOS)
         case .bandcamp(let query, _, _): return query
         #endif
+        case .libraryRadio(let query, _): return query
         }
     }
 }
@@ -104,6 +109,7 @@ extension RadioBroadcaster {
         #if os(macOS)
         case .bandcamp: return "bandcamp"
         #endif
+        case .libraryRadio: return "libraryRadio"
         }
     }
 
@@ -194,6 +200,16 @@ extension RadioBroadcaster {
                 self.shufflePool = config.shufflePool
                 self.trackCount = nil
             #endif
+            case .libraryRadio(let config):
+                // The query is safe to publish for this kind too: it is
+                // the owner's *filter*, never the library it filters —
+                // no `Track` fields, paths or counts leave here.
+                self.kind = "libraryRadio"
+                self.query = FacetedQueryPayload(query: config.query)
+                self.exploration = nil
+                self.sort = nil
+                self.shufflePool = config.shufflePool
+                self.trackCount = nil
             }
         }
 
@@ -365,18 +381,24 @@ extension RadioBroadcaster {
     func performStationCreateAsync(_ req: StationCreateRequest) async -> (Int, Data) {
         if let rejection = await ownerGate(req.token) { return rejection }
         guard let createStation else { return Self.catalogueUnavailable() }
-        // A create with no query has no tags — same 422 the manager's
-        // own validation would produce, answered before kind dispatch so
-        // every kind agrees on it.
-        guard let query = req.query else {
-            return Self.unprocessable("station needs at least one tag")
-        }
+        // A generative create with no query has no tags — same 422 the
+        // manager's own validation would produce, answered inside each
+        // kind's dispatch. Library Radio is exempt: for it, no query (or
+        // an empty one) legitimately means "the whole library", so a
+        // missing body key defaults to the empty filter instead of 422.
+        let query = req.query
         let shufflePool = req.shufflePool ?? true
         let draft: StationDraft
         switch req.kind {
         case "nts":
+            guard let query else {
+                return Self.unprocessable("station needs at least one tag")
+            }
             draft = .nts(query: query, shufflePool: shufflePool)
         case "lastFM":
+            guard let query else {
+                return Self.unprocessable("station needs at least one tag")
+            }
             // The same gate AddLastFMStationView enforces: a Last.fm
             // station without an API key can never broadcast, so refuse
             // at birth rather than at first start.
@@ -391,6 +413,9 @@ extension RadioBroadcaster {
             )
         case "bandcamp":
             #if os(macOS)
+            guard let query else {
+                return Self.unprocessable("station needs at least one tag")
+            }
             guard let sort = BandcampClient.Sort(rawValue: req.sort ?? "date") else {
                 return Self.unprocessable("unknown sort")
             }
@@ -398,9 +423,20 @@ extension RadioBroadcaster {
             #else
             return Self.unprocessable("unknown kind")
             #endif
+        case "libraryRadio":
+            // No tag requirement (empty filter = whole library) and no
+            // API key gate (the pool is the owner's own files). The
+            // manager normalizes `excludeOwnedLibrary` to false — the
+            // wire contract says the flag is meaningless here, and a
+            // stored `true` would be a station configured to play
+            // nothing.
+            draft = .libraryRadio(
+                query: query ?? FacetedQuery(genreTags: []),
+                shufflePool: shufflePool
+            )
         default:
             // Covers "playlist" (desktop-only by design) and kinds this
-            // build predates ("libraryRadio") — the web gates its kind
+            // build genuinely doesn't know — the web gates its kind
             // picker on /vocab's `kinds`, so this is the backstop.
             return Self.unprocessable("unknown kind")
         }
@@ -559,14 +595,23 @@ extension RadioBroadcaster {
         // StationTagPalette is macOS-gated with the views; the broadcaster
         // HTTP layer only runs there in practice. The non-macOS branch
         // returns empty palettes, same posture as buildHistoryPayload.
+        // libraryRadio's palette is deliberately EMPTY, not derived from
+        // the library: this builder is a nonisolated static with no path
+        // to the indexed tracks, and threading the library through a
+        // cacheable public endpoint for a suggestion list isn't worth
+        // the seam. Web forms fall back to free-text tags for this kind
+        // (the desktop sheet does the same).
         let tags = [
             "nts": StationTagPalette.nts,
             "lastFM": StationTagPalette.lastFM,
-            "bandcamp": StationTagPalette.bandcamp
+            "bandcamp": StationTagPalette.bandcamp,
+            "libraryRadio": []
         ]
         let bandcampSort = [BandcampClient.Sort.date, .pop].map(\.rawValue)
         #else
-        let tags: [String: [String]] = ["nts": [], "lastFM": [], "bandcamp": []]
+        let tags: [String: [String]] = [
+            "nts": [], "lastFM": [], "bandcamp": [], "libraryRadio": []
+        ]
         let bandcampSort = ["date", "pop"]
         #endif
         let response = VocabResponse(
@@ -574,7 +619,7 @@ extension RadioBroadcaster {
             tagMatch: [TagMatch.any, .all].map(\.rawValue),
             popularity: [PopularityTier.hits, .middle, .deepCuts].map(\.rawValue),
             bandcampSort: bandcampSort,
-            kinds: ["nts", "lastFM", "bandcamp"],
+            kinds: ["nts", "lastFM", "bandcamp", "libraryRadio"],
             // Sorted for a deterministic wire; two-character filter drops
             // the "001"-style numeric world/subregion codes, mirroring
             // FacetedQueryEditor's list.

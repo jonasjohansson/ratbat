@@ -39,6 +39,7 @@ public struct EditStationView: View {
     private let palette: [String]
     private let isBandcamp: Bool
     private let isLastFM: Bool
+    private let isLibraryRadio: Bool
     private let sourceLabel: String
 
     /// Returns `nil` for a playlist-backed station: a fixed queue has no
@@ -57,6 +58,7 @@ public struct EditStationView: View {
             self.palette = StationTagPalette.nts
             self.isBandcamp = false
             self.isLastFM = false
+            self.isLibraryRadio = false
             self.sourceLabel = "NTS"
             self._sort = State(initialValue: .date)
             self._exploration = State(initialValue: 0.25)
@@ -65,6 +67,7 @@ public struct EditStationView: View {
             self.palette = StationTagPalette.lastFM
             self.isBandcamp = false
             self.isLastFM = true
+            self.isLibraryRadio = false
             self.sourceLabel = "Last.fm"
             self._sort = State(initialValue: .date)
             self._exploration = State(initialValue: config.exploration)
@@ -73,8 +76,21 @@ public struct EditStationView: View {
             self.palette = StationTagPalette.bandcamp
             self.isBandcamp = true
             self.isLastFM = false
+            self.isLibraryRadio = false
             self.sourceLabel = "Bandcamp"
             self._sort = State(initialValue: config.sort)
+            self._exploration = State(initialValue: 0.25)
+        case .libraryRadio(let config):
+            // Empty palette: the curated vocabularies are external
+            // taxonomies; this kind's tags match the files' own genre
+            // fields, entered free-text in the shared editor.
+            self._query = State(initialValue: config.query)
+            self.palette = []
+            self.isBandcamp = false
+            self.isLastFM = false
+            self.isLibraryRadio = true
+            self.sourceLabel = "Library Radio"
+            self._sort = State(initialValue: .date)
             self._exploration = State(initialValue: 0.25)
         }
         self.station = station
@@ -128,10 +144,21 @@ public struct EditStationView: View {
                         }
                         .pickerStyle(.menu)
                     }
-                    Toggle(
-                        "Only surprise me — exclude my library",
-                        isOn: $query.excludeOwnedLibrary
-                    )
+                    if isLibraryRadio {
+                        // No exclude-library toggle: every candidate IS
+                        // the library. And say out loud which facets a
+                        // local file cannot answer, instead of letting
+                        // the shared editor's region section look wired.
+                        Text("Tags and era filter your files' own tags; an era bound excludes files with no year tag. Regions and popularity aren't in file metadata and are ignored for this kind.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Toggle(
+                            "Only surprise me — exclude my library",
+                            isOn: $query.excludeOwnedLibrary
+                        )
+                    }
                     if isLastFM {
                         VStack(alignment: .leading, spacing: 2) {
                             HStack {
@@ -169,7 +196,10 @@ public struct EditStationView: View {
                     .keyboardShortcut(.cancelAction)
                 Button(isLive ? "Save & Restart" : "Save") { save() }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(query.genreTags.isEmpty || saving)
+                    // Library Radio may save with zero tags — that is the
+                    // "whole library" filter, the same carve-out the
+                    // manager's validation makes.
+                    .disabled((query.genreTags.isEmpty && !isLibraryRadio) || saving)
             }
         }
         .padding(20)

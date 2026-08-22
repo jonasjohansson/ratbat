@@ -152,6 +152,9 @@ public final class StationManager: ObservableObject {
             config.query = query
             stations[index].kind = .bandcamp(config: config)
         #endif
+        case .libraryRadio(var config):
+            config.query = Self.normalizedLibraryRadioQuery(query)
+            stations[index].kind = .libraryRadio(config: config)
         }
         persist()
         return stations[index]
@@ -259,6 +262,20 @@ public final class StationManager: ObservableObject {
     }
     #endif
 
+    /// Create a new Library Radio station from a config and persist
+    /// immediately. Same collision-handling as ``createNTS(_:)``.
+    /// Cross-platform because the config is — see the `.libraryRadio`
+    /// case's note on why this kind avoids the `.bandcamp` gate.
+    @discardableResult
+    public func createLibraryRadio(_ config: LibraryRadioStationConfig) -> Station {
+        var cfg = config
+        cfg.name = uniquifyName(cfg.name)
+        let station = Station.fromLibraryRadio(cfg)
+        stations.append(station)
+        persist()
+        return station
+    }
+
     /// Find a station whose ``Station/slug`` matches `slug`. Used by the
     /// HTTP router to map an incoming `/stream/{slug}.aac` request to a
     /// specific station's broadcast pipeline.
@@ -310,7 +327,14 @@ public final class StationManager: ObservableObject {
     /// and "we ignored it" is worse than "it was empty".
     @discardableResult
     public func createStation(_ draft: StationDraft, name: String?) throws -> Station {
-        guard !draft.query.genreTags.isEmpty else {
+        // Library Radio is the one kind allowed to carry zero tags —
+        // "no filter" legitimately means "the whole library" there,
+        // whereas a generative station with no tags has nothing to fetch.
+        let isLibraryRadio: Bool = {
+            if case .libraryRadio = draft { return true }
+            return false
+        }()
+        guard isLibraryRadio || !draft.query.genreTags.isEmpty else {
             throw StationEditError.emptyGenreTags
         }
         let finalName: String
@@ -318,6 +342,10 @@ public final class StationManager: ObservableObject {
             let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { throw StationEditError.emptyName }
             finalName = trimmed
+        } else if isLibraryRadio, draft.query.genreTags.isEmpty {
+            // suggestedName says "New Station" for an empty query; this
+            // kind has a truthful name for that state.
+            finalName = "Library Radio"
         } else {
             finalName = draft.query.suggestedName
         }
@@ -338,7 +366,25 @@ public final class StationManager: ObservableObject {
                 sort: sort, shufflePool: shufflePool
             ))
         #endif
+        case .libraryRadio(let query, let shufflePool):
+            return createLibraryRadio(LibraryRadioStationConfig(
+                name: finalName,
+                query: Self.normalizedLibraryRadioQuery(query),
+                shufflePool: shufflePool
+            ))
         }
+    }
+
+    /// Every candidate on a Library Radio station is owned by
+    /// definition, so a persisted `excludeOwnedLibrary: true` would be a
+    /// station configured to play nothing. The server-side contract says
+    /// the flag is ignored/normalized for this kind — normalized HERE,
+    /// at the single write surface, so the stored config never carries
+    /// the contradiction in the first place.
+    private static func normalizedLibraryRadioQuery(_ query: FacetedQuery) -> FacetedQuery {
+        var normalized = query
+        normalized.excludeOwnedLibrary = false
+        return normalized
     }
 
     /// Apply a sparse edit — every non-nil field of `update` — as one
@@ -371,9 +417,18 @@ public final class StationManager: ObservableObject {
             if case .playlist = stations[index].kind { return true }
             return false
         }()
+        let isLibraryRadio: Bool = {
+            if case .libraryRadio = stations[index].kind { return true }
+            return false
+        }()
         if let query = update.query {
             guard !isPlaylist else { throw StationEditError.kindHasNoQuery }
-            guard !query.genreTags.isEmpty else { throw StationEditError.emptyGenreTags }
+            // Same carve-out as ``createStation(_:name:)``: an empty tag
+            // list is a legal "whole library" filter for Library Radio
+            // and an error everywhere else.
+            guard isLibraryRadio || !query.genreTags.isEmpty else {
+                throw StationEditError.emptyGenreTags
+            }
         }
         if update.shufflePool != nil, isPlaylist {
             throw StationEditError.wrongKind
@@ -425,6 +480,12 @@ public final class StationManager: ObservableObject {
             if let sort = update.sort { config.sort = sort }
             stations[index].kind = .bandcamp(config: config)
         #endif
+        case .libraryRadio(var config):
+            if let query = update.query {
+                config.query = Self.normalizedLibraryRadioQuery(query)
+            }
+            if let shuffle = update.shufflePool { config.shufflePool = shuffle }
+            stations[index].kind = .libraryRadio(config: config)
         }
         persist()
         let newSlug = stations[index].slug

@@ -147,6 +147,103 @@ final class StationStoreTests: XCTestCase {
         XCTAssertEqual(names, ["Alpha", "Beta"])
     }
 
+    /// The S4 forward-compat requirement, proven rather than asserted:
+    /// an OLDER build (which has no `.libraryRadio` case) reading a
+    /// stations file that contains a libraryRadio entry must NOT wipe
+    /// the file. This build *does* know the kind, so the old build is
+    /// simulated the only honest way available in-process: a fixture
+    /// entry whose `kind` key is one this binary cannot decode, with a
+    /// payload shaped exactly like a libraryRadio config. The mechanism
+    /// under test — ``StationStore``'s per-entry fail-open decode — is
+    /// the very one the old binary relies on, so what this test proves
+    /// for `veryFutureKind` holds for `libraryRadio` on origin/main.
+    ///
+    /// Outcome, stated exactly (and mirrored in docs/mac-mini-setup.md):
+    /// - **Read is safe.** The unknown entry is logged + skipped; every
+    ///   sibling loads; the file on disk is untouched by reading.
+    /// - **Write-back is lossy.** `save` encodes the reduced in-memory
+    ///   list, so an old build that *mutates* stations drops the kinds
+    ///   it doesn't know. Preserving undecoded entries would mean
+    ///   carrying raw JSON blobs through `[Station]` — not achievable
+    ///   cheaply — so the loss is the documented single-writer posture
+    ///   (the Mini is authoritative; other machines reflect read-only),
+    ///   and this test pins the actual behavior instead of wishing it
+    ///   away.
+    func testUnknownKindEntrySurvivesReadButIsDroppedByWriteBack() throws {
+        let known = Station(name: "Known Sibling", kind: .playlist(queue: []))
+        let knownJSON = try JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(known)
+        )
+        // Byte-for-byte the shape a future kind writes: synthesized enum
+        // coding nests the config under kind.<caseName>.config — the same
+        // envelope `.libraryRadio` uses on the wire today.
+        let futureEntry: [String: Any] = [
+            "id": UUID().uuidString,
+            "name": "Whole Library",
+            "kind": ["veryFutureKind": ["config": [
+                "id": UUID().uuidString,
+                "name": "Whole Library",
+                "query": [
+                    "genreTags": ["ambient"], "yearMin": NSNull(),
+                    "yearMax": NSNull(), "regions": [],
+                    "tagMatch": "any", "popularity": "middle",
+                    "excludeOwnedLibrary": false, "excludedArtists": []
+                ] as [String: Any],
+                "shufflePool": true
+            ] as [String: Any]]]
+        ]
+        let envelope: [String: Any] = [
+            "version": StationStore.currentVersion,
+            "stations": [knownJSON, futureEntry]
+        ]
+        let url = tempRoot.appendingPathComponent(StationStore.filename)
+        try JSONSerialization.data(withJSONObject: envelope).write(to: url)
+
+        // Read: the sibling survives, the unknown entry is dropped, and
+        // the bytes on disk still hold BOTH entries — loading is not a
+        // write.
+        let loaded = try StationStore.load(from: tempRoot)
+        XCTAssertEqual(loaded.map(\.name), ["Known Sibling"],
+                       "siblings must survive an unknown kind")
+        let onDiskAfterRead = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertTrue(onDiskAfterRead.contains("veryFutureKind"),
+                      "reading must never rewrite the file")
+
+        // Write-back: persisting the reduced list loses the unknown
+        // entry. This is the ACTUAL behavior — asserted, not accidental —
+        // and the reason mac-mini-setup.md tells every non-Mini machine
+        // to stay a reader.
+        try StationStore.save(loaded, to: tempRoot)
+        let onDiskAfterSave = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertFalse(onDiskAfterSave.contains("veryFutureKind"),
+                       "write-back is lossy for unknown kinds (documented single-writer posture)")
+        XCTAssertTrue(onDiskAfterSave.contains("Known Sibling"))
+    }
+
+    /// The libraryRadio wire shape, pinned: this build round-trips a
+    /// `.libraryRadio` station through the store with the kind spelled
+    /// `libraryRadio` and the envelope still at version 1 (bumping it is
+    /// what would make old builds wipe the file — see risk R2).
+    func testLibraryRadioStationRoundTripsUnderVersionOne() throws {
+        let config = LibraryRadioStationConfig(
+            name: "Home Tapes",
+            query: FacetedQuery(genreTags: ["ambient"], yearMin: 1990),
+            shufflePool: false
+        )
+        let station = Station.fromLibraryRadio(config)
+        try StationStore.save([station], to: tempRoot)
+
+        let url = tempRoot.appendingPathComponent(StationStore.filename)
+        let raw = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertTrue(raw.contains("\"libraryRadio\""), "wire kind key is the synthesized case name")
+        XCTAssertTrue(raw.contains("\"version\":1"), "the envelope must stay at v1 — a bump wipes old builds")
+
+        let loaded = try StationStore.load(from: tempRoot)
+        XCTAssertEqual(loaded.count, 1)
+        XCTAssertEqual(loaded[0].id, config.id, "station id reuses the config id (history-dedup invariant)")
+        XCTAssertEqual(loaded[0].libraryRadioConfig, config)
+    }
+
     /// Envelope itself is wrong — no `version` key at all — so we bail
     /// with the dedicated corruptEnvelope error rather than silently
     /// returning an empty list.

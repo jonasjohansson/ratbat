@@ -163,8 +163,58 @@ tail -20 ~/Library/Logs/ratbat-verify.log
 
 ---
 
+## 8. Single writer: the Mini owns the station catalogue
+
+The web player at ratbat.fm is now a control surface, not just a viewer:
+a logged-in owner can create, edit, start, stop, and **delete** stations
+from any browser. Every one of those mutations goes through the Mini's
+HTTP API (`/stations/*` — see `docs/http-api.md`), which means the Ratbat
+process **on the Mini** is the one writing `.ratbat-stations.json`.
+
+That file is Drive-synced, and Drive handles exactly one writer well. So
+the discipline is:
+
+- **The Mini (the broadcasting machine) is the sole station writer.**
+  Create and edit stations via the web control surface or in the app on
+  the Mini itself — both are the same writer.
+- **The MacBook creates and edits nothing.** Its app is read-only for
+  stations: it picks up the Mini's changes on relaunch or via "Reload
+  Library". There is deliberately no file watching — a half-synced Drive
+  file mid-write is worse than a stale sidebar.
+- Why this matters beyond conflict-copies: an **old build that edits**
+  stations persists only the kinds it can decode, silently dropping any
+  station kind it doesn't know from the shared file. Reading is safe
+  (unknown kinds are skipped per entry); writing is lossy. Update all
+  machines before creating stations of a newly added kind — and until a
+  machine is updated, it must not mutate stations at all.
+  This is not hypothetical any more: **Library Radio** (S4) is exactly
+  such a kind. A pre-S4 build opening the shared file will read around a
+  `libraryRadio` entry without harm, but the first station mutation it
+  performs writes the file back without it. Update every machine before
+  creating Library Radio stations (the behavior is pinned by
+  `StationStoreTests.testUnknownKindEntrySurvivesReadButIsDroppedByWriteBack`).
+
+### The passcode's blast radius, and rotating it
+
+The shared owner passcode used to guard ♥/skip/boost. It now also guards
+**delete** — one leaked passcode can empty the sidebar from anywhere on
+the internet. The cheap guards are in place (typed-name confirmation on
+the web, a growing delay on wrong-passcode attempts), but the real
+mitigations are:
+
+- **Rotation**: set a new passcode in Settings → Broadcast on the Mini,
+  or clear the stored default with
+  `defaults delete se.jonasjohansson.ratbat.mac ratbat.broadcast.ownerToken`
+  — the app issues a fresh random token on next read. Either way every browser that knew the old
+  passcode is locked out at once.
+- **Undo**: `.ratbat-stations.json` is Drive-synced, so Drive's version
+  history is the recovery path for a deleted station. Deletion is
+  recoverable socially, not by the app.
+
+---
+
 ## Gotchas
 
 - **Launching Ratbat from `open`/Finder** (vs. from `install.sh`) inherits macOS's minimal GUI `PATH`, so yt-dlp won't find ffmpeg via `$PATH` lookup. The Python wrapper probes `/opt/homebrew/bin`, `/usr/local/bin`, `/opt/local/bin` explicitly to paper over this — as long as `ffmpeg` is in one of those three, you're fine regardless of how Ratbat was launched.
-- **Drive sync races** — if stations on the main Mac and the Mini both try to write `.ratbat-stations.json` at the same time, Drive conflict-copies will pile up. Run station creation on one machine only.
+- **Drive sync races** — if stations on the main Mac and the Mini both try to write `.ratbat-stations.json` at the same time, Drive conflict-copies will pile up. The Mini is the only machine allowed to write stations — see §8 above.
 - **Cloudflared binary path** — Ratbat bundles its own `cloudflared` inside `Ratbat.app/Contents/Resources`. No need to `brew install cloudflared`.

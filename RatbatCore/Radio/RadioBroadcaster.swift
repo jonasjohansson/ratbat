@@ -431,6 +431,14 @@ public final class RadioBroadcaster: ObservableObject {
     /// so the write goes through the seam like every other mutation the
     /// web can cause — the broadcaster stays a reader.
     public var setAutoStart: (@MainActor (Bool, String) -> Void)?
+    /// Read-only view of the indexed library, for Library Radio pools.
+    /// The same injected-closure idiom as the catalogue seam and for the
+    /// same reason: the library lives on `LibraryViewModel`, which the
+    /// broadcaster deliberately never holds. Re-read at every pool
+    /// refill so a rescan reaches a live station without a restart.
+    /// `nil` until RootView wires it — starting a Library Radio station
+    /// before then surfaces an error instead of broadcasting silence.
+    public var libraryTracks: (@MainActor () -> [Track])?
 
     /// Failed-attempt throttle state for ``ownerGate(_:)``. The three
     /// knobs are `var`s rather than constants only so the tests that
@@ -783,6 +791,16 @@ public final class RadioBroadcaster: ObservableObject {
             }
             await startBroadcast(station: station, source: source)
         #endif
+
+        case .libraryRadio(let config):
+            #if os(macOS)
+            guard let source = makeLibraryRadioSource(config: config) else {
+                return
+            }
+            await startBroadcast(station: station, source: source)
+            #else
+            error = "Library Radio stations are macOS-only"
+            #endif
         }
     }
 
@@ -1075,6 +1093,61 @@ public final class RadioBroadcaster: ObservableObject {
             selectionPolicy: selectionPolicyProvider()
         )
         return BandcampSource(controller: controller)
+    }
+
+    /// Resolve a ``LibraryRadioStationController`` + ``LibraryRadioSource``.
+    /// Synchronous and dependency-light on purpose — the pool is the
+    /// owner's own indexed library, so unlike the other generative kinds
+    /// there is no venv to bootstrap, no API key to check and no resolver
+    /// to construct. The only hard requirement is the library seam;
+    /// history and taste profile degrade gracefully exactly as they do
+    /// for the sibling factories (empty profile → near-random ranking,
+    /// no history → no play recording, no behavioral scoring).
+    private func makeLibraryRadioSource(config: LibraryRadioStationConfig) -> LibraryRadioSource? {
+        guard let libraryTracks else {
+            let msg = "Library Radio station requires the library seam — no music folder loaded yet"
+            error = msg
+            logger.error("\(msg, privacy: .public)")
+            return nil
+        }
+
+        let profile = tasteProfile ?? TasteProfile()
+        let stationID = config.id
+
+        // The same two closure recorders the playlist branch builds, and
+        // for the same reason: the store is macOS-only, the actors are
+        // not, and `.map`-returning-closure trips the known inference bug.
+        let recorder: (@Sendable (String, String, URL) async -> Int64?)?
+        let exclusionRecorder: (@Sendable ([SelectionExclusionRecord]) async -> Void)?
+        if let store = history {
+            recorder = { (artist: String, title: String, url: URL) async -> Int64? in
+                try? await store.record(
+                    station: stationID,
+                    artist: artist,
+                    title: title,
+                    cachedPath: url.path
+                )
+            }
+            exclusionRecorder = { (rows: [SelectionExclusionRecord]) async -> Void in
+                try? await store.recordExclusions(
+                    rows.map(HistoryStore.ExclusionInput.init),
+                    stationID: stationID
+                )
+            }
+        } else {
+            recorder = nil
+            exclusionRecorder = nil
+        }
+
+        let controller = LibraryRadioStationController(
+            config: config,
+            libraryTracks: { await MainActor.run { libraryTracks() } },
+            history: history,
+            tasteProfile: profile,
+            selectionPolicy: selectionPolicyProvider(),
+            recordExclusions: exclusionRecorder
+        )
+        return LibraryRadioSource(controller: controller, recordPlay: recorder)
     }
     #endif
 
@@ -1524,6 +1597,9 @@ public final class RadioBroadcaster: ObservableObject {
         case .nts: origin = .nts
         case .lastFM: origin = .lastFM
         case .bandcamp: origin = .bandcamp
+        // Library Radio plays the owner's own files — the same truth
+        // `.playlist` tells the wire.
+        case .libraryRadio: origin = .library
         }
         Task { [weak self] in
             let rows = (try? await history.recentEntries(

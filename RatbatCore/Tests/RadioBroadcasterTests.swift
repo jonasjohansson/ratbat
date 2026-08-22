@@ -2798,10 +2798,11 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertTrue(stored.contains("Web Made"), "created station reached disk")
     }
 
-    /// The create-time validation gauntlet: unknown kinds (including the
-    /// not-yet-shipped libraryRadio and the desktop-only playlist), empty
-    /// tags, a blank provided name, and a Last.fm create without an API
-    /// key are all 422s with a reason — never opaque 400s.
+    /// The create-time validation gauntlet: unknown kinds (a spelling no
+    /// build knows, and the desktop-only playlist), empty tags, a blank
+    /// provided name, and a Last.fm create without an API key are all
+    /// 422s with a reason — never opaque 400s. libraryRadio left this
+    /// list when S4 shipped it; its create path is covered below.
     @MainActor
     func testStationCreateValidationAnswers422() async throws {
         let prefs = BroadcastPreferences()
@@ -2821,8 +2822,8 @@ final class RadioBroadcasterTests: XCTestCase {
         let token = prefs.ownerToken
         let tags = Self.queryJSON(tags: ["dub"])
         let cases: [(body: String, fragment: String, label: String)] = [
-            ("{\"token\":\"\(token)\",\"kind\":\"libraryRadio\",\"query\":\(tags)}",
-             "unknown kind", "a kind this build predates"),
+            ("{\"token\":\"\(token)\",\"kind\":\"spotify\",\"query\":\(tags)}",
+             "unknown kind", "a kind no build knows"),
             ("{\"token\":\"\(token)\",\"kind\":\"playlist\",\"query\":\(tags)}",
              "unknown kind", "playlist stations are desktop-only"),
             ("{\"token\":\"\(token)\",\"kind\":\"nts\",\"query\":\(Self.queryJSON(tags: []))}",
@@ -3109,6 +3110,78 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertEqual(goneStatus, 410, "unknown station cannot gain a flag")
     }
 
+    /// S4 end to end over the socket: an authed `/stations/create` with
+    /// `kind: libraryRadio` (and NO query — the whole-library default)
+    /// answers 201 with the new kind's payload shape, `/stations/start`
+    /// brings it on air through the catalogue seam, and `/now.json`
+    /// reports `origin: "library"` — the proof the tracks on the wire
+    /// are the owner's own files, not resolver downloads.
+    @MainActor
+    func testLibraryRadioCreateStartsAndPlaysOwnedTracksOverTheSocket() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let prefs = BroadcastPreferences()
+        prefs.resetToDefaults()
+        prefs.ownerToken = "station-crud-passcode"
+        prefs.port = 18_114
+        defer { prefs.port = 18_000 }
+        let radio = RadioBroadcaster(preferences: prefs)
+        defer { radio.stopAll() }
+        let manager = StationManager()
+        installCatalogue(on: radio, manager: manager, preferences: prefs)
+        // The library seam RootView normally wires: the fixture library
+        // plays the role of the indexed music folder.
+        radio.libraryTracks = { tracks }
+
+        // Bring the shared listener up so the control plane answers.
+        let filler = Station(name: "Library Filler", kind: .playlist(queue: []))
+        await radio.startBroadcast(station: filler, source: NeverSource())
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        let created = try await Self.fetchRawResponse(
+            port: 18_114,
+            path: "/stations/create",
+            requestHeaders: ["Content-Type: application/json"],
+            maxBytes: 4_096,
+            method: "POST",
+            body: "{\"token\":\"\(prefs.ownerToken)\",\"kind\":\"libraryRadio\"}"
+        )
+        XCTAssertTrue(created.contains("HTTP/1.1 201 Created"), "Expected 201: \(created)")
+        XCTAssertTrue(created.contains("\"kind\":\"libraryRadio\""), "payload names its kind: \(created)")
+        XCTAssertTrue(created.contains("\"name\":\"Library Radio\""),
+                      "empty-filter create gets the truthful default name: \(created)")
+        XCTAssertTrue(created.contains("\"exploration\":null"),
+                      "no exploration dial on this kind — explicit null, same key set as every kind: \(created)")
+
+        let station = try XCTUnwrap(
+            manager.stations.first(where: { $0.libraryRadioConfig != nil }),
+            "the create landed in the real catalogue"
+        )
+        XCTAssertEqual(station.libraryRadioConfig?.query.genreTags, [],
+                       "missing query defaults to the whole-library filter")
+
+        let started = try await Self.fetchRawResponse(
+            port: 18_114,
+            path: "/stations/start",
+            requestHeaders: ["Content-Type: application/json"],
+            maxBytes: 1_024,
+            method: "POST",
+            body: "{\"token\":\"\(prefs.ownerToken)\",\"station\":\"\(station.id.uuidString)\"}"
+        )
+        XCTAssertTrue(started.contains("\"status\":\"started\""), "Expected started: \(started)")
+        XCTAssertTrue(radio.isBroadcasting(stationID: station.id))
+
+        // Give the encoder time to open the first owned file.
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+
+        let (nowData, _) = try await Self.fetchPayload(port: 18_114, path: "/now.json")
+        let now = String(data: nowData, encoding: .utf8)!
+        XCTAssertTrue(now.contains("\"origin\":\"library\""),
+                      "library radio publishes the owner's-own-file truth: \(now)")
+        XCTAssertTrue(now.contains(station.slug), "the new station is on the public wire: \(now)")
+    }
+
     // MARK: - /vocab
 
     /// `GET /vocab` is public and cacheable — compiled-in vocabulary,
@@ -3136,7 +3209,9 @@ final class RadioBroadcasterTests: XCTestCase {
     /// The vocab payload's shape, pinned: `tags` keyed by wire kind with
     /// the palettes verbatim, enum spellings from the enums themselves,
     /// bare ISO alpha-2 region codes (the client localizes names), and a
-    /// `kinds` list that deliberately excludes libraryRadio until it ships.
+    /// `kinds` list that — now that S4 shipped — includes libraryRadio,
+    /// which is exactly how the web client's kind picker learns this
+    /// build can create one.
     func testVocabPayloadMatchesTheSwiftVocabulary() throws {
         let payload = RadioBroadcaster.buildVocabPayload()
         let root = try XCTUnwrap(
@@ -3150,10 +3225,14 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertEqual(tags["nts"], StationTagPalette.nts)
         XCTAssertEqual(tags["lastFM"], StationTagPalette.lastFM)
         XCTAssertEqual(tags["bandcamp"], StationTagPalette.bandcamp)
+        // Empty, not library-derived: the vocab builder is a nonisolated
+        // static with no path to the indexed tracks (see its comment).
+        // The key still exists so web forms can key off it uniformly.
+        XCTAssertEqual(tags["libraryRadio"], [])
         XCTAssertEqual(root["tagMatch"] as? [String], ["any", "all"])
         XCTAssertEqual(root["popularity"] as? [String], ["hits", "middle", "deepCuts"])
         XCTAssertEqual(root["bandcampSort"] as? [String], ["date", "pop"])
-        XCTAssertEqual(root["kinds"] as? [String], ["nts", "lastFM", "bandcamp"])
+        XCTAssertEqual(root["kinds"] as? [String], ["nts", "lastFM", "bandcamp", "libraryRadio"])
         let regions = try XCTUnwrap(root["regions"] as? [String])
         XCTAssertTrue(regions.contains("JP"))
         XCTAssertTrue(regions.allSatisfy { $0.count == 2 }, "bare alpha-2 codes only")
