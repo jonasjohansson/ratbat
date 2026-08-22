@@ -2404,6 +2404,10 @@ final class RadioBroadcasterTests: XCTestCase {
         let health = try JSONDecoder().decode(Health.self, from: data)
         XCTAssertEqual(health.status, "ok")
         XCTAssertTrue(health.capabilities.contains("health"), "got: \(health.capabilities)")
+        XCTAssertTrue(
+            health.capabilities.contains("trackinfo"),
+            "the /trackinfo capability gates the web's about-this-track card: \(health.capabilities)"
+        )
         XCTAssertGreaterThanOrEqual(health.uptimeSeconds, 0)
         XCTAssertEqual(health.broadcastingCount, 1)
 
@@ -2443,6 +2447,144 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertEqual(health.status, "degraded")
         XCTAssertTrue(health.capabilities.contains("health"))
         XCTAssertTrue(health.stations.isEmpty, "no store means no station history to report")
+    }
+
+    // MARK: - /trackinfo
+
+    /// Canned MusicBrainz lookup for the /trackinfo tests — proves the
+    /// MB half of the payload fills even when Last.fm is keyless,
+    /// without the suite ever touching musicbrainz.org.
+    private actor CannedMusicBrainz: MusicBrainzLookup {
+        func firstReleaseYear(artist: String, title: String) async -> Int? { 1998 }
+        func countryCode(forArtist artist: String) async -> String? { "SE" }
+    }
+
+    /// `/trackinfo` answers only for tracks the station is (or just was)
+    /// broadcasting: a station id the broadcaster doesn't know is a 404,
+    /// and a request with no parseable station id is the shared 400 —
+    /// exercised over the socket so the GET route registration is what's
+    /// under test, not just the handler.
+    @MainActor
+    func testTrackInfoRouteAnswers404ForUnknownStation() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let port: UInt16 = 18_130
+        let radio = RadioBroadcaster(port: port)
+        // Need a live station so the listener is actually up.
+        let filler = Station(name: "Info Filler", kind: .playlist(queue: tracks))
+        await radio.startBroadcast(station: filler)
+        defer { radio.stopAll() }
+
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        // Unknown station: nothing to describe. This is also the idle-
+        // station answer — the broadcaster only knows live stations, so
+        // it can't (and shouldn't) tell a stranger which is which.
+        let unknown = try await Self.fetchRawResponse(
+            port: port,
+            path: "/trackinfo?station=\(UUID().uuidString)",
+            requestHeaders: [],
+            maxBytes: 2_048
+        )
+        XCTAssertTrue(unknown.contains("HTTP/1.1 404"), "Expected 404: \(unknown.prefix(200))")
+
+        // No station parameter at all is malformed, not unknown.
+        let malformed = try await Self.fetchRawResponse(
+            port: port,
+            path: "/trackinfo",
+            requestHeaders: [],
+            maxBytes: 2_048
+        )
+        XCTAssertTrue(malformed.contains("HTTP/1.1 400"), "Expected 400: \(malformed.prefix(200))")
+
+        // And /trackinfoanything must 404 like any unknown path — the
+        // exact-path-plus-query rule /history had to learn the hard way.
+        let greedy = try await Self.fetchRawResponse(
+            port: port,
+            path: "/trackinfoxyz",
+            requestHeaders: [],
+            maxBytes: 2_048
+        )
+        XCTAssertTrue(greedy.contains("HTTP/1.1 404"), "Expected 404: \(greedy.prefix(200))")
+    }
+
+    /// The degrade contract: with no Last.fm key configured, /trackinfo
+    /// still answers 200 with the FULL envelope — Last.fm fields null /
+    /// empty, MusicBrainz fields filled (canned here, so no network) —
+    /// because enrichment failing is not the radio failing. Also pins
+    /// the wire shape: every key present, explicit nulls, both info
+    /// objects present whenever the track carries an artist and title.
+    @MainActor
+    func testTrackInfoKeylessStillAnswersFullEnvelope() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let prefs = BroadcastPreferences()
+        prefs.port = 18_131
+        defer { prefs.port = 18_000 }
+        let savedKey = prefs.lastFMAPIKey
+        prefs.lastFMAPIKey = ""
+        defer { prefs.lastFMAPIKey = savedKey }
+
+        let radio = RadioBroadcaster(preferences: prefs)
+        radio.trackInfoMusicBrainzOverride = CannedMusicBrainz()
+        let station = Station(name: "Info Test", kind: .playlist(queue: tracks))
+        await radio.startBroadcast(station: station)
+        defer { radio.stopAll() }
+
+        // Wait for the encoder to open its first track; poll rather than
+        // one long sleep so a slow CI machine doesn't flake the 404 path.
+        var status = 0
+        var data = Data()
+        for _ in 0..<10 {
+            try await Task.sleep(nanoseconds: 500_000_000)
+            (status, data) = await radio.performTrackInfoAsync(
+                path: "/trackinfo?station=\(station.id.uuidString)"
+            )
+            if status == 200 { break }
+        }
+        XCTAssertEqual(status, 200, "got \(status): \(String(data: data, encoding: .utf8) ?? "")")
+
+        let obj = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        XCTAssertEqual(
+            Set(obj.keys),
+            ["artist", "title", "album", "origin", "sourceURL", "youtubeURL",
+             "artistInfo", "trackInfo"],
+            "every key present, none extra"
+        )
+        XCTAssertEqual(obj["origin"] as? String, "library")
+        XCTAssertFalse((obj["artist"] as? String ?? "").isEmpty, "fixture tracks carry an artist tag")
+
+        let artistInfo = try XCTUnwrap(
+            obj["artistInfo"] as? [String: Any],
+            "the track has an artist, so the object must be present even keyless"
+        )
+        XCTAssertEqual(
+            Set(artistInfo.keys),
+            ["bio", "listeners", "playcount", "tags", "similar", "country"]
+        )
+        XCTAssertTrue(artistInfo["bio"] is NSNull, "keyless = no Last.fm facts, explicit null")
+        XCTAssertTrue(artistInfo["listeners"] is NSNull)
+        XCTAssertEqual(artistInfo["tags"] as? [String], [])
+        XCTAssertEqual(artistInfo["similar"] as? [String], [])
+        XCTAssertEqual(artistInfo["country"] as? String, "SE", "MusicBrainz still fills its half")
+
+        let trackInfo = try XCTUnwrap(obj["trackInfo"] as? [String: Any])
+        XCTAssertEqual(
+            Set(trackInfo.keys),
+            ["album", "playcount", "listeners", "tags", "wiki", "firstReleaseYear"]
+        )
+        XCTAssertTrue(trackInfo["wiki"] is NSNull)
+        XCTAssertEqual(trackInfo["firstReleaseYear"] as? Int, 1998)
+
+        // A recent-entry id that was never in the ring: gone, not 500.
+        let (entryStatus, _) = await radio.performTrackInfoAsync(
+            path: "/trackinfo?station=\(station.id.uuidString)&entry=\(UUID().uuidString)"
+        )
+        XCTAssertEqual(entryStatus, 404, "an entry that has left the ring has nothing to describe")
     }
 
     func testAACRingBufferOverflowBumpsCursor() async {
@@ -3240,11 +3382,14 @@ final class RadioBroadcasterTests: XCTestCase {
     }
 
     /// The capability anchor grows with the build: this one answers the
-    /// station CRUD routes, /vocab, the policy dials and the two
-    /// transparency surfaces — and /health says so.
+    /// station CRUD routes, /vocab, the policy dials, the two
+    /// transparency surfaces and /trackinfo — and /health says so.
     @MainActor
     func testHealthAdvertisesTheControlPlaneCapabilities() async throws {
-        let expected = ["health", "stations", "vocab", "policy", "taste", "exclusions"]
+        let expected = [
+            "health", "stations", "vocab", "policy", "taste", "exclusions",
+            "trackinfo"
+        ]
         XCTAssertEqual(RadioBroadcaster.healthCapabilities, expected)
         let radio = RadioBroadcaster(port: 18_113)
         defer { radio.stopAll() }

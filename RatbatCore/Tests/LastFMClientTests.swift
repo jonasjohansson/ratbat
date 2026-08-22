@@ -97,6 +97,151 @@ final class LastFMClientTests: XCTestCase {
         XCTAssertEqual(parsed.first?.listeners, 412000)
     }
 
+    // MARK: - artist.getinfo / track.getinfo (/trackinfo enrichment)
+
+    func testParseArtistInfo_extractsFieldsAndStripsBio() async throws {
+        // Trimmed from a real artist.getinfo response: numbers as
+        // strings, HTML in the bio, and the "Read more" boilerplate
+        // Last.fm appends to every `content` blob.
+        let fixture = Data(#"""
+        {
+          "artist": {
+            "name": "Boards of Canada",
+            "stats": {"listeners": "1412000", "playcount": "93100000"},
+            "similar": {"artist": [
+              {"name": "Aphex Twin"}, {"name": "Bibio"}, {"name": ""}
+            ]},
+            "tags": {"tag": [{"name": "IDM"}, {"name": "Electronic"}, {"name": ""}]},
+            "bio": {
+              "summary": "short",
+              "content": "Boards of Canada are a Scottish duo &amp; siblings. <a href=\"https://www.last.fm/music/Boards+of+Canada\">Read more on Last.fm</a>. User-contributed text is available under the Creative Commons By-SA License."
+            }
+          }
+        }
+        """#.utf8)
+        let client = LastFMClient(apiKey: "x")
+        let sourceURL = URL(string: "https://ws.audioscrobbler.com/2.0/")!
+        let parsed = try await client.parseArtistInfo(from: fixture, sourceURL: sourceURL)
+        // Bio is plain text: entity decoded, anchor gone, everything from
+        // "Read more" onward (link text + license sentence) cut.
+        XCTAssertEqual(parsed.bio, "Boards of Canada are a Scottish duo & siblings.")
+        XCTAssertEqual(parsed.listeners, 1_412_000)
+        XCTAssertEqual(parsed.playcount, 93_100_000)
+        // Tags lowercased (the artistTopTags rule), blanks dropped.
+        XCTAssertEqual(parsed.tags, ["idm", "electronic"])
+        // Similar keeps casing — names are display text.
+        XCTAssertEqual(parsed.similar, ["Aphex Twin", "Bibio"])
+    }
+
+    func testParseArtistInfo_emptyEnvelope_answersAllNulls() async throws {
+        // An unknown-but-not-erroring artist: envelope present, nothing
+        // in it. Every field degrades rather than throwing — /trackinfo
+        // renders nulls, not a 500.
+        let fixture = Data(#"{ "artist": {} }"#.utf8)
+        let client = LastFMClient(apiKey: "x")
+        let sourceURL = URL(string: "https://ws.audioscrobbler.com/2.0/")!
+        let parsed = try await client.parseArtistInfo(from: fixture, sourceURL: sourceURL)
+        XCTAssertNil(parsed.bio)
+        XCTAssertNil(parsed.listeners)
+        XCTAssertNil(parsed.playcount)
+        XCTAssertTrue(parsed.tags.isEmpty)
+        XCTAssertTrue(parsed.similar.isEmpty)
+    }
+
+    func testParseArtistInfo_apiError_throws() async {
+        let fixture = Data(#"{ "error": 6, "message": "The artist you supplied could not be found" }"#.utf8)
+        let client = LastFMClient(apiKey: "x")
+        let sourceURL = URL(string: "https://ws.audioscrobbler.com/2.0/")!
+        do {
+            _ = try await client.parseArtistInfo(from: fixture, sourceURL: sourceURL)
+            XCTFail("expected an apiError")
+        } catch LastFMClient.Error.apiError(let code, _) {
+            XCTAssertEqual(code, 6)
+        } catch {
+            XCTFail("wrong error kind: \(error)")
+        }
+    }
+
+    func testParseTrackInfo_extractsFields() async throws {
+        let fixture = Data(#"""
+        {
+          "track": {
+            "name": "Roygbiv",
+            "listeners": "412000",
+            "playcount": "3100000",
+            "album": {"title": "Music Has the Right to Children"},
+            "toptags": {"tag": [{"name": "IDM"}, {"name": "Downtempo"}]},
+            "wiki": {"summary": "A <b>seminal</b> track. <a href=\"https://www.last.fm/music/x\">Read more on Last.fm</a>."}
+          }
+        }
+        """#.utf8)
+        let client = LastFMClient(apiKey: "x")
+        let sourceURL = URL(string: "https://ws.audioscrobbler.com/2.0/")!
+        let parsed = try await client.parseTrackInfo(from: fixture, sourceURL: sourceURL)
+        XCTAssertEqual(parsed.album, "Music Has the Right to Children")
+        XCTAssertEqual(parsed.listeners, 412_000)
+        XCTAssertEqual(parsed.playcount, 3_100_000)
+        XCTAssertEqual(parsed.tags, ["idm", "downtempo"])
+        XCTAssertEqual(parsed.wiki, "A seminal track.")
+    }
+
+    func testPlainBio_capsAtSentenceBoundary() {
+        // 40 sentences of 40 chars = 1600 chars, over the cap. The cut
+        // must land on a sentence end inside the cap, never mid-word.
+        let sentence = "This sentence is forty characters long!"
+        let long = Array(repeating: sentence, count: 40).joined(separator: " ")
+        guard let capped = LastFMClient.plainBio(long) else {
+            XCTFail("a long plain-text bio must survive the cap")
+            return
+        }
+        XCTAssertLessThanOrEqual(capped.count, LastFMClient.bioCharacterCap)
+        XCTAssertTrue(capped.hasSuffix("!"), "cut mid-sentence: …\(capped.suffix(50))")
+        // Nothing-but-markup reduces to nothing, and says so with nil
+        // rather than an empty string the client would render as a blank
+        // card.
+        XCTAssertNil(LastFMClient.plainBio("<p>  </p>"))
+        XCTAssertNil(LastFMClient.plainBio(nil))
+    }
+
+    func testArtistInfoSingleFlight_coalescesConcurrentFetches() async throws {
+        // Two concurrent asks for the same artist (case differs — the
+        // cache key is lowercased) must produce ONE upstream request,
+        // and a later ask is served from the 24h cache: /trackinfo is
+        // polled, and the poll must not multiply into API traffic.
+        StubURLProtocol.reset()
+        StubURLProtocol.set([
+            "/2.0?method=artist.getinfo&artist=Bibio&autocorrect=1&api_key=test&format=json": Data(#"""
+                {"artist":{"stats":{"listeners":"5","playcount":"9"},"bio":{"summary":"Hi there."}}}
+                """#.utf8)
+        ])
+        defer { StubURLProtocol.reset() }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StubURLProtocol.self]
+        let client = LastFMClient(
+            apiKey: "test",
+            session: URLSession(configuration: configuration)
+        )
+
+        async let first = client.artistInfo("Bibio")
+        async let second = client.artistInfo("bibio")
+        let (a, b) = try await (first, second)
+        // The lowercased ask rode the in-flight task — had it fetched on
+        // its own, the stub would have answered its unknown URL with the
+        // empty default and the two results would differ.
+        XCTAssertEqual(a, b)
+        XCTAssertEqual(a.bio, "Hi there.")
+        XCTAssertEqual(
+            StubURLProtocol.requestedKeys().count, 1,
+            "two concurrent asks, one upstream fetch: \(StubURLProtocol.requestedKeys())"
+        )
+
+        _ = try await client.artistInfo("Bibio")
+        XCTAssertEqual(
+            StubURLProtocol.requestedKeys().count, 1,
+            "a repeat ask inside the TTL must be served from cache"
+        )
+    }
+
     func testParseArtistTopTags_apiError_throws() async {
         let fixture = """
         { "error": 6, "message": "No artist found with that name" }

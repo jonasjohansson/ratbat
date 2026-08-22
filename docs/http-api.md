@@ -2,17 +2,18 @@
 
 The broadcaster's complete HTTP surface, as served by `RadioBroadcaster`
 (`RatbatCore/Radio/RadioBroadcaster.swift`, with the station control
-plane in `StationWire.swift` and steering/transparency in
-`SteeringWire.swift`). Those three files are the source of truth; this
-document mirrors them so the web client and the verify scripts have a
-spec to read that isn't Swift.
+plane in `StationWire.swift`, steering/transparency in
+`SteeringWire.swift`, and track enrichment in `TrackInfoWire.swift`).
+Those four files are the source of truth; this document mirrors them so
+the web client and the verify scripts have a spec to read that isn't
+Swift.
 
 - **Origin**: `http://localhost:18000` on the broadcasting machine,
   published as `https://radio.jonasjohansson.se` through a Cloudflare
   tunnel. Everything below is reachable from the public origin.
 - **Verbs**: reads are `GET`; every action is a `POST` with a JSON body
   and a path-verb (`/stations/create`, not `PUT /stations`). There are
-  no query-string parameters except on `/history`.
+  no query-string parameters except on `/history` and `/trackinfo`.
 - **Auth**: a single shared owner passcode, sent as `token` **in the
   JSON body** — never a header, never a cookie, no sessions. Comparison
   is whitespace- and case-insensitive (the passcode is typed by humans
@@ -39,7 +40,7 @@ spec to read that isn't Swift.
 — strings are never renamed or removed within v1:
 
 ```
-health, stations, vocab, policy, taste, exclusions
+health, stations, vocab, policy, taste, exclusions, trackinfo
 ```
 
 Client rules: probe `/health` once per page load; a 404 (pre-capability
@@ -112,6 +113,54 @@ to 1–200, `offset` ≥ 0. Public: it only exposes what was broadcast.
 immediately); `null` means the station was deleted — the row stays
 attributable by `stationID`.
 
+### `GET /trackinfo?station=<uuid>&entry=<entryID>`
+
+Text about what a station is playing — who made it, when it first came
+out, what else they sound like. `station` is required; `entry`
+(optional) names an `entryID` from that station's `recent[]` in
+`/now.json` to describe a just-played track instead. Public, and
+deliberately scoped to the station's current/recent tracks: the
+endpoint never accepts an artist or title, so it cannot be driven as an
+open Last.fm proxy — it only describes music the radio already made
+public by broadcasting it.
+
+`404` when there is no track to describe (unknown or idle station, no
+current track, an entry that has left the recent ring); `400` when an
+id doesn't parse. Enrichment failures are **never** errors: no Last.fm
+key configured, an upstream outage, or an uncatalogued artist all
+answer `200` with nulls in the gaps (`tags`/`similar` degrade to `[]`).
+
+```json
+{
+  "artist": "Boards of Canada", "title": "Roygbiv", "album": null,
+  "origin": "lastfm", "sourceURL": null, "youtubeURL": null,
+  "artistInfo": {
+    "bio": "…",                // plain text: HTML stripped, Last.fm's
+                               // "Read more" tail dropped, capped ~1200
+                               // chars at a sentence boundary
+    "listeners": 1412000, "playcount": 93100000,
+    "tags": ["idm", "electronic"],
+    "similar": ["Aphex Twin", "…"],   // ≤ 5 names
+    "country": "GB"            // ISO 3166 alpha-2, from MusicBrainz
+  },
+  "trackInfo": {
+    "album": "Music Has the Right to Children",
+    "playcount": 3100000, "listeners": 412000,
+    "tags": ["idm"], "wiki": null,
+    "firstReleaseYear": 1998   // MusicBrainz
+  }
+}
+```
+
+`artistInfo` / `trackInfo` are `null` only when the track carries no
+artist (or no title) to ask about — enrichment that merely *failed*
+still answers an object full of nulls. `bio`/`tags`/`similar` and the
+stats come from Last.fm `artist.getinfo` / `track.getinfo`; `country`
+and `firstReleaseYear` from MusicBrainz. Answers are served from a 24h
+in-memory cache (keyed lowercased artist, and artist|title) with
+single-flight coalescing, so N clients polling the same current track
+cost one upstream fetch per fact per day.
+
 ### `GET /health`
 
 Deploy-verification and capability surface. Always `200`; degradation is
@@ -121,7 +170,7 @@ a payload fact, not a transport failure.
 {
   "status": "ok",                    // "degraded" = up but no history store
   "version": "1.0",                  // CFBundleShortVersionString, "dev" fallback
-  "capabilities": ["health", "stations", "vocab", "policy", "taste", "exclusions"],
+  "capabilities": ["health", "stations", "vocab", "policy", "taste", "exclusions", "trackinfo"],
   "uptimeSeconds": 273906.0,
   "broadcastingCount": 2,
   "stations": [

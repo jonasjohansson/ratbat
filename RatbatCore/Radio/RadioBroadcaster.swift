@@ -481,12 +481,31 @@ public final class RadioBroadcaster: ObservableObject {
     /// network calls, so the cost is negligible, and eager init
     /// removes a benign TOCTOU race between two concurrent
     /// `startBroadcast` calls both lazy-initing the shared client.
-    private let musicBrainz: MusicBrainzClient
+    /// Internal (not private) for the same reason ``preferences`` is:
+    /// the `/trackinfo` handler lives in TrackInfoWire.swift — same
+    /// type, different file — and asks it for country + release year.
+    let musicBrainz: MusicBrainzClient
     /// Long-lived Bandcamp discover client. Same rationale as
     /// ``musicBrainz``: per-actor request throttling is more useful
     /// when the throttle gate survives across stations / refills,
     /// and the constructor is network-free so eager init is free.
     private let bandcamp: BandcampClient
+    /// Long-lived Last.fm client for `/trackinfo`, tagged with the API
+    /// key it was built with. `lastFMClientIfAvailable()` deliberately
+    /// builds a FRESH client per call so key changes bite immediately —
+    /// but a fresh actor also means fresh caches, and `/trackinfo`'s
+    /// whole cost model rests on ``LastFMClient/artistInfo(_:)``'s 24h
+    /// TTL + single-flight caches surviving between polls. This slot
+    /// keeps one client alive per key; a changed key still bites,
+    /// because the handler rebuilds the slot the moment the stored key
+    /// stops matching (see `lastFMForTrackInfo()` in TrackInfoWire.swift).
+    var trackInfoLastFM: (apiKey: String, client: LastFMClient)?
+    /// MusicBrainz seam for `/trackinfo`. Production leaves it nil and
+    /// the shared ``musicBrainz`` client answers; the socket tests
+    /// install a canned lookup so the suite never touches
+    /// musicbrainz.org. Same tests-only-assign posture as
+    /// ``ownerFreeAttempts``.
+    var trackInfoMusicBrainzOverride: (any MusicBrainzLookup)?
     #endif
 
     // MARK: - Internals
@@ -1823,6 +1842,10 @@ public final class RadioBroadcaster: ObservableObject {
             await self?.buildHealthPayload()
                 ?? Data("{\"status\":\"error\"}".utf8)
         }
+        let trackInfoRoute: @Sendable (String) async -> (Int, Data) = { [weak self] path in
+            await self?.performTrackInfoAsync(path: path)
+                ?? (500, Data("{\"status\":\"error\",\"message\":\"no broadcaster\"}".utf8))
+        }
         let jsonRoute: @Sendable (String, Data) async -> (Int, Data) = { [weak self] path, body in
             // Hop to the main actor exactly once per request; the
             // per-route semantics live in `performJSONRoute`. One closure
@@ -1917,6 +1940,31 @@ public final class RadioBroadcaster: ObservableObject {
                 _ = await Self.send(
                     data: Self.buildHTTPResponse(
                         status: 200,
+                        headers: [
+                            "Content-Type": "application/json",
+                            "Access-Control-Allow-Origin": "*",
+                            "Cache-Control": "no-cache"
+                        ],
+                        body: payload
+                    ),
+                    on: connection
+                )
+                connection.cancel()
+                return
+            }
+
+            // "About this track" — enrichment for a station's current (or
+            // still-in-the-ring recent) track. Same exact-path-plus-query
+            // match as /history, and the same public-read posture: it only
+            // answers for tracks the station is (or just was)
+            // broadcasting, so it can't be driven as an open Last.fm
+            // proxy. Status varies (404 for "nothing to describe"), which
+            // is why this route carries one, unlike its GET neighbours.
+            if path == "/trackinfo" || path.hasPrefix("/trackinfo?") {
+                let (status, payload) = await trackInfoRoute(path)
+                _ = await Self.send(
+                    data: Self.buildHTTPResponse(
+                        status: status,
                         headers: [
                             "Content-Type": "application/json",
                             "Access-Control-Allow-Origin": "*",
@@ -3386,7 +3434,8 @@ public final class RadioBroadcaster: ObservableObject {
     /// listed, so entries are added as features land (`stations` will
     /// join with the CRUD routes) and never renamed.
     nonisolated static let healthCapabilities = [
-        "health", "stations", "vocab", "policy", "taste", "exclusions"
+        "health", "stations", "vocab", "policy", "taste", "exclusions",
+        "trackinfo"
     ]
     /// Window over which `/health` judges each station's liveness.
     /// Ten minutes ≈ a handful of heartbeats: long enough that one

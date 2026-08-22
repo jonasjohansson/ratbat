@@ -49,6 +49,45 @@ public actor LastFMClient {
         }
     }
 
+    /// One artist as `artist.getinfo` describes them — the "about this
+    /// artist" facts `/trackinfo` serves. `bio` is already plain text by
+    /// the time it lands here: tags stripped, Last.fm's trailing "Read
+    /// more" boilerplate removed, capped at a sentence boundary (see
+    /// ``plainBio(_:)``), so no caller ever has to sanitize HTML.
+    public struct ArtistInfo: Sendable, Hashable {
+        public let bio: String?
+        public let listeners: Int?
+        public let playcount: Int?
+        public let tags: [String]      // lowercased, Last.fm's order
+        public let similar: [String]
+
+        public init(bio: String?, listeners: Int?, playcount: Int?, tags: [String], similar: [String]) {
+            self.bio = bio
+            self.listeners = listeners
+            self.playcount = playcount
+            self.tags = tags
+            self.similar = similar
+        }
+    }
+
+    /// One recording as `track.getinfo` describes it. `wiki` gets the
+    /// same plain-text treatment as ``ArtistInfo/bio``.
+    public struct TrackInfo: Sendable, Hashable {
+        public let album: String?
+        public let listeners: Int?
+        public let playcount: Int?
+        public let tags: [String]      // lowercased, Last.fm's order
+        public let wiki: String?
+
+        public init(album: String?, listeners: Int?, playcount: Int?, tags: [String], wiki: String?) {
+            self.album = album
+            self.listeners = listeners
+            self.playcount = playcount
+            self.tags = tags
+            self.wiki = wiki
+        }
+    }
+
     public enum Error: Swift.Error, Sendable, Equatable {
         case apiKeyMissing
         case fetchFailed(URL, String)
@@ -74,6 +113,19 @@ public actor LastFMClient {
     /// ordered similar-artist names). Same rationale as `artistTagCache`:
     /// similarity graphs move slowly, so a process-lifetime cache is plenty.
     private var similarArtistCache: [String: [String]] = [:]
+    /// `/trackinfo` enrichment caches, keyed lowercased artist and
+    /// lowercased artist|title. Unlike the tag/similar caches above these
+    /// carry a TTL: listener and playcount figures move daily, so 24h
+    /// keeps them honest without hammering the API on every poll. The
+    /// in-flight maps give each key single-flight semantics — N clients
+    /// asking about the same current track at once share ONE upstream
+    /// fetch instead of racing N (the URL cache below can't do this: it
+    /// only fills after a fetch completes).
+    private var artistInfoCache: [String: (fetchedAt: Date, info: ArtistInfo)] = [:]
+    private var trackInfoCache: [String: (fetchedAt: Date, info: TrackInfo)] = [:]
+    private var artistInfoInFlight: [String: Task<ArtistInfo, Swift.Error>] = [:]
+    private var trackInfoInFlight: [String: Task<TrackInfo, Swift.Error>] = [:]
+    private let infoCacheTTL: TimeInterval = 24 * 3600
     private let session: URLSession
     private let apiBase = URL(string: "https://ws.audioscrobbler.com/2.0/")!
     private let userAgent = "Ratbat/1.0 (personal radio)"
@@ -209,6 +261,59 @@ public actor LastFMClient {
         return try parseArtistTopTracks(from: data, sourceURL: url)
     }
 
+    /// "About this artist" (`artist.getinfo`): bio, global stats, top
+    /// tags, similar artists. Powers the `/trackinfo` endpoint, whose
+    /// callers poll — hence the 24h TTL and the single-flight coalescing
+    /// (see the cache comment above). Failures are thrown, not cached:
+    /// a transient outage deserves a retry on the next request, exactly
+    /// the ``MusicBrainzClient`` stance.
+    public func artistInfo(_ artist: String) async throws -> ArtistInfo {
+        guard !apiKey.isEmpty else { throw Error.apiKeyMissing }
+        let cacheKey = artist
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if let hit = artistInfoCache[cacheKey],
+           Date().timeIntervalSince(hit.fetchedAt) < infoCacheTTL {
+            return hit.info
+        }
+        if let inFlight = artistInfoInFlight[cacheKey] {
+            return try await inFlight.value
+        }
+        // Registering the task BEFORE the first await is what makes this
+        // single-flight: any caller arriving during the fetch finds the
+        // task above and awaits it, so one URL hits the wire per key.
+        let task = Task { try await self.fetchArtistInfo(artist) }
+        artistInfoInFlight[cacheKey] = task
+        defer { artistInfoInFlight[cacheKey] = nil }
+        let info = try await task.value
+        artistInfoCache[cacheKey] = (fetchedAt: Date(), info: info)
+        return info
+    }
+
+    /// "About this track" (`track.getinfo`): album, stats, top tags,
+    /// wiki blurb. Same caching contract as ``artistInfo(_:)``.
+    public func trackInfo(artist: String, title: String) async throws -> TrackInfo {
+        guard !apiKey.isEmpty else { throw Error.apiKeyMissing }
+        let cacheKey = artist
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            + "\u{1}"
+            + title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let hit = trackInfoCache[cacheKey],
+           Date().timeIntervalSince(hit.fetchedAt) < infoCacheTTL {
+            return hit.info
+        }
+        if let inFlight = trackInfoInFlight[cacheKey] {
+            return try await inFlight.value
+        }
+        let task = Task { try await self.fetchTrackInfo(artist: artist, title: title) }
+        trackInfoInFlight[cacheKey] = task
+        defer { trackInfoInFlight[cacheKey] = nil }
+        let info = try await task.value
+        trackInfoCache[cacheKey] = (fetchedAt: Date(), info: info)
+        return info
+    }
+
     // MARK: - Internal (exposed for @testable import)
 
     /// Parse a `tag.gettoptracks` response into ``TrackCandidate`` values.
@@ -311,7 +416,166 @@ public actor LastFMClient {
         }
     }
 
+    /// Parse an `artist.getinfo` response into ``ArtistInfo``. Tags come
+    /// back lowercased (the ``parseArtistTopTags(from:sourceURL:)`` rule,
+    /// so genre strings compare the same everywhere); similar-artist
+    /// names keep their casing — they're display text, and titlecase is
+    /// part of the name. Bio prefers `content` over `summary` (fuller),
+    /// falling back when content is blank.
+    internal func parseArtistInfo(from data: Data, sourceURL: URL) throws -> ArtistInfo {
+        if let errorEnvelope = try? JSONDecoder().decode(ApiError.self, from: data), errorEnvelope.error != 0 {
+            throw Error.apiError(code: errorEnvelope.error, message: errorEnvelope.message ?? "")
+        }
+        let envelope: ArtistInfoEnvelope
+        do {
+            envelope = try JSONDecoder().decode(ArtistInfoEnvelope.self, from: data)
+        } catch {
+            throw Error.malformed(sourceURL, reason: "artist info envelope: \(error)")
+        }
+        let raw = envelope.artist
+        let rawBio = [raw?.bio?.content, raw?.bio?.summary]
+            .compactMap { $0 }
+            .first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        return ArtistInfo(
+            bio: Self.plainBio(rawBio),
+            listeners: (raw?.stats?.listeners).flatMap { Int($0) },
+            playcount: (raw?.stats?.playcount).flatMap { Int($0) },
+            tags: Self.cleanTagNames(raw?.tags?.tag),
+            similar: (raw?.similar?.artist ?? []).compactMap {
+                let name = ($0.name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                return name.isEmpty ? nil : name
+            }
+        )
+    }
+
+    /// Parse a `track.getinfo` response into ``TrackInfo``. Same rules as
+    /// ``parseArtistInfo(from:sourceURL:)`` — the wiki blurb goes through
+    /// the same stripping/cap, tags are lowercased, and the numeric
+    /// strings Last.fm insists on become honest Ints or nil.
+    internal func parseTrackInfo(from data: Data, sourceURL: URL) throws -> TrackInfo {
+        if let errorEnvelope = try? JSONDecoder().decode(ApiError.self, from: data), errorEnvelope.error != 0 {
+            throw Error.apiError(code: errorEnvelope.error, message: errorEnvelope.message ?? "")
+        }
+        let envelope: TrackInfoEnvelope
+        do {
+            envelope = try JSONDecoder().decode(TrackInfoEnvelope.self, from: data)
+        } catch {
+            throw Error.malformed(sourceURL, reason: "track info envelope: \(error)")
+        }
+        let raw = envelope.track
+        let rawWiki = [raw?.wiki?.content, raw?.wiki?.summary]
+            .compactMap { $0 }
+            .first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        let album = (raw?.album?.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return TrackInfo(
+            album: album.isEmpty ? nil : album,
+            listeners: (raw?.listeners).flatMap { Int($0) },
+            playcount: (raw?.playcount).flatMap { Int($0) },
+            tags: Self.cleanTagNames(raw?.toptags?.tag),
+            wiki: Self.plainBio(rawWiki)
+        )
+    }
+
+    /// Where the bio/wiki cap sits. "~1200": generous enough for a few
+    /// real paragraphs, small enough that `/trackinfo` stays a card, not
+    /// a page.
+    nonisolated internal static let bioCharacterCap = 1200
+
+    /// Reduce a Last.fm `bio`/`wiki` blob to plain text a client can
+    /// render directly. Last.fm returns HTML — anchors, the occasional
+    /// entity — always ending in an `<a>Read more on Last.fm</a>` link,
+    /// with a Creative Commons license sentence after it in the `content`
+    /// variant. None of that belongs in an "about this track" card.
+    ///
+    /// Tag-stripping is a linear scan, not a parser: the input is
+    /// Last.fm's own constrained markup, not arbitrary HTML. Tags go
+    /// first so the read-more cut only has to find the visible text,
+    /// wherever the anchor markup drifts. The cap cuts at the last
+    /// sentence end inside ``bioCharacterCap`` so the text never stops
+    /// mid-word; a cap-length run-on with no sentence ends keeps the
+    /// hard cut rather than vanishing entirely.
+    nonisolated internal static func plainBio(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        var text = ""
+        text.reserveCapacity(raw.count)
+        var insideTag = false
+        for ch in raw {
+            if ch == "<" { insideTag = true; continue }
+            if ch == ">" { insideTag = false; continue }
+            if !insideTag { text.append(ch) }
+        }
+        // Minimal entity decode — the handful Last.fm actually emits.
+        // &amp; last, so "&amp;lt;" can't double-decode into a stray "<".
+        for (entity, plain) in [
+            ("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""),
+            ("&#39;", "'"), ("&nbsp;", " "), ("&amp;", "&")
+        ] {
+            text = text.replacingOccurrences(of: entity, with: plain)
+        }
+        // Everything from "Read more on Last.fm" onward is boilerplate:
+        // the link text itself, then the license sentence.
+        if let readMore = text.range(of: "Read more on Last.fm") {
+            text = String(text[..<readMore.lowerBound])
+        }
+        text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.count > bioCharacterCap {
+            let head = String(text.prefix(bioCharacterCap))
+            if let cut = head.lastIndex(where: { ".!?".contains($0) }) {
+                text = String(head[...cut])
+            } else {
+                text = head
+            }
+            text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return text.isEmpty ? nil : text
+    }
+
+    /// Shared tag cleanup for the two info parsers: drop blanks,
+    /// lowercase, keep Last.fm's own relevance order.
+    nonisolated private static func cleanTagNames(_ rows: [ArtistTagRaw]?) -> [String] {
+        (rows ?? []).compactMap { row in
+            let name = (row.name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            return name.isEmpty ? nil : name.lowercased()
+        }
+    }
+
     // MARK: - Internals
+
+    /// Fetch + parse behind ``artistInfo(_:)`` — split out so the
+    /// single-flight task wrapper up top stays readable.
+    private func fetchArtistInfo(_ artist: String) async throws -> ArtistInfo {
+        var comps = URLComponents(url: apiBase, resolvingAgainstBaseURL: false)!
+        comps.queryItems = [
+            URLQueryItem(name: "method", value: "artist.getinfo"),
+            URLQueryItem(name: "artist", value: artist),
+            URLQueryItem(name: "autocorrect", value: "1"),
+            URLQueryItem(name: "api_key", value: apiKey),
+            URLQueryItem(name: "format", value: "json"),
+        ]
+        guard let url = comps.url else {
+            throw Error.malformed(apiBase, reason: "artist.getinfo URL")
+        }
+        let data = try await fetch(url)
+        return try parseArtistInfo(from: data, sourceURL: url)
+    }
+
+    /// Fetch + parse behind ``trackInfo(artist:title:)``.
+    private func fetchTrackInfo(artist: String, title: String) async throws -> TrackInfo {
+        var comps = URLComponents(url: apiBase, resolvingAgainstBaseURL: false)!
+        comps.queryItems = [
+            URLQueryItem(name: "method", value: "track.getinfo"),
+            URLQueryItem(name: "artist", value: artist),
+            URLQueryItem(name: "track", value: title),
+            URLQueryItem(name: "autocorrect", value: "1"),
+            URLQueryItem(name: "api_key", value: apiKey),
+            URLQueryItem(name: "format", value: "json"),
+        ]
+        guard let url = comps.url else {
+            throw Error.malformed(apiBase, reason: "track.getinfo URL")
+        }
+        let data = try await fetch(url)
+        return try parseTrackInfo(from: data, sourceURL: url)
+    }
 
     /// Fetches `url` with caching + rate limiting + friendly UA.
     private func fetch(_ url: URL) async throws -> Data {
@@ -428,6 +692,51 @@ public actor LastFMClient {
 
     private struct ArtistTopTracksBody: Decodable {
         let track: [TrackRaw]?
+    }
+
+    // artist.getinfo / track.getinfo. Same tolerance rule as above; the
+    // `tags`/`toptags` rows reuse ``ArtistTagRaw`` (getinfo tags carry no
+    // count, which decodes as nil and is simply unused here).
+
+    private struct ArtistInfoEnvelope: Decodable {
+        let artist: ArtistInfoRaw?
+    }
+
+    private struct ArtistInfoRaw: Decodable {
+        let stats: StatsRaw?
+        let tags: InfoTagsRaw?
+        let similar: SimilarArtistsBody?   // same {artist:[{name}]} shape
+        let bio: WikiRaw?
+    }
+
+    private struct StatsRaw: Decodable {
+        let listeners: String?   // strings again, same as TrackRaw
+        let playcount: String?
+    }
+
+    private struct InfoTagsRaw: Decodable {
+        let tag: [ArtistTagRaw]?
+    }
+
+    private struct WikiRaw: Decodable {
+        let summary: String?
+        let content: String?
+    }
+
+    private struct TrackInfoEnvelope: Decodable {
+        let track: TrackInfoRaw?
+    }
+
+    private struct TrackInfoRaw: Decodable {
+        let listeners: String?
+        let playcount: String?
+        let album: TrackAlbumRaw?
+        let toptags: InfoTagsRaw?
+        let wiki: WikiRaw?
+    }
+
+    private struct TrackAlbumRaw: Decodable {
+        let title: String?
     }
 }
 #endif
