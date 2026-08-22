@@ -844,6 +844,29 @@ public actor HistoryStore {
         return gaps
     }
 
+    /// Every station that recorded at least one heartbeat in the window.
+    ///
+    /// Exists for `/health`: the broadcaster knows what is live right
+    /// now, but "was on air earlier today and then went dark" lives only
+    /// in this table — and that is precisely the station a health report
+    /// must not omit.
+    public func stationsWithHeartbeats(from: Date, to: Date) throws -> [UUID] {
+        let stmt = try prepare(
+            "SELECT DISTINCT station_id FROM heartbeat WHERE at >= ? AND at <= ?;"
+        )
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_double(stmt, 1, from.timeIntervalSince1970)
+        sqlite3_bind_double(stmt, 2, to.timeIntervalSince1970)
+        var stations: [UUID] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let raw = sqlite3_column_text(stmt, 0),
+               let id = UUID(uuidString: String(cString: raw)) {
+                stations.append(id)
+            }
+        }
+        return stations
+    }
+
     /// Retention. Returns how many rows were removed.
     @discardableResult
     public func pruneHeartbeats(olderThan cutoff: Date) throws -> Int {

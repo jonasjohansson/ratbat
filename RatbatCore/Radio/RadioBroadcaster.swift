@@ -504,6 +504,17 @@ public final class RadioBroadcaster: ObservableObject {
     /// of this station", which is how `/history` distinguishes a deleted
     /// station from one that simply isn't on air.
     private var stationNames: [Station.ID: String] = [:]
+    /// Slugs, maintained in lockstep with ``stationNames``. `/health`
+    /// reports stations that heartbeated earlier today but aren't live
+    /// now — no pipeline to read a slug off, and the slug can't be
+    /// recomputed from the name alone (its empty-name fallback embeds the
+    /// station's own uuid), so it has to be remembered like the name is.
+    private var stationSlugs: [Station.ID: String] = [:]
+    /// When this broadcaster came up. `/health` reports the difference as
+    /// `uptimeSeconds` — the broadcaster lives for the whole process, so
+    /// this is effectively app uptime, which is what "● on air · 3d 4h"
+    /// on the web wants to say.
+    private let startedAt = Date()
     private var listener: NWListener?
     /// Connected clients keyed by connection identity. We store the
     /// station each client is bound to so disconnects decrement the
@@ -952,6 +963,21 @@ public final class RadioBroadcaster: ObservableObject {
         guard !broadcasting.contains(station.id) else { return }
         error = nil
 
+        // A failed-but-non-nil listener must be recreated, not trusted.
+        // The control plane has to survive zero stations, so the rebind
+        // loop no longer assumes "no pipelines, no listener worth having"
+        // — and by the same token a desktop start can arrive while the
+        // socket sits dead between rebind attempts. Treating that socket
+        // as "already up" would start the station with no way to hear it.
+        if let existing = listener {
+            switch existing.state {
+            case .failed, .cancelled:
+                existing.cancel()
+                listener = nil
+            default:
+                break
+            }
+        }
         // Bring up the shared listener the first time anyone broadcasts.
         if listener == nil {
             do {
@@ -980,6 +1006,7 @@ public final class RadioBroadcaster: ObservableObject {
         // A station we are broadcasting is one we can always name, even if
         // nobody registered the catalogue (older callers, tests).
         stationNames[station.id] = station.name
+        stationSlugs[station.id] = station.slug
         broadcasting.insert(station.id)
         listenerCount[station.id] = 0
         // Restart resilience: remember what's live so the next launch can
@@ -1190,6 +1217,7 @@ public final class RadioBroadcaster: ObservableObject {
     public func registerStations(_ stations: [Station]) {
         for station in stations {
             stationNames[station.id] = station.name
+            stationSlugs[station.id] = station.slug
         }
         // A live pipeline's copy is what the wire reads, so refresh it.
         for station in stations {
@@ -1452,8 +1480,14 @@ public final class RadioBroadcaster: ObservableObject {
     /// same reasoning as the tunnel supervisor and the open-failure
     /// backoff.
     private func scheduleListenerRebind(reason: String) {
-        // Nothing to serve — don't churn on a listener nobody needs.
-        guard !pipelines.isEmpty else { return }
+        // Deliberately NOT gated on `pipelines.isEmpty`. The listener is
+        // the control plane, not just the audio plane: /now.json, /health
+        // and (soon) /stations/* must answer at zero stations, because a
+        // dead socket with nothing broadcasting is exactly the state a
+        // remote owner needs the socket to escape from — stop the last
+        // station over the web and the "nothing to serve" guard would
+        // have made starting one again impossible.
+        //
         // One rebind in flight at a time.
         guard listenerRebindTask == nil else { return }
 
@@ -1468,7 +1502,6 @@ public final class RadioBroadcaster: ObservableObject {
             await MainActor.run {
                 guard let self else { return }
                 self.listenerRebindTask = nil
-                guard !self.pipelines.isEmpty else { return }
                 self.listener?.cancel()
                 self.listener = nil
                 do {
@@ -1563,43 +1596,16 @@ public final class RadioBroadcaster: ObservableObject {
             await self?.buildHistoryPayload(path: path)
                 ?? Data("{\"entries\":[]}".utf8)
         }
-        let authHandler: @Sendable (String?) async -> (Int, Data) = { [weak self] token in
-            await self?.performAuthAsync(token: token)
-                ?? (500, Data("{\"status\":\"error\",\"message\":\"no broadcaster\"}".utf8))
+        let healthPayload: @Sendable () async -> Data = { [weak self] in
+            await self?.buildHealthPayload()
+                ?? Data("{\"status\":\"error\"}".utf8)
         }
-        let likeHandler: @Sendable (UUID, String?) async -> (Int, Data) = { [weak self] stationID, token in
-            // Hop to the main actor to resolve the pipeline snapshot,
-            // then do the copy + history mark off-main without pinning
-            // the UI thread. `performLikeAsync` is the async bridge.
-            await self?.performLikeAsync(stationID: stationID, token: token)
-                ?? (500, Data("{\"status\":\"error\",\"message\":\"no broadcaster\"}".utf8))
-        }
-        let retroLikeHandler: @Sendable (UUID, String, String?) async -> (Int, Data) = { [weak self] stationID, entryID, token in
-            await self?.performRetroLikeAsync(stationID: stationID, entryID: entryID, token: token)
-                ?? (500, Data("{\"status\":\"error\",\"message\":\"no broadcaster\"}".utf8))
-        }
-        let skipHandler: @Sendable (UUID, String?) async -> (Int, Data) = { [weak self] stationID, token in
-            // 👎 from a listener — mark the current track skipped and nudge
-            // the encode loop. `performSkipAsync` is the main-actor bridge.
-            await self?.performSkipAsync(stationID: stationID, token: token)
-                ?? (500, Data("{\"status\":\"error\",\"message\":\"no broadcaster\"}".utf8))
-        }
-        let nextHandler: @Sendable (UUID, String?) async -> (Int, Data) = { [weak self] stationID, token in
-            // ⏭ — advance without judging. No taste signal, no history
-            // mark; "not right now" mustn't poison the profile the way
-            // 👎 deliberately does.
-            await self?.performNextAsync(stationID: stationID, token: token)
-                ?? (500, Data("{\"status\":\"error\",\"message\":\"no broadcaster\"}".utf8))
-        }
-        let boostHandler: @Sendable (UUID, String?) async -> (Int, Data) = { [weak self] stationID, token in
-            // Boost — "more of this": the strong steering signal, above ♥.
-            await self?.performBoostAsync(stationID: stationID, token: token)
-                ?? (500, Data("{\"status\":\"error\",\"message\":\"no broadcaster\"}".utf8))
-        }
-        let unlikeHandler: @Sendable (UUID, String?) async -> (Int, Data) = { [weak self] stationID, token in
-            // Un-♥ — a mis-tap shouldn't be forever: clears the signal and
-            // removes the file the ♥ copied (never a library original).
-            await self?.performUnlikeAsync(stationID: stationID, token: token)
+        let jsonRoute: @Sendable (String, Data) async -> (Int, Data) = { [weak self] path, body in
+            // Hop to the main actor exactly once per request; the
+            // per-route semantics live in `performJSONRoute`. One closure
+            // instead of one per route — the old shape allocated six of
+            // them per connection, including for plain GET /now.json polls.
+            await self?.performJSONRoute(path: path, body: body)
                 ?? (500, Data("{\"status\":\"error\",\"message\":\"no broadcaster\"}".utf8))
         }
 
@@ -1614,7 +1620,9 @@ public final class RadioBroadcaster: ObservableObject {
 
             // CORS preflight for the action POSTs — browsers send OPTIONS
             // before the real POST because we use Content-Type: application/json.
-            if method == "OPTIONS" && (path == "/auth" || path == "/like" || path == "/skip" || path == "/next" || path == "/boost" || path == "/unlike") {
+            // Gated on the same Set as the dispatch below, so a route can't
+            // exist for one and not the other.
+            if method == "OPTIONS" && Self.jsonPostPaths.contains(path) {
                 _ = await Self.send(
                     data: Self.buildHTTPResponse(
                         status: 204,
@@ -1627,170 +1635,43 @@ public final class RadioBroadcaster: ObservableObject {
                 return
             }
 
-            // Passcode check for the web player's unlock prompt. Answers
-            // 200 or 403 and changes nothing either way, so the prompt can
-            // tell the owner they mistyped without ♥-ing a track to find
-            // out. Shares the throttle with the action endpoints.
-            if method == "POST" && path == "/auth" {
+            // Every JSON action POST funnels through one shape: bound and
+            // read the body, hop to the main actor to route, answer with
+            // CORS + JSON. The per-route semantics — including the 400 for
+            // a body that doesn't decode — live in `performJSONRoute`.
+            if method == "POST", Self.jsonPostPaths.contains(path) {
                 let contentLength = Self.contentLength(from: headerBytes) ?? 0
-                let body = await Self.readBody(
-                    connection: connection,
-                    alreadyRead: Self.bodyBytes(after: headerBytes),
-                    expected: contentLength
-                )
-                let token = (try? JSONDecoder().decode(AuthRequest.self, from: body))?.token
-                let (status, payload) = await authHandler(token)
-                var headers = Self.corsHeaders()
-                headers["Content-Type"] = "application/json"
-                _ = await Self.send(
-                    data: Self.buildHTTPResponse(status: status, headers: headers, body: payload),
-                    on: connection
-                )
-                connection.cancel()
-                return
-            }
-
-            // ♥ save — move the currently-playing cached file into the
-            // user's library. Only meaningful on macOS (broadcaster is
-            // macOS-only), but the request surface is cross-platform.
-            if method == "POST" && path == "/like" {
-                let contentLength = Self.contentLength(from: headerBytes) ?? 0
-                let body = await Self.readBody(
-                    connection: connection,
-                    alreadyRead: Self.bodyBytes(after: headerBytes),
-                    expected: contentLength
-                )
-                guard let req = try? JSONDecoder().decode(LikeRequest.self, from: body),
-                      let stationID = UUID(uuidString: req.station) else {
+                guard contentLength <= Self.maxJSONBodyBytes else {
+                    // Refuse outright rather than truncating into an opaque
+                    // decode failure. Drain what the client is mid-sending
+                    // first: closing with unread bytes in the receive
+                    // buffer makes the OS RST the connection, which can
+                    // destroy the very response we're trying to deliver.
+                    _ = await Self.readBody(
+                        connection: connection,
+                        alreadyRead: Self.bodyBytes(after: headerBytes),
+                        expected: contentLength
+                    )
                     var headers = Self.corsHeaders()
                     headers["Content-Type"] = "application/json"
                     _ = await Self.send(
                         data: Self.buildHTTPResponse(
-                            status: 400,
+                            status: 413,
                             headers: headers,
-                            body: Data("{\"status\":\"error\",\"message\":\"bad request\"}".utf8)
+                            body: Data("{\"status\":\"error\",\"message\":\"body too large\"}".utf8)
                         ),
                         on: connection
                     )
                     connection.cancel()
                     return
                 }
-
-                let (status, payload) = if let entry = req.entry {
-                    await retroLikeHandler(stationID, entry, req.token)
-                } else {
-                    await likeHandler(stationID, req.token)
-                }
-                var headers = Self.corsHeaders()
-                headers["Content-Type"] = "application/json"
-                _ = await Self.send(
-                    data: Self.buildHTTPResponse(status: status, headers: headers, body: payload),
-                    on: connection
-                )
-                connection.cancel()
-                return
-            }
-
-            // 👎 skip — listener-side thumbs-down on the current track.
-            // Same request shape and CORS handling as /like; marks the
-            // track skipped (taste blacklist) and advances the station.
-            if method == "POST" && path == "/skip" {
-                let contentLength = Self.contentLength(from: headerBytes) ?? 0
                 let body = await Self.readBody(
                     connection: connection,
                     alreadyRead: Self.bodyBytes(after: headerBytes),
-                    expected: contentLength
+                    expected: contentLength,
+                    timeout: Self.jsonBodyReadTimeout
                 )
-                guard let req = try? JSONDecoder().decode(LikeRequest.self, from: body),
-                      let stationID = UUID(uuidString: req.station) else {
-                    var headers = Self.corsHeaders()
-                    headers["Content-Type"] = "application/json"
-                    _ = await Self.send(
-                        data: Self.buildHTTPResponse(
-                            status: 400,
-                            headers: headers,
-                            body: Data("{\"status\":\"error\",\"message\":\"bad request\"}".utf8)
-                        ),
-                        on: connection
-                    )
-                    connection.cancel()
-                    return
-                }
-
-                let (status, payload) = await skipHandler(stationID, req.token)
-                var headers = Self.corsHeaders()
-                headers["Content-Type"] = "application/json"
-                _ = await Self.send(
-                    data: Self.buildHTTPResponse(status: status, headers: headers, body: payload),
-                    on: connection
-                )
-                connection.cancel()
-                return
-            }
-
-            // ⏭ next — advance the station without recording any taste
-            // signal. Same request shape and CORS handling as /like.
-            if method == "POST" && path == "/next" {
-                let contentLength = Self.contentLength(from: headerBytes) ?? 0
-                let body = await Self.readBody(
-                    connection: connection,
-                    alreadyRead: Self.bodyBytes(after: headerBytes),
-                    expected: contentLength
-                )
-                guard let req = try? JSONDecoder().decode(LikeRequest.self, from: body),
-                      let stationID = UUID(uuidString: req.station) else {
-                    var headers = Self.corsHeaders()
-                    headers["Content-Type"] = "application/json"
-                    _ = await Self.send(
-                        data: Self.buildHTTPResponse(
-                            status: 400,
-                            headers: headers,
-                            body: Data("{\"status\":\"error\",\"message\":\"bad request\"}".utf8)
-                        ),
-                        on: connection
-                    )
-                    connection.cancel()
-                    return
-                }
-
-                let (status, payload) = await nextHandler(stationID, req.token)
-                var headers = Self.corsHeaders()
-                headers["Content-Type"] = "application/json"
-                _ = await Self.send(
-                    data: Self.buildHTTPResponse(status: status, headers: headers, body: payload),
-                    on: connection
-                )
-                connection.cancel()
-                return
-            }
-
-            // Boost / un-♥ — same request shape and CORS handling as /like.
-            if method == "POST" && (path == "/boost" || path == "/unlike") {
-                let contentLength = Self.contentLength(from: headerBytes) ?? 0
-                let body = await Self.readBody(
-                    connection: connection,
-                    alreadyRead: Self.bodyBytes(after: headerBytes),
-                    expected: contentLength
-                )
-                guard let req = try? JSONDecoder().decode(LikeRequest.self, from: body),
-                      let stationID = UUID(uuidString: req.station) else {
-                    var headers = Self.corsHeaders()
-                    headers["Content-Type"] = "application/json"
-                    _ = await Self.send(
-                        data: Self.buildHTTPResponse(
-                            status: 400,
-                            headers: headers,
-                            body: Data("{\"status\":\"error\",\"message\":\"bad request\"}".utf8)
-                        ),
-                        on: connection
-                    )
-                    connection.cancel()
-                    return
-                }
-
-                let (status, payload) = path == "/boost"
-                    ? await boostHandler(stationID, req.token)
-                    : await unlikeHandler(stationID, req.token)
+                let (status, payload) = await jsonRoute(path, body)
                 var headers = Self.corsHeaders()
                 headers["Content-Type"] = "application/json"
                 _ = await Self.send(
@@ -1805,7 +1686,10 @@ public final class RadioBroadcaster: ObservableObject {
             // in-memory `recent` ring in /now.json. Survives restarts and
             // reaches back as far as the store does. Public read, same
             // posture as /now.json: it only exposes what was broadcast.
-            if path.hasPrefix("/history") {
+            // Exact path (plus optional query) — a bare `hasPrefix` also
+            // claimed /historyanything, which should 404 like any other
+            // unknown path.
+            if path == "/history" || path.hasPrefix("/history?") {
                 let payload = await historyPayload(path)
                 _ = await Self.send(
                     data: Self.buildHTTPResponse(
@@ -1857,6 +1741,28 @@ public final class RadioBroadcaster: ObservableObject {
                 return
             }
 
+            // Deploy-verification and capability surface. No auth, same
+            // posture as /now.json: it names only stations that have been
+            // on air, which were public knowledge while they were. Serves
+            // 200 even when degraded — see ``buildHealthPayload()``.
+            if path == "/health" {
+                let payload = await healthPayload()
+                _ = await Self.send(
+                    data: Self.buildHTTPResponse(
+                        status: 200,
+                        headers: [
+                            "Content-Type": "application/json",
+                            "Access-Control-Allow-Origin": "*",
+                            "Cache-Control": "no-cache"
+                        ],
+                        body: payload
+                    ),
+                    on: connection
+                )
+                connection.cancel()
+                return
+            }
+
             // Public JSON status. Lists the CURRENTLY BROADCASTING stations
             // plus their current track and listener counts. No auth —
             // broadcaster only knows live stations, so idle library
@@ -1901,13 +1807,17 @@ public final class RadioBroadcaster: ObservableObject {
                 await MainActor.run { [weak self] in self?.registerSSE(connection) }
                 // Initial snapshot so the client renders immediately rather
                 // than waiting for the first track change.
-                _ = await Self.send(data: Self.sseEvent(await nowPayload()), on: connection)
+                _ = await Self.send(data: Self.sseEvent(await nowPayload(), name: "now"), on: connection)
                 // Heartbeat loop. Pushes are driven from the broadcaster;
                 // this only keeps the pipe warm and notices a dead peer.
+                // A named `ping` rather than a `:` comment frame: comments
+                // are invisible to `EventSource`, so the web client's
+                // liveness watchdog had to guess at the cadence. An event
+                // it can listen for makes "the pipe is warm" exact.
                 while !Task.isCancelled {
                     try? await Task.sleep(nanoseconds: 30_000_000_000)
                     if Task.isCancelled { break }
-                    let alive = await Self.send(data: Data(": heartbeat\n\n".utf8), on: connection)
+                    let alive = await Self.send(data: Data("event: ping\ndata: {}\n\n".utf8), on: connection)
                     if !alive { break }
                 }
                 await MainActor.run { [weak self] in self?.removeSSE(ObjectIdentifier(connection)) }
@@ -2070,7 +1980,7 @@ public final class RadioBroadcaster: ObservableObject {
     /// under rapid changes is harmless.
     private func pushSSE() {
         guard !sseSubscribers.isEmpty else { return }
-        let event = Self.sseEvent(buildNowPayload())
+        let event = Self.sseEvent(buildNowPayload(), name: "now")
         for (id, conn) in sseSubscribers {
             Task { [weak self] in
                 let ok = await Self.send(data: event, on: conn)
@@ -2079,14 +1989,121 @@ public final class RadioBroadcaster: ObservableObject {
         }
     }
 
-    /// Frame a JSON payload as a single SSE `data:` event. SSE is
-    /// line-oriented and terminates an event with a blank line; our payload
-    /// is single-line JSON so one `data:` line suffices.
-    nonisolated static func sseEvent(_ json: Data) -> Data {
-        var out = Data("data: ".utf8)
+    /// Frame a JSON payload as a single SSE event. SSE is line-oriented
+    /// and terminates an event with a blank line; our payload is
+    /// single-line JSON so one `data:` line suffices. `name` becomes an
+    /// `event:` line so `EventSource` clients can `addEventListener` on
+    /// it — every frame we send is named (`now` for snapshots, `ping` for
+    /// the keep-alive), and there are no unnamed-frame consumers to keep
+    /// compatible, so new frame kinds should be named too.
+    nonisolated static func sseEvent(_ json: Data, name: String? = nil) -> Data {
+        var out = Data()
+        if let name {
+            out.append(Data("event: \(name)\n".utf8))
+        }
+        out.append(Data("data: ".utf8))
         out.append(json)
         out.append(Data("\n\n".utf8))
         return out
+    }
+
+    // MARK: - JSON POST routing
+
+    /// Every JSON POST route. Single source of truth for BOTH the CORS
+    /// OPTIONS preflight and the POST dispatch — a path added here gets
+    /// both, so a new route can never ship answering POSTs while
+    /// stonewalling the preflight browsers send first (or vice versa).
+    nonisolated static let jsonPostPaths: Set<String> = [
+        "/auth", "/like", "/skip", "/next", "/boost", "/unlike"
+    ]
+
+    /// Ceiling on a JSON POST body. The largest legitimate payload today
+    /// is a station config (40 tags + regions + excluded artists), which
+    /// is well under a kilobyte — 64 KB is generous headroom, while
+    /// anything past it is not a config, it's a hose.
+    nonisolated static let maxJSONBodyBytes = 64 * 1024
+
+    /// Wall-clock budget for reading a JSON POST body. The old flat 3s
+    /// was tuned for `{"station":…,"token":…}` and silently truncated
+    /// larger bodies arriving in dribs over a slow tunnel — which then
+    /// failed to decode and surfaced as an opaque 400. Config-sized
+    /// payloads get a budget that covers a bad mobile link instead.
+    nonisolated static let jsonBodyReadTimeout: TimeInterval = 10
+
+    /// The shared 400 for a body that doesn't decode or a station id that
+    /// doesn't parse — the same bytes every route used to assemble inline.
+    nonisolated static func badRequest() -> (Int, Data) {
+        (400, Data("{\"status\":\"error\",\"message\":\"bad request\"}".utf8))
+    }
+
+    /// Route a JSON POST to its handler. One switch instead of five
+    /// copy-pasted per-connection blocks; runs on the main actor so each
+    /// case can reach broadcaster state directly, with the detached
+    /// reader hopping here exactly once per request.
+    func performJSONRoute(path: String, body: Data) async -> (Int, Data) {
+        let decoder = JSONDecoder()
+        switch path {
+        case "/auth":
+            // Passcode check for the web player's unlock prompt. Answers
+            // 200 or 403 and changes nothing either way. A malformed or
+            // empty body decodes to "no token" and takes the ordinary
+            // rejection path instead of a 400 — see ``AuthRequest``.
+            return await performAuthAsync(
+                token: (try? decoder.decode(AuthRequest.self, from: body))?.token
+            )
+        case "/like":
+            // ♥ save — move the currently-playing cached file into the
+            // user's library. Retro-♥ rides the same route: an `entry` id
+            // from the recent ring saves that just-played track instead
+            // ("the one that got away, two tracks back").
+            guard let req = try? decoder.decode(LikeRequest.self, from: body),
+                  let stationID = UUID(uuidString: req.station) else {
+                return Self.badRequest()
+            }
+            if let entry = req.entry {
+                return await performRetroLikeAsync(
+                    stationID: stationID, entryID: entry, token: req.token
+                )
+            }
+            return await performLikeAsync(stationID: stationID, token: req.token)
+        case "/skip":
+            // 👎 — mark the current track skipped (taste blacklist) and
+            // nudge the encode loop to advance.
+            guard let req = try? decoder.decode(LikeRequest.self, from: body),
+                  let stationID = UUID(uuidString: req.station) else {
+                return Self.badRequest()
+            }
+            return await performSkipAsync(stationID: stationID, token: req.token)
+        case "/next":
+            // ⏭ — advance without judging. No taste signal, no history
+            // mark; "not right now" mustn't poison the profile the way
+            // 👎 deliberately does.
+            guard let req = try? decoder.decode(LikeRequest.self, from: body),
+                  let stationID = UUID(uuidString: req.station) else {
+                return Self.badRequest()
+            }
+            return await performNextAsync(stationID: stationID, token: req.token)
+        case "/boost":
+            // Boost — "more of this": the strong steering signal, above ♥.
+            guard let req = try? decoder.decode(LikeRequest.self, from: body),
+                  let stationID = UUID(uuidString: req.station) else {
+                return Self.badRequest()
+            }
+            return await performBoostAsync(stationID: stationID, token: req.token)
+        case "/unlike":
+            // Un-♥ — a mis-tap shouldn't be forever: clears the signal and
+            // removes the file the ♥ copied (never a library original).
+            guard let req = try? decoder.decode(LikeRequest.self, from: body),
+                  let stationID = UUID(uuidString: req.station) else {
+                return Self.badRequest()
+            }
+            return await performUnlikeAsync(stationID: stationID, token: req.token)
+        default:
+            // Unreachable while dispatch is gated on ``jsonPostPaths``,
+            // but a path added to the set without a case must land here
+            // rather than silently hang the connection.
+            return (404, Data("{\"status\":\"error\",\"message\":\"unknown route\"}".utf8))
+        }
     }
 
     // MARK: - Request parsing
@@ -2158,13 +2175,19 @@ public final class RadioBroadcaster: ObservableObject {
     /// nothing was pre-buffered and nothing else is coming, returns what
     /// we have. Safe against clients that claim a large body and never
     /// send it (bounded by `expected`, with a timeout).
+    ///
+    /// `timeout` is the wall clock for the whole body. The 3s default
+    /// suits the tiny action payloads; JSON routes pass the roomier
+    /// ``jsonBodyReadTimeout`` so a config-sized body arriving slowly
+    /// over the tunnel isn't silently truncated into a decode failure.
     nonisolated static func readBody(
         connection: NWConnection,
         alreadyRead: Data,
-        expected: Int
+        expected: Int,
+        timeout: TimeInterval = 3
     ) async -> Data {
         var acc = alreadyRead
-        let deadline = Date().addingTimeInterval(3)
+        let deadline = Date().addingTimeInterval(timeout)
         while acc.count < expected, Date() < deadline {
             let needed = expected - acc.count
             // The deadline above only bounds the loop BETWEEN receives —
@@ -2173,7 +2196,7 @@ public final class RadioBroadcaster: ObservableObject {
             // park this task forever. The watchdog cancels the connection
             // instead, which forces the pending receive to complete.
             let watchdog = Task {
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
                 // try? swallows the CancellationError a normal receive
                 // triggers — re-check so the happy path can't kill a
                 // healthy connection.
@@ -2286,11 +2309,19 @@ public final class RadioBroadcaster: ObservableObject {
         let statusText: String
         switch status {
         case 200: statusText = "OK"
+        case 201: statusText = "Created"
         case 204: statusText = "No Content"
         case 302: statusText = "Found"
         case 400: statusText = "Bad Request"
+        // Every status a route actually emits needs a row here — the gate
+        // used to be missing 403 of all things, so the wire literally read
+        // `HTTP/1.1 403 Unknown`. Reason phrases follow RFC 9110 naming.
+        case 403: statusText = "Forbidden"
         case 404: statusText = "Not Found"
         case 409: statusText = "Conflict"
+        case 410: statusText = "Gone"
+        case 413: statusText = "Content Too Large"
+        case 422: statusText = "Unprocessable Content"
         case 500: statusText = "Internal Server Error"
         default: statusText = "Unknown"
         }
@@ -3007,6 +3038,150 @@ public final class RadioBroadcaster: ObservableObject {
             ?? Data("{\"entries\":[]}".utf8)
         #else
         return Data("{\"entries\":[]}".utf8)
+        #endif
+    }
+
+    // MARK: - Health payload
+
+    /// What this build's HTTP surface can do, for web capability gating.
+    /// The anchor the web client reads instead of 404-probing each route.
+    /// Append-only: a control appears on the web iff its capability is
+    /// listed, so entries are added as features land (`stations` will
+    /// join with the CRUD routes) and never renamed.
+    nonisolated static let healthCapabilities = ["health"]
+    /// Window over which `/health` judges each station's liveness.
+    /// Ten minutes ≈ a handful of heartbeats: long enough that one
+    /// missed beat doesn't flap the answer, short enough to notice an
+    /// outage while it still matters.
+    nonisolated static let healthLivenessWindow: TimeInterval = 10 * 60
+    /// Window over which `/health` looks for the most recent off-air gap
+    /// — "did the radio go dark in the last day, and when".
+    nonisolated static let healthGapWindow: TimeInterval = 24 * 60 * 60
+
+    #if os(macOS)
+    /// Wire spelling of ``HistoryStore/Liveness`` — the case names,
+    /// pinned here so a Swift-side rename can't silently change the API.
+    nonisolated static func livenessLabel(_ liveness: HistoryStore.Liveness) -> String {
+        switch liveness {
+        case .onAirAndPlaying: return "onAirAndPlaying"
+        case .onAirButQuiet: return "onAirButQuiet"
+        case .offAir: return "offAir"
+        }
+    }
+    #endif
+
+    /// JSON for `GET /health` — the deploy-verification surface. Reads
+    /// the heartbeat table so "off air" and "on air but quiet" can be
+    /// told apart after the fact, which no status line can do.
+    ///
+    /// Always a 200: "degraded" (no history store) is a payload fact,
+    /// not a transport failure, so an outside probe can tell
+    /// "broadcaster up but storeless" from "socket dead".
+    func buildHealthPayload() async -> Data {
+        /// Same wire-shape rules as /now.json: every key always present,
+        /// explicit nulls, sorted keys.
+        struct HealthGap: Encodable {
+            let start: Double
+            let end: Double
+        }
+        struct HealthStation: Encodable {
+            let id: String
+            let name: String?
+            let slug: String?
+            let broadcasting: Bool
+            let liveness: String
+            let lastGap: HealthGap?
+
+            enum CodingKeys: String, CodingKey {
+                case id, name, slug, broadcasting, liveness, lastGap
+            }
+
+            /// Hand-written so a nil name/slug (a deleted station whose
+            /// heartbeats outlive its catalogue entry) and a gap-free day
+            /// encode as explicit JSON nulls rather than missing keys.
+            func encode(to encoder: Encoder) throws {
+                var c = encoder.container(keyedBy: CodingKeys.self)
+                try c.encode(id, forKey: .id)
+                try c.encode(name, forKey: .name)
+                try c.encode(slug, forKey: .slug)
+                try c.encode(broadcasting, forKey: .broadcasting)
+                try c.encode(liveness, forKey: .liveness)
+                try c.encode(lastGap, forKey: .lastGap)
+            }
+        }
+        struct HealthResponse: Encodable {
+            let status: String
+            let version: String
+            let capabilities: [String]
+            let uptimeSeconds: Double
+            let broadcastingCount: Int
+            let stations: [HealthStation]
+        }
+
+        // Bundle.main is the app in production and the xctest runner
+        // under test; "dev" is the honest fallback for a bare binary.
+        let version = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "dev"
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+
+        func payload(status: String, stations: [HealthStation]) -> Data {
+            let response = HealthResponse(
+                status: status,
+                version: version,
+                capabilities: Self.healthCapabilities,
+                uptimeSeconds: Date().timeIntervalSince(startedAt),
+                broadcastingCount: broadcasting.count,
+                stations: stations
+            )
+            return (try? encoder.encode(response)) ?? Data("{\"status\":\"error\"}".utf8)
+        }
+
+        #if os(macOS)
+        guard let history else { return payload(status: "degraded", stations: []) }
+
+        let now = Date()
+        let livenessFrom = now.addingTimeInterval(-Self.healthLivenessWindow)
+        let gapFrom = now.addingTimeInterval(-Self.healthGapWindow)
+
+        // Currently broadcasting ∪ heartbeated inside the gap window.
+        // Anything in either set was public on /now.json while it was
+        // live — no new leak — and idle-forever stations never appear.
+        var ids = broadcasting
+        if let beating = try? await history.stationsWithHeartbeats(from: gapFrom, to: now) {
+            ids.formUnion(beating)
+        }
+
+        var stations: [HealthStation] = []
+        for id in ids {
+            let liveness = (try? await history.liveness(
+                station: id, from: livenessFrom, to: now
+            )) ?? .offAir
+            // One most-recent gap, not the whole day's list — the client
+            // renders a single "went dark 03:12–04:40" line.
+            let gaps = (try? await history.offAirGaps(
+                station: id, from: gapFrom, to: now,
+                expectedInterval: Self.heartbeatInterval
+            )) ?? []
+            stations.append(HealthStation(
+                id: id.uuidString,
+                name: pipelines[id]?.station.name ?? stationNames[id],
+                slug: pipelines[id]?.station.slug ?? stationSlugs[id],
+                broadcasting: broadcasting.contains(id),
+                liveness: Self.livenessLabel(liveness),
+                lastGap: gaps.last.map {
+                    HealthGap(
+                        start: $0.start.timeIntervalSince1970,
+                        end: $0.end.timeIntervalSince1970
+                    )
+                }
+            ))
+        }
+        // Stable ordering by name so UI doesn't jitter between polls,
+        // same as /now.json; id breaks ties and orders the nameless.
+        stations.sort { ($0.name ?? "", $0.id) < ($1.name ?? "", $1.id) }
+        return payload(status: "ok", stations: stations)
+        #else
+        return payload(status: "degraded", stations: [])
         #endif
     }
 

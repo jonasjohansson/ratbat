@@ -399,6 +399,54 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertTrue(served, "listener never rebound after the port was freed")
     }
 
+    /// Mirror of ``testListenerRecoversFromABindConflict`` with the last
+    /// station stopped INDIVIDUALLY before the port frees up. The rebind
+    /// path used to bail at zero pipelines ("nothing to serve") — but the
+    /// listener is the control plane too: once the web can stop the last
+    /// station, a dead socket at zero stations means the web can never
+    /// start one again.
+    @MainActor
+    func testListenerRebindsAfterEveryStationStopsIndividually() async throws {
+        let port: UInt16 = 18_071
+
+        // Occupy the port so the broadcaster's listener cannot bind.
+        let squatterParams = NWParameters.tcp
+        let squatter = try NWListener(using: squatterParams, on: NWEndpoint.Port(rawValue: port)!)
+        squatter.newConnectionHandler = { $0.cancel() }
+        squatter.start(queue: .global())
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        let radio = RadioBroadcaster(port: port)
+        defer { radio.stopAll() }
+        let station = Station(name: "Rebind Empty", kind: .playlist(queue: []))
+        await radio.startBroadcast(station: station, source: NeverSource())
+        try await Task.sleep(nanoseconds: 800_000_000)
+
+        // Stop the one and only station — NOT stopAll, which is the
+        // deliberate shutdown gesture and tears the listener down on
+        // purpose. A per-station stop must leave the control plane up.
+        radio.stopBroadcast(stationID: station.id)
+        XCTAssertTrue(radio.broadcasting.isEmpty)
+
+        // Free the port; the broadcaster should rebind on its own even
+        // though nothing is broadcasting any more.
+        squatter.cancel()
+
+        var served = false
+        for _ in 0..<20 {
+            try await Task.sleep(nanoseconds: 500_000_000)
+            if let r = await Self.probeEndpoint(port: port, path: "/now.json", timeout: 1),
+               r.contains("HTTP/1.1 200") {
+                served = true
+                break
+            }
+        }
+        XCTAssertTrue(
+            served,
+            "listener never rebound once the last station was stopped individually"
+        )
+    }
+
     // MARK: - A cancelled encode loop must not fold its successor
 
     /// Parks for a long time, then reports exhaustion — a resolve that is
@@ -1002,6 +1050,60 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertTrue(response.contains("history unavailable"), "Expected message: \(response)")
     }
 
+    /// OPTIONS against a path that is NOT in ``RadioBroadcaster/jsonPostPaths``
+    /// must fall through to the ordinary 404 — the Set really is the gate,
+    /// not a parallel list that can drift from the POST dispatch.
+    @MainActor
+    func testOptionsAgainstUnknownPathReturns404() async throws {
+        let port: UInt16 = 18_072
+        let radio = RadioBroadcaster(port: port)
+        defer { radio.stopAll() }
+        let station = Station(name: "Preflight 404", kind: .playlist(queue: []))
+        await radio.startBroadcast(station: station, source: NeverSource())
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        let response = try await Self.fetchRawResponse(
+            port: port,
+            path: "/nope",
+            requestHeaders: ["Access-Control-Request-Method: POST"],
+            maxBytes: 1_024,
+            method: "OPTIONS"
+        )
+        XCTAssertTrue(response.contains("HTTP/1.1 404"), "Expected 404: \(response)")
+    }
+
+    /// A JSON POST declaring a body past ``RadioBroadcaster/maxJSONBodyBytes``
+    /// is refused with 413 up front, rather than truncated by the read
+    /// deadline into an opaque decode-failure 400 — the slow-tunnel
+    /// failure mode the body-limit hardening exists for.
+    @MainActor
+    func testOversizedJSONPostBodyIsRefusedWith413() async throws {
+        let port: UInt16 = 18_073
+        let radio = RadioBroadcaster(port: port)
+        defer { radio.stopAll() }
+        let station = Station(name: "Too Large", kind: .playlist(queue: []))
+        await radio.startBroadcast(station: station, source: NeverSource())
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        // One byte over the cap, all of it actually sent, so the server's
+        // drain-then-answer path runs exactly as it would against a real
+        // client mid-upload.
+        let padding = String(repeating: "x", count: RadioBroadcaster.maxJSONBodyBytes + 1)
+        let response = try await Self.fetchRawResponse(
+            port: port,
+            path: "/like",
+            requestHeaders: ["Content-Type: application/json"],
+            maxBytes: 1_024,
+            method: "POST",
+            body: "{\"station\":\"\(station.id.uuidString)\",\"pad\":\"\(padding)\"}"
+        )
+        XCTAssertTrue(
+            response.contains("HTTP/1.1 413 Content Too Large"),
+            "Expected 413: \(response)"
+        )
+        XCTAssertTrue(response.contains("body too large"), "Expected message: \(response)")
+    }
+
     // MARK: - Timeline (recent ring + upcoming + retro-♥)
 
     /// Advancing a station must retire the outgoing track into the recent
@@ -1275,16 +1377,67 @@ final class RadioBroadcasterTests: XCTestCase {
             method: "POST",
             body: "{\"station\":\"\(station.id.uuidString)\"}"
         )
-        XCTAssertTrue(response.contains("HTTP/1.1 403"), "Expected 403: \(response)")
+        // The full status line, not just the code: 403 had no row in the
+        // reason-phrase table, so the wire read `HTTP/1.1 403 Unknown`.
+        XCTAssertTrue(response.contains("HTTP/1.1 403 Forbidden"), "Expected 403 Forbidden: \(response)")
         XCTAssertTrue(response.contains("listener mode"), "Expected guest message: \(response)")
     }
 
+    /// Every status a route emits must carry its RFC 9110 reason phrase —
+    /// codes missing from the table fell through to `Unknown`.
+    func testBuildHTTPResponseKnowsItsStatusTexts() {
+        for (status, expected) in [
+            (201, "201 Created"),
+            (403, "403 Forbidden"),
+            (410, "410 Gone"),
+            (413, "413 Content Too Large"),
+            (422, "422 Unprocessable Content")
+        ] {
+            let response = RadioBroadcaster.buildHTTPResponse(
+                status: status, headers: [:], body: Data()
+            )
+            let head = String(data: response, encoding: .utf8) ?? ""
+            XCTAssertTrue(
+                head.hasPrefix("HTTP/1.1 \(expected)\r\n"),
+                "Expected \(expected), got: \(head.prefix(40))"
+            )
+        }
+    }
+
     /// SSE framing: a payload becomes a single `data:` line terminated by
-    /// a blank line, with the JSON bytes passed through verbatim.
+    /// a blank line, with the JSON bytes passed through verbatim. A named
+    /// event gains an `event:` line first — and every frame we actually
+    /// send is named (`now` / `ping`), so `EventSource` clients can
+    /// `addEventListener` instead of funnelling through `onmessage`.
     func testSSEEventFraming() {
         let json = Data("{\"stations\":[]}".utf8)
         let framed = RadioBroadcaster.sseEvent(json)
         XCTAssertEqual(String(data: framed, encoding: .utf8), "data: {\"stations\":[]}\n\n")
+
+        let named = RadioBroadcaster.sseEvent(json, name: "now")
+        XCTAssertEqual(
+            String(data: named, encoding: .utf8),
+            "event: now\ndata: {\"stations\":[]}\n\n"
+        )
+    }
+
+    /// The frames `/events` actually emits are named `now`, starting with
+    /// the initial snapshot — no unnamed frames remain on the wire.
+    @MainActor
+    func testEventsStreamNamesItsNowFrames() async throws {
+        let port: UInt16 = 18_076
+        let radio = RadioBroadcaster(port: port)
+        defer { radio.stopAll() }
+        let station = Station(name: "SSE Named", kind: .playlist(queue: []))
+        await radio.startBroadcast(station: station, source: NeverSource())
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        let (data, _) = try await Self.fetchStream(port: port, path: "/events", maxBytes: 32)
+        let text = String(data: data, encoding: .utf8) ?? ""
+        XCTAssertTrue(
+            text.hasPrefix("event: now\ndata: "),
+            "initial snapshot must be a named `now` event, got: \(text)"
+        )
     }
 
     /// GET /events opens a Server-Sent Events stream — the response head
@@ -2176,6 +2329,120 @@ final class RadioBroadcasterTests: XCTestCase {
         let second = try JSONDecoder().decode(Envelope.self, from: secondData)
         XCTAssertEqual(second.stations.count, 1)
         XCTAssertEqual(second.stations.first?.name, "Beta JSON")
+    }
+
+    /// `/history` used to be a prefix match, so `/historyxyz` answered 200
+    /// with real rows instead of 404-ing like any other unknown path. The
+    /// real route keeps answering, with and without a query string.
+    @MainActor
+    func testHistoryRouteMatchesExactPathOnly() async throws {
+        let port: UInt16 = 18_070
+        let radio = RadioBroadcaster(port: port)
+        defer { radio.stopAll() }
+        let station = Station(name: "History Exact", kind: .playlist(queue: []))
+        await radio.startBroadcast(station: station, source: NeverSource())
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        let bogus = try await Self.fetchRawResponse(
+            port: port, path: "/historyxyz", requestHeaders: [], maxBytes: 1_024
+        )
+        XCTAssertTrue(bogus.contains("HTTP/1.1 404"), "Expected 404: \(bogus)")
+
+        for path in ["/history", "/history?limit=1"] {
+            let ok = try await Self.fetchRawResponse(
+                port: port, path: path, requestHeaders: [], maxBytes: 2_048
+            )
+            XCTAssertTrue(ok.contains("HTTP/1.1 200"), "Expected 200 for \(path): \(ok)")
+        }
+    }
+
+    // MARK: - /health
+
+    /// `GET /health` answers 200 with the capability anchor, uptime, and
+    /// per-station liveness read from the heartbeat table.
+    @MainActor
+    func testHealthReportsLivenessAndCapabilities() async throws {
+        let tempDB = FileManager.default.temporaryDirectory
+            .appendingPathComponent("health-\(UUID().uuidString).sqlite")
+        let store = try await HistoryStore(databaseURL: tempDB)
+        let prefs = BroadcastPreferences()
+        prefs.port = 18_074
+        defer { prefs.port = 18_000 }
+        let radio = RadioBroadcaster(preferences: prefs, history: store)
+        defer { radio.stopAll() }
+        let station = Station(name: "Health Test", kind: .playlist(queue: []))
+        await radio.startBroadcast(station: station, source: NeverSource())
+        // Don't wait on the 60s heartbeat cadence — one explicit row makes
+        // the liveness answer deterministic.
+        try await store.recordHeartbeat(station: station.id)
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        let (data, response) = try await Self.fetchPayload(port: 18_074, path: "/health")
+        let http = try XCTUnwrap(response as? HTTPURLResponse)
+        XCTAssertEqual(http.statusCode, 200)
+
+        struct Health: Decodable {
+            struct HealthStation: Decodable {
+                struct Gap: Decodable {
+                    let start: Double
+                    let end: Double
+                }
+                let id: String
+                let name: String?
+                let slug: String?
+                let broadcasting: Bool
+                let liveness: String
+                let lastGap: Gap?
+            }
+            let status: String
+            let version: String
+            let capabilities: [String]
+            let uptimeSeconds: Double
+            let broadcastingCount: Int
+            let stations: [HealthStation]
+        }
+        let health = try JSONDecoder().decode(Health.self, from: data)
+        XCTAssertEqual(health.status, "ok")
+        XCTAssertTrue(health.capabilities.contains("health"), "got: \(health.capabilities)")
+        XCTAssertGreaterThanOrEqual(health.uptimeSeconds, 0)
+        XCTAssertEqual(health.broadcastingCount, 1)
+
+        let only = try XCTUnwrap(health.stations.first)
+        XCTAssertEqual(only.id, station.id.uuidString)
+        XCTAssertEqual(only.name, "Health Test")
+        XCTAssertEqual(only.slug, "health-test")
+        XCTAssertTrue(only.broadcasting)
+        // NeverSource never plays anything, so heartbeats without plays
+        // mean "running, nothing queued" — not an outage.
+        XCTAssertEqual(only.liveness, "onAirButQuiet")
+        XCTAssertNil(only.lastGap, "fresh heartbeats leave no gap to report")
+    }
+
+    /// A broadcaster with no history store still answers 200 and the full
+    /// shape — "degraded" is a payload fact, not a transport failure, so
+    /// an outside probe can tell "up but storeless" from "socket dead".
+    @MainActor
+    func testHealthWithoutHistoryStoreIsDegradedButStill200() async throws {
+        let port: UInt16 = 18_075
+        let radio = RadioBroadcaster(port: port)
+        defer { radio.stopAll() }
+        let station = Station(name: "Degraded Health", kind: .playlist(queue: []))
+        await radio.startBroadcast(station: station, source: NeverSource())
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        let (data, response) = try await Self.fetchPayload(port: port, path: "/health")
+        let http = try XCTUnwrap(response as? HTTPURLResponse)
+        XCTAssertEqual(http.statusCode, 200)
+
+        struct Health: Decodable {
+            let status: String
+            let capabilities: [String]
+            let stations: [String]
+        }
+        let health = try JSONDecoder().decode(Health.self, from: data)
+        XCTAssertEqual(health.status, "degraded")
+        XCTAssertTrue(health.capabilities.contains("health"))
+        XCTAssertTrue(health.stations.isEmpty, "no store means no station history to report")
     }
 
     func testAACRingBufferOverflowBumpsCursor() async {
