@@ -124,4 +124,46 @@ if [ "$VERIFY_RC" -ne 0 ]; then
   exit 1
 fi
 
-echo "✓ Ratbat installed, launched, and audible at the public URL."
+# Audio proves listeners can hear the radio; this proves the OWNER can
+# still steer it from outside — the /stations/* control plane the web
+# editor depends on. Skips its write tests (with a warning, exit 0) when
+# no owner token is available, so a token-less box deploys green-with-a-
+# warning rather than green-by-omission.
+echo "→ Verifying the owner control plane from outside…"
+if "$REPO/scripts/verify-control-plane.sh" "${RATBAT_PUBLIC_URL:-https://radio.jonasjohansson.se}"; then
+  CP_RC=0
+else
+  CP_RC=$?
+fi
+if [ "$CP_RC" -ne 0 ]; then
+  echo "✗ Ratbat is serving audio, but the web control plane is broken." >&2
+  echo "  The deploy is NOT complete." >&2
+  # Same discipline as the audio verifier: the distinct exit codes are
+  # the diagnosis — route the operator to the right place, don't shrug.
+  case "$CP_RC" in
+    2) echo "  → /health is absent or incomplete: an OLD build answered. The install" >&2
+       echo "    above may not have actually replaced the running app." >&2
+       echo "    /usr/bin/log show --last 15m --predicate 'subsystem == \"se.jonasjohansson.ratbat\" AND category BEGINSWITH \"broadcaster\"'" >&2
+       ;;
+    3) echo "  → /auth is broken: the owner token was rejected, or a wrong one was" >&2
+       echo "    accepted. Check the passcode in Settings → Broadcast against" >&2
+       echo "    RATBAT_OWNER_TOKEN / ~/.ratbat-owner-token." >&2
+       ;;
+    4|5) echo "  → Station create/list/update failed — the catalogue seam. Check that a" >&2
+       echo "    music folder is configured (503 = no catalogue) and read:" >&2
+       echo "    /usr/bin/log show --last 15m --predicate 'subsystem == \"se.jonasjohansson.ratbat\" AND category BEGINSWITH \"broadcaster\"'" >&2
+       ;;
+    6|7) echo "  → The throwaway station failed to start or stop — the same listener/" >&2
+       echo "    pipeline path real stations use. Check the encode loop and resolver:" >&2
+       echo "    /usr/bin/log show --last 15m --predicate 'subsystem == \"se.jonasjohansson.ratbat\" AND category BEGINSWITH \"broadcaster\"'" >&2
+       ;;
+    8) echo "  → Delete failed or left the station behind. If cleanup could not remove" >&2
+       echo "    the zz-verify-* station, delete it by hand in the Ratbat sidebar." >&2
+       ;;
+    *) echo "  → verify-control-plane.sh exited $CP_RC." >&2 ;;
+  esac
+  echo "  Verdict history: ${RATBAT_VERIFY_LOG:-$HOME/Library/Logs/ratbat-verify.log}" >&2
+  exit 1
+fi
+
+echo "✓ Ratbat installed, launched, audible, and steerable at the public URL."
