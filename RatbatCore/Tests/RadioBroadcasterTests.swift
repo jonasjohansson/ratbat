@@ -2544,4 +2544,724 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertEqual(status, 404, "valid passcode gets past the gate to a real 404")
         XCTAssertEqual(radio.failedOwnerAttempts, 0)
     }
+
+    // MARK: - Station CRUD control plane (/stations/*)
+
+    /// Wire the catalogue seam over a real ``StationManager`` the way
+    /// `RootView` does in production — closures, never the manager itself.
+    @MainActor
+    private func installCatalogue(
+        on radio: RadioBroadcaster,
+        manager: StationManager,
+        preferences: BroadcastPreferences
+    ) {
+        radio.listStations = { manager.stations }
+        radio.createStation = { draft, name in
+            try manager.createStation(draft, name: name)
+        }
+        radio.updateStation = { id, update in
+            try manager.applyUpdate(id, update)
+        }
+        radio.deleteStation = { id in
+            guard manager.station(id: id) != nil else { return false }
+            manager.delete(id)
+            return true
+        }
+        radio.setAutoStart = { enabled, slug in
+            preferences.setAutoStart(enabled, slug: slug)
+        }
+    }
+
+    /// A `FacetedQuery` as the web client sends it: the full pinned key
+    /// set, explicit nulls included — the same shape /stations/list emits.
+    nonisolated private static func queryJSON(tags: [String]) -> String {
+        let quoted = tags.map { "\"\($0)\"" }.joined(separator: ",")
+        return "{\"genreTags\":[\(quoted)],\"yearMin\":null,\"yearMax\":null,"
+            + "\"regions\":[],\"tagMatch\":\"any\",\"popularity\":\"middle\","
+            + "\"excludeOwnedLibrary\":false,\"excludedArtists\":[]}"
+    }
+
+    /// Every `/stations/*` route is owner-gated: a wrong (or missing)
+    /// token answers 403 listener-mode before any station is even looked
+    /// up. One superset body decodes against every route's request shape.
+    @MainActor
+    func testStationRoutesRejectGuestsWith403() async throws {
+        let prefs = BroadcastPreferences()
+        prefs.resetToDefaults()
+        prefs.ownerToken = "station-crud-passcode"
+        prefs.port = 18_100
+        defer { prefs.port = 18_000 }
+        let radio = RadioBroadcaster(preferences: prefs)
+        radio.ownerThrottleStep = 0
+        defer { radio.stopAll() }
+
+        let json = "{\"token\":\"wrong\",\"station\":\"\(UUID().uuidString)\","
+            + "\"kind\":\"nts\",\"enabled\":true,\"query\":\(Self.queryJSON(tags: ["dub"]))}"
+        let body = Data(json.utf8)
+        for path in [
+            "/stations/list", "/stations/create", "/stations/update",
+            "/stations/delete", "/stations/start", "/stations/stop",
+            "/stations/autostart"
+        ] {
+            let (status, payload) = await radio.performJSONRoute(path: path, body: body)
+            XCTAssertEqual(status, 403, "\(path) must reject guests")
+            XCTAssertTrue(
+                String(data: payload, encoding: .utf8)!.contains("listener mode"),
+                "\(path) must answer listener-mode"
+            )
+        }
+    }
+
+    /// Before RootView wires the catalogue seam (no music folder chosen,
+    /// or a bare broadcaster) the owner routes answer 503 — "capable but
+    /// unavailable", which the client shows instead of hiding the panel.
+    /// Stop is the exception: it acts on the broadcaster's own pipelines
+    /// and needs no catalogue, and it is idempotent even against nothing.
+    @MainActor
+    func testStationRoutesAnswer503BeforeACatalogueIsWired() async throws {
+        let prefs = BroadcastPreferences()
+        prefs.resetToDefaults()
+        prefs.ownerToken = "station-crud-passcode"
+        prefs.port = 18_108
+        defer { prefs.port = 18_000 }
+        let radio = RadioBroadcaster(preferences: prefs)
+        defer { radio.stopAll() }
+
+        let token = prefs.ownerToken
+        let station = UUID().uuidString
+        let cases: [(String, String)] = [
+            ("/stations/list", "{\"token\":\"\(token)\"}"),
+            ("/stations/create",
+             "{\"token\":\"\(token)\",\"kind\":\"nts\",\"query\":\(Self.queryJSON(tags: ["dub"]))}"),
+            ("/stations/update", "{\"token\":\"\(token)\",\"station\":\"\(station)\"}"),
+            ("/stations/delete", "{\"token\":\"\(token)\",\"station\":\"\(station)\"}"),
+            ("/stations/start", "{\"token\":\"\(token)\",\"station\":\"\(station)\"}"),
+            ("/stations/autostart",
+             "{\"token\":\"\(token)\",\"station\":\"\(station)\",\"enabled\":true}")
+        ]
+        for (path, body) in cases {
+            let (status, payload) = await radio.performJSONRoute(path: path, body: Data(body.utf8))
+            XCTAssertEqual(status, 503, "\(path) without a catalogue")
+            XCTAssertTrue(
+                String(data: payload, encoding: .utf8)!.contains("catalogue unavailable"),
+                "\(path) message"
+            )
+        }
+        let (stopStatus, stopBody) = await radio.performJSONRoute(
+            path: "/stations/stop",
+            body: Data("{\"token\":\"\(token)\",\"station\":\"\(station)\"}".utf8)
+        )
+        XCTAssertEqual(stopStatus, 200, "stop needs no catalogue")
+        XCTAssertTrue(String(data: stopBody, encoding: .utf8)!.contains("stopped"))
+    }
+
+    /// The leak decision, enforced: a playlist station projects to
+    /// `kind`/`trackCount` and nulls — its queue of `file://` URLs, sizes
+    /// and dates never crosses the wire. And every payload carries the
+    /// same key set whatever its kind, the /now.json wire rule.
+    @MainActor
+    func testStationsListScrubsPlaylistStations() async throws {
+        let prefs = BroadcastPreferences()
+        prefs.resetToDefaults()
+        prefs.ownerToken = "station-crud-passcode"
+        prefs.port = 18_109
+        defer { prefs.port = 18_000 }
+        let radio = RadioBroadcaster(preferences: prefs)
+        defer { radio.stopAll() }
+        let manager = StationManager()
+        installCatalogue(on: radio, manager: manager, preferences: prefs)
+
+        let secret = Track(
+            url: URL(fileURLWithPath: "/secret/library/hidden-track.mp3"),
+            title: "Hidden", artist: "Private", album: "Owned",
+            duration: 61, fileSize: 12_345
+        )
+        let playlistStation = manager.create(from: Playlist(
+            name: "Owned Mix", folder: nil, tracks: [secret], children: [], kind: .folder
+        ))
+        _ = manager.createNTS(NTSStationConfig(
+            name: "Public Facets", query: FacetedQuery(genreTags: ["ambient"])
+        ))
+        prefs.setAutoStart(true, slug: playlistStation.slug)
+        defer { prefs.autoStartSlugs = [] }
+
+        let (status, payload) = await radio.performJSONRoute(
+            path: "/stations/list",
+            body: Data("{\"token\":\"\(prefs.ownerToken)\"}".utf8)
+        )
+        XCTAssertEqual(status, 200)
+        let text = String(data: payload, encoding: .utf8)!
+        XCTAssertFalse(text.contains("file://"), "queue URLs must never leave: \(text)")
+        XCTAssertFalse(text.contains("/secret"), "library paths must never leave: \(text)")
+        XCTAssertFalse(text.contains("fileSize"), "file facts must never leave: \(text)")
+        XCTAssertFalse(text.contains("dateAdded"), "file facts must never leave: \(text)")
+
+        let root = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: payload) as? [String: Any]
+        )
+        let stations = try XCTUnwrap(root["stations"] as? [[String: Any]])
+        XCTAssertEqual(stations.count, 2)
+        let expectedKeys: Set<String> = [
+            "id", "name", "slug", "kind", "broadcasting", "autoStart",
+            "query", "exploration", "sort", "shufflePool", "trackCount"
+        ]
+        for entry in stations {
+            XCTAssertEqual(
+                Set(entry.keys), expectedKeys,
+                "every kind carries the same key set"
+            )
+        }
+        let playlist = try XCTUnwrap(stations.first { $0["kind"] as? String == "playlist" })
+        XCTAssertEqual(playlist["trackCount"] as? Int, 1)
+        XCTAssertTrue(playlist["query"] is NSNull, "a fixed queue has no query")
+        XCTAssertTrue(playlist["shufflePool"] is NSNull)
+        XCTAssertEqual(playlist["autoStart"] as? Bool, true, "auto-start flag rides the payload")
+        let nts = try XCTUnwrap(stations.first { $0["kind"] as? String == "nts" })
+        let query = try XCTUnwrap(nts["query"] as? [String: Any])
+        XCTAssertEqual(query["genreTags"] as? [String], ["ambient"])
+        XCTAssertEqual(nts["broadcasting"] as? Bool, false, "idle stations appear, marked idle")
+    }
+
+    /// Create over a real socket → 201 Created, and the station is
+    /// immediately visible in a follow-up list. Also covers the CORS
+    /// preflight for a /stations/* path — same Set gates both.
+    @MainActor
+    func testStationCreateShowsUpInListAndOverTheSocket() async throws {
+        let prefs = BroadcastPreferences()
+        prefs.resetToDefaults()
+        prefs.ownerToken = "station-crud-passcode"
+        prefs.port = 18_101
+        defer { prefs.port = 18_000 }
+        let radio = RadioBroadcaster(preferences: prefs)
+        defer { radio.stopAll() }
+        let manager = StationManager()
+        // Real storage, so the test proves the HTTP create persists the
+        // way a desktop create does — not just an in-memory append.
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ratbat-web-create-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: tempRoot, withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+        manager.setStorage(root: tempRoot)
+        installCatalogue(on: radio, manager: manager, preferences: prefs)
+
+        // Bring the shared listener up — the control plane rides the same
+        // socket the streams do.
+        let filler = Station(name: "Listener Filler", kind: .playlist(queue: []))
+        await radio.startBroadcast(station: filler, source: NeverSource())
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        let preflight = try await Self.fetchRawResponse(
+            port: 18_101,
+            path: "/stations/create",
+            requestHeaders: ["Access-Control-Request-Method: POST"],
+            maxBytes: 1_024,
+            method: "OPTIONS"
+        )
+        XCTAssertTrue(preflight.contains("HTTP/1.1 204"), "Expected 204: \(preflight)")
+        XCTAssertTrue(
+            preflight.lowercased().contains("access-control-allow-origin: *"),
+            "Missing allow-origin: \(preflight)"
+        )
+
+        let response = try await Self.fetchRawResponse(
+            port: 18_101,
+            path: "/stations/create",
+            requestHeaders: ["Content-Type: application/json"],
+            maxBytes: 4_096,
+            method: "POST",
+            body: "{\"token\":\"\(prefs.ownerToken)\",\"kind\":\"nts\","
+                + "\"name\":\"Web Made\",\"query\":\(Self.queryJSON(tags: ["ambient", "drone"]))}"
+        )
+        XCTAssertTrue(response.contains("HTTP/1.1 201 Created"), "Expected 201: \(response)")
+        XCTAssertTrue(response.contains("\"kind\":\"nts\""), "payload names its kind: \(response)")
+        XCTAssertTrue(response.contains("\"slug\":\"web-made\""), "payload carries the slug: \(response)")
+
+        let (listStatus, listPayload) = await radio.performJSONRoute(
+            path: "/stations/list",
+            body: Data("{\"token\":\"\(prefs.ownerToken)\"}".utf8)
+        )
+        XCTAssertEqual(listStatus, 200)
+        XCTAssertTrue(
+            String(data: listPayload, encoding: .utf8)!.contains("Web Made"),
+            "a created station is immediately listable"
+        )
+        XCTAssertEqual(manager.stations.count, 1, "and it landed in the real catalogue")
+
+        // Persistence round-trip: the HTTP create wrote the same
+        // `.ratbat-stations.json` a desktop create would.
+        let stored = try String(
+            contentsOf: tempRoot.appendingPathComponent(StationStore.filename),
+            encoding: .utf8
+        )
+        XCTAssertTrue(stored.contains("Web Made"), "created station reached disk")
+    }
+
+    /// The create-time validation gauntlet: unknown kinds (including the
+    /// not-yet-shipped libraryRadio and the desktop-only playlist), empty
+    /// tags, a blank provided name, and a Last.fm create without an API
+    /// key are all 422s with a reason — never opaque 400s.
+    @MainActor
+    func testStationCreateValidationAnswers422() async throws {
+        let prefs = BroadcastPreferences()
+        prefs.resetToDefaults()
+        prefs.ownerToken = "station-crud-passcode"
+        prefs.port = 18_110
+        defer { prefs.port = 18_000 }
+        let radio = RadioBroadcaster(preferences: prefs)
+        defer { radio.stopAll() }
+        let manager = StationManager()
+        installCatalogue(on: radio, manager: manager, preferences: prefs)
+
+        let savedKey = prefs.lastFMAPIKey
+        prefs.lastFMAPIKey = ""
+        defer { prefs.lastFMAPIKey = savedKey }
+
+        let token = prefs.ownerToken
+        let tags = Self.queryJSON(tags: ["dub"])
+        let cases: [(body: String, fragment: String, label: String)] = [
+            ("{\"token\":\"\(token)\",\"kind\":\"libraryRadio\",\"query\":\(tags)}",
+             "unknown kind", "a kind this build predates"),
+            ("{\"token\":\"\(token)\",\"kind\":\"playlist\",\"query\":\(tags)}",
+             "unknown kind", "playlist stations are desktop-only"),
+            ("{\"token\":\"\(token)\",\"kind\":\"nts\",\"query\":\(Self.queryJSON(tags: []))}",
+             "tag", "empty tags"),
+            ("{\"token\":\"\(token)\",\"kind\":\"nts\"}",
+             "tag", "missing query"),
+            ("{\"token\":\"\(token)\",\"kind\":\"nts\",\"name\":\"   \",\"query\":\(tags)}",
+             "name", "blank provided name"),
+            ("{\"token\":\"\(token)\",\"kind\":\"lastFM\",\"query\":\(tags)}",
+             "API key", "Last.fm without a key")
+        ]
+        for testCase in cases {
+            let (status, payload) = await radio.performJSONRoute(
+                path: "/stations/create", body: Data(testCase.body.utf8)
+            )
+            let text = String(data: payload, encoding: .utf8)!
+            XCTAssertEqual(status, 422, "\(testCase.label): \(text)")
+            XCTAssertTrue(text.contains(testCase.fragment), "\(testCase.label): \(text)")
+        }
+        XCTAssertTrue(manager.stations.isEmpty, "nothing may survive a refused create")
+    }
+
+    /// A station id that parses but resolves to nothing is 410 Gone — the
+    /// route exists, the station doesn't — while an unparseable id stays
+    /// a plain 400. The distinction is what lets the client say "station
+    /// no longer exists" instead of "something broke".
+    @MainActor
+    func testStationUpdateAnswers410ForUnknownAnd400ForUnparseableIds() async throws {
+        let prefs = BroadcastPreferences()
+        prefs.resetToDefaults()
+        prefs.ownerToken = "station-crud-passcode"
+        prefs.port = 18_111
+        defer { prefs.port = 18_000 }
+        let radio = RadioBroadcaster(preferences: prefs)
+        defer { radio.stopAll() }
+        let manager = StationManager()
+        installCatalogue(on: radio, manager: manager, preferences: prefs)
+
+        let (gone, goneBody) = await radio.performJSONRoute(
+            path: "/stations/update",
+            body: Data("{\"token\":\"\(prefs.ownerToken)\",\"station\":\"\(UUID().uuidString)\",\"name\":\"X\"}".utf8)
+        )
+        XCTAssertEqual(gone, 410)
+        XCTAssertTrue(String(data: goneBody, encoding: .utf8)!.contains("no longer exists"))
+
+        let (bad, _) = await radio.performJSONRoute(
+            path: "/stations/update",
+            body: Data("{\"token\":\"\(prefs.ownerToken)\",\"station\":\"not-a-uuid\",\"name\":\"X\"}".utf8)
+        )
+        XCTAssertEqual(bad, 400)
+
+        // Same 410 posture over the socket, so the status text is on the
+        // wire too (the table entry is load-bearing per the review).
+        let filler = Station(name: "Gone Filler", kind: .playlist(queue: []))
+        await radio.startBroadcast(station: filler, source: NeverSource())
+        try await Task.sleep(nanoseconds: 400_000_000)
+        let response = try await Self.fetchRawResponse(
+            port: 18_111,
+            path: "/stations/delete",
+            requestHeaders: ["Content-Type: application/json"],
+            maxBytes: 1_024,
+            method: "POST",
+            body: "{\"token\":\"\(prefs.ownerToken)\",\"station\":\"\(UUID().uuidString)\"}"
+        )
+        XCTAssertTrue(response.contains("HTTP/1.1 410 Gone"), "Expected 410: \(response)")
+    }
+
+    /// The applyNow split, observed from outside: `false` persists the
+    /// edit while the live pipeline keeps its old config until its next
+    /// deliberate restart; `true` restarts the pipeline — audibly — and
+    /// the station stays on air afterwards. Persist-first either way.
+    @MainActor
+    func testStationUpdatePersistsFirstAndRestartsOnlyWhenAsked() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let prefs = BroadcastPreferences()
+        prefs.resetToDefaults()
+        prefs.ownerToken = "station-crud-passcode"
+        prefs.port = 18_102
+        defer { prefs.port = 18_000 }
+        let radio = RadioBroadcaster(preferences: prefs)
+        defer { radio.stopAll() }
+        let manager = StationManager()
+        installCatalogue(on: radio, manager: manager, preferences: prefs)
+        let station = manager.create(from: Playlist(
+            name: "Live Edit", folder: nil, tracks: tracks, children: [], kind: .folder
+        ))
+        await radio.startBroadcast(station: station)
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+
+        // applyNow:false — the catalogue changes, the pipeline doesn't.
+        let (savedStatus, _) = await radio.performJSONRoute(
+            path: "/stations/update",
+            body: Data("{\"token\":\"\(prefs.ownerToken)\",\"station\":\"\(station.id.uuidString)\",\"name\":\"Saved Only\",\"applyNow\":false}".utf8)
+        )
+        XCTAssertEqual(savedStatus, 200)
+        XCTAssertEqual(manager.stations[0].name, "Saved Only", "persisted immediately")
+        let before = try await Self.fetchRawResponse(
+            port: 18_102, path: "/now.json", requestHeaders: [], maxBytes: 8_192
+        )
+        XCTAssertTrue(
+            before.contains("radio-based-on-live-edit"),
+            "without applyNow the live pipeline keeps its old config: \(before)"
+        )
+
+        // applyNow:true — the pipeline is rebuilt from the saved config
+        // and the station is still on air.
+        let (restartStatus, restartPayload) = await radio.performJSONRoute(
+            path: "/stations/update",
+            body: Data("{\"token\":\"\(prefs.ownerToken)\",\"station\":\"\(station.id.uuidString)\",\"name\":\"Renamed Live\",\"applyNow\":true}".utf8)
+        )
+        XCTAssertEqual(restartStatus, 200)
+        XCTAssertTrue(
+            String(data: restartPayload, encoding: .utf8)!.contains("\"broadcasting\":true"),
+            "the envelope reflects the post-restart state"
+        )
+        XCTAssertTrue(radio.isBroadcasting(stationID: station.id), "restart, not stop")
+        let after = try await Self.fetchRawResponse(
+            port: 18_102, path: "/now.json", requestHeaders: [], maxBytes: 8_192
+        )
+        XCTAssertTrue(
+            after.contains("renamed-live"),
+            "applyNow rebuilt the pipeline on the new config: \(after)"
+        )
+    }
+
+    /// Deleting a live station stops it first (a deliberate owner stop —
+    /// it must not resume at next launch), removes it from the catalogue,
+    /// and leaves the listener serving — the control plane must survive
+    /// zero stations or the web could never start one again.
+    @MainActor
+    func testStationDeleteStopsTheLiveStationAndKeepsTheListenerServing() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let prefs = BroadcastPreferences()
+        prefs.resetToDefaults()
+        prefs.ownerToken = "station-crud-passcode"
+        prefs.port = 18_103
+        defer { prefs.port = 18_000 }
+        let radio = RadioBroadcaster(preferences: prefs)
+        defer { radio.stopAll() }
+        let manager = StationManager()
+        installCatalogue(on: radio, manager: manager, preferences: prefs)
+        let station = manager.create(from: Playlist(
+            name: "Doomed", folder: nil, tracks: tracks, children: [], kind: .folder
+        ))
+        await radio.startBroadcast(station: station)
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+        XCTAssertTrue(radio.isBroadcasting(stationID: station.id))
+
+        let response = try await Self.fetchRawResponse(
+            port: 18_103,
+            path: "/stations/delete",
+            requestHeaders: ["Content-Type: application/json"],
+            maxBytes: 1_024,
+            method: "POST",
+            body: "{\"token\":\"\(prefs.ownerToken)\",\"station\":\"\(station.id.uuidString)\"}"
+        )
+        XCTAssertTrue(response.contains("HTTP/1.1 200"), "Expected 200: \(response)")
+        XCTAssertTrue(response.contains("\"status\":\"deleted\""), "Expected deleted: \(response)")
+        XCTAssertFalse(radio.isBroadcasting(stationID: station.id), "stopped before deleting")
+        XCTAssertTrue(manager.stations.isEmpty, "removed from the catalogue")
+
+        // Zero stations, listener still answering — the S1 guarantee the
+        // whole web-stop story depends on.
+        let now = try await Self.fetchRawResponse(
+            port: 18_103, path: "/now.json", requestHeaders: [], maxBytes: 1_024
+        )
+        XCTAssertTrue(now.contains("HTTP/1.1 200"), "listener must survive: \(now)")
+    }
+
+    /// Start and stop over the socket, full cycle, both idempotent: a
+    /// double-start answers the same 200 a fresh one does, and a stop of
+    /// an already-idle station is still "stopped" — a double-tap on a
+    /// phone must never surface as an error.
+    @MainActor
+    func testStationStartAndStopAreIdempotentOverTheControlPlane() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let prefs = BroadcastPreferences()
+        prefs.resetToDefaults()
+        prefs.ownerToken = "station-crud-passcode"
+        prefs.port = 18_104
+        defer { prefs.port = 18_000 }
+        let radio = RadioBroadcaster(preferences: prefs)
+        defer { radio.stopAll() }
+        let manager = StationManager()
+        installCatalogue(on: radio, manager: manager, preferences: prefs)
+        let station = manager.create(from: Playlist(
+            name: "Cycled", folder: nil, tracks: tracks, children: [], kind: .folder
+        ))
+        // The listener rides the first start, so raise it with a filler —
+        // the control plane can then start the *idle* target over HTTP.
+        let filler = Station(name: "Cycle Filler", kind: .playlist(queue: []))
+        await radio.startBroadcast(station: filler, source: NeverSource())
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        func post(_ path: String, station id: String) async throws -> String {
+            try await Self.fetchRawResponse(
+                port: 18_104,
+                path: path,
+                requestHeaders: ["Content-Type: application/json"],
+                maxBytes: 1_024,
+                method: "POST",
+                body: "{\"token\":\"\(prefs.ownerToken)\",\"station\":\"\(id)\"}"
+            )
+        }
+
+        let started = try await post("/stations/start", station: station.id.uuidString)
+        XCTAssertTrue(started.contains("HTTP/1.1 200"), "Expected 200: \(started)")
+        XCTAssertTrue(started.contains("\"status\":\"started\""), "Expected started: \(started)")
+        XCTAssertTrue(radio.isBroadcasting(stationID: station.id))
+
+        let startedAgain = try await post("/stations/start", station: station.id.uuidString)
+        XCTAssertTrue(
+            startedAgain.contains("\"status\":\"started\""),
+            "double-start is idempotent: \(startedAgain)"
+        )
+
+        let stopped = try await post("/stations/stop", station: station.id.uuidString)
+        XCTAssertTrue(stopped.contains("\"status\":\"stopped\""), "Expected stopped: \(stopped)")
+        XCTAssertFalse(radio.isBroadcasting(stationID: station.id))
+
+        let stoppedAgain = try await post("/stations/stop", station: station.id.uuidString)
+        XCTAssertTrue(
+            stoppedAgain.contains("\"status\":\"stopped\""),
+            "stop of an idle station is idempotent: \(stoppedAgain)"
+        )
+
+        let unknown = try await post("/stations/start", station: UUID().uuidString)
+        XCTAssertTrue(unknown.contains("HTTP/1.1 410 Gone"), "Expected 410: \(unknown)")
+    }
+
+    /// The auto-start toggle writes real per-machine preference state
+    /// through the seam — and reads back through the same store the
+    /// launch resume uses, so a web toggle survives to the next boot.
+    @MainActor
+    func testAutoStartTogglePersistsThroughThePreferencesSeam() async throws {
+        let prefs = BroadcastPreferences()
+        prefs.resetToDefaults()
+        prefs.ownerToken = "station-crud-passcode"
+        prefs.port = 18_112
+        defer {
+            prefs.autoStartSlugs = []
+            prefs.port = 18_000
+        }
+        let radio = RadioBroadcaster(preferences: prefs)
+        defer { radio.stopAll() }
+        let manager = StationManager()
+        installCatalogue(on: radio, manager: manager, preferences: prefs)
+        let station = manager.createNTS(NTSStationConfig(
+            name: "Morning Auto", query: FacetedQuery(genreTags: ["ambient"])
+        ))
+
+        func toggle(_ enabled: Bool, station id: String) async -> (Int, Data) {
+            await radio.performJSONRoute(
+                path: "/stations/autostart",
+                body: Data("{\"token\":\"\(prefs.ownerToken)\",\"station\":\"\(id)\",\"enabled\":\(enabled)}".utf8)
+            )
+        }
+
+        let (onStatus, onBody) = await toggle(true, station: station.id.uuidString)
+        XCTAssertEqual(onStatus, 200)
+        XCTAssertTrue(String(data: onBody, encoding: .utf8)!.contains("\"status\":\"ok\""))
+        XCTAssertTrue(prefs.isAutoStart(slug: station.slug), "membership written")
+
+        // And the flag comes back on the list payload.
+        let (_, listPayload) = await radio.performJSONRoute(
+            path: "/stations/list",
+            body: Data("{\"token\":\"\(prefs.ownerToken)\"}".utf8)
+        )
+        XCTAssertTrue(
+            String(data: listPayload, encoding: .utf8)!.contains("\"autoStart\":true")
+        )
+
+        let (offStatus, _) = await toggle(false, station: station.id.uuidString)
+        XCTAssertEqual(offStatus, 200)
+        XCTAssertFalse(prefs.isAutoStart(slug: station.slug), "membership cleared")
+
+        let (goneStatus, _) = await toggle(true, station: UUID().uuidString)
+        XCTAssertEqual(goneStatus, 410, "unknown station cannot gain a flag")
+    }
+
+    // MARK: - /vocab
+
+    /// `GET /vocab` is public and cacheable — compiled-in vocabulary,
+    /// nothing about this owner's stations.
+    @MainActor
+    func testVocabEndpointServesTheStationFormVocabulary() async throws {
+        let port: UInt16 = 18_105
+        let radio = RadioBroadcaster(port: port)
+        defer { radio.stopAll() }
+        let filler = Station(name: "Vocab Filler", kind: .playlist(queue: []))
+        await radio.startBroadcast(station: filler, source: NeverSource())
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        let response = try await Self.fetchRawResponse(
+            port: port, path: "/vocab", requestHeaders: [], maxBytes: 16_384
+        )
+        XCTAssertTrue(response.contains("HTTP/1.1 200"), "Expected 200: \(response)")
+        XCTAssertTrue(
+            response.contains("Cache-Control: public, max-age=3600"),
+            "vocab is cacheable: \(response)"
+        )
+        XCTAssertTrue(response.contains("deepCuts"), "enum spellings ride the wire: \(response)")
+    }
+
+    /// The vocab payload's shape, pinned: `tags` keyed by wire kind with
+    /// the palettes verbatim, enum spellings from the enums themselves,
+    /// bare ISO alpha-2 region codes (the client localizes names), and a
+    /// `kinds` list that deliberately excludes libraryRadio until it ships.
+    func testVocabPayloadMatchesTheSwiftVocabulary() throws {
+        let payload = RadioBroadcaster.buildVocabPayload()
+        let root = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: payload) as? [String: Any]
+        )
+        XCTAssertEqual(
+            Set(root.keys),
+            ["tags", "tagMatch", "popularity", "bandcampSort", "kinds", "regions"]
+        )
+        let tags = try XCTUnwrap(root["tags"] as? [String: [String]])
+        XCTAssertEqual(tags["nts"], StationTagPalette.nts)
+        XCTAssertEqual(tags["lastFM"], StationTagPalette.lastFM)
+        XCTAssertEqual(tags["bandcamp"], StationTagPalette.bandcamp)
+        XCTAssertEqual(root["tagMatch"] as? [String], ["any", "all"])
+        XCTAssertEqual(root["popularity"] as? [String], ["hits", "middle", "deepCuts"])
+        XCTAssertEqual(root["bandcampSort"] as? [String], ["date", "pop"])
+        XCTAssertEqual(root["kinds"] as? [String], ["nts", "lastFM", "bandcamp"])
+        let regions = try XCTUnwrap(root["regions"] as? [String])
+        XCTAssertTrue(regions.contains("JP"))
+        XCTAssertTrue(regions.allSatisfy { $0.count == 2 }, "bare alpha-2 codes only")
+        XCTAssertEqual(regions, regions.sorted(), "deterministic wire ordering")
+    }
+
+    /// The capability anchor grows with the build: this one answers the
+    /// station CRUD routes and /vocab, and /health says so.
+    @MainActor
+    func testHealthAdvertisesTheControlPlaneCapabilities() async throws {
+        XCTAssertEqual(
+            RadioBroadcaster.healthCapabilities,
+            ["health", "stations", "vocab"]
+        )
+        let radio = RadioBroadcaster(port: 18_113)
+        defer { radio.stopAll() }
+        struct Health: Decodable { let capabilities: [String] }
+        let health = try JSONDecoder().decode(
+            Health.self, from: await radio.buildHealthPayload()
+        )
+        XCTAssertEqual(health.capabilities, ["health", "stations", "vocab"])
+    }
+
+    // MARK: - SSE `stations` events
+
+    /// Subscribe to `/events` and collect whatever arrives for `seconds`.
+    /// Unlike `fetchRawResponse` this does not stop at the header block —
+    /// SSE frames trickle in over time and the interesting one is late.
+    nonisolated private static func collectSSE(
+        port: UInt16, seconds: TimeInterval
+    ) async -> String {
+        let url = URL(string: "http://127.0.0.1:\(port)/events")!
+        let config = URLSessionConfiguration.ephemeral
+        // The request timeout backstops the deadline check below, which
+        // only runs when a byte actually arrives.
+        config.timeoutIntervalForRequest = seconds + 2
+        config.timeoutIntervalForResource = seconds + 2
+        let session = URLSession(configuration: config)
+        var data = Data()
+        let deadline = Date().addingTimeInterval(seconds)
+        do {
+            let (bytes, _) = try await session.bytes(from: url)
+            for try await byte in bytes {
+                data.append(byte)
+                if Date() >= deadline { break }
+            }
+        } catch {
+            // Timeout or cancellation — keep what we got.
+        }
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    /// Starting a station mid-stream pushes a named `stations` nudge with
+    /// an empty body — a notification, never the owner catalogue, because
+    /// `/events` is public.
+    @MainActor
+    func testEventsStreamAnnouncesStationChanges() async throws {
+        let port: UInt16 = 18_106
+        let radio = RadioBroadcaster(port: port)
+        defer { radio.stopAll() }
+        let first = Station(name: "SSE First", kind: .playlist(queue: []))
+        await radio.startBroadcast(station: first, source: NeverSource())
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        let collector = Task { await Self.collectSSE(port: port, seconds: 4) }
+        try await Task.sleep(nanoseconds: 500_000_000)
+
+        let second = Station(name: "SSE Second", kind: .playlist(queue: []))
+        await radio.startBroadcast(station: second, source: NeverSource())
+
+        let text = await collector.value
+        XCTAssertTrue(
+            text.contains("event: stations\ndata: {}"),
+            "a start must push the named nudge with an empty body, got: \(text)"
+        )
+    }
+
+    /// `registerStations` pushes the nudge only when the catalogue it is
+    /// handed actually differs from the last registration — RootView
+    /// re-registers on every @Published tick, and identical lists must
+    /// not spam every web client into a re-fetch.
+    @MainActor
+    func testRegisterStationsPushesOnlyOnActualCatalogueChange() async throws {
+        let port: UInt16 = 18_107
+        let radio = RadioBroadcaster(port: port)
+        defer { radio.stopAll() }
+        let live = Station(name: "Register Live", kind: .playlist(queue: []))
+        await radio.startBroadcast(station: live, source: NeverSource())
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        let collector = Task { await Self.collectSSE(port: port, seconds: 3) }
+        try await Task.sleep(nanoseconds: 500_000_000)
+
+        let catalogue = [
+            live,
+            Station(name: "Desktop Made", kind: .playlist(queue: []))
+        ]
+        radio.registerStations(catalogue)
+        try await Task.sleep(nanoseconds: 500_000_000)
+        // The same list again — RootView's onChange re-fire — is not a
+        // change and must not push.
+        radio.registerStations(catalogue)
+
+        let text = await collector.value
+        let nudges = text.components(separatedBy: "event: stations").count - 1
+        XCTAssertEqual(
+            nudges, 1,
+            "one catalogue change, one nudge — got \(nudges) in: \(text)"
+        )
+    }
 }

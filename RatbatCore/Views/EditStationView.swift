@@ -185,17 +185,19 @@ public struct EditStationView: View {
     private func save() {
         saving = true
         let trimmed = name.trimmingCharacters(in: .whitespaces)
-        if !trimmed.isEmpty, trimmed != station.name {
-            stations.rename(station.id, to: trimmed)
-        }
-        var updated = stations.updateQuery(station.id, to: query)
-        if isBandcamp {
-            updated = stations.updateBandcampSort(station.id, to: sort) ?? updated
-        }
-        if isLastFM {
-            updated = stations.updateExploration(station.id, to: exploration) ?? updated
-        }
-        guard let updated else {
+        // One atomic mutation through the same `applyUpdate` the web
+        // `/stations/update` route rides — one persist, one @Published
+        // tick, and no way for the sheet and the web to drift on edit
+        // semantics. A throw is unreachable from this sheet (the confirm
+        // button is disabled with no tags, and playlist stations never
+        // get here), so `try?` + bail is an acknowledgement, not a path.
+        var update = StationUpdate(
+            name: (trimmed.isEmpty || trimmed == station.name) ? nil : trimmed,
+            query: query
+        )
+        if isBandcamp { update.sort = sort }
+        if isLastFM { update.exploration = exploration }
+        guard let updated = try? stations.applyUpdate(station.id, update) else {
             saving = false
             dismiss()
             return

@@ -403,8 +403,34 @@ public final class RadioBroadcaster: ObservableObject {
     // MARK: - Config
 
     private let port: NWEndpoint.Port
-    private let preferences: BroadcastPreferences
+    /// Internal (not private) because the `/stations/*` route handlers
+    /// live in StationWire.swift — same type, different file — and read
+    /// the owner token, Last.fm key and auto-start membership off it.
+    let preferences: BroadcastPreferences
     private var preferencesSubscription: AnyCancellable?
+
+    // MARK: - Catalogue seam
+
+    /// Injected catalogue capabilities for the web control plane. The
+    /// broadcaster deliberately does not hold `StationManager` (see the
+    /// comment at ``stationNames``) — `RootView` wires these closures at
+    /// storage-attach time, the same idiom as `selectionPolicyProvider`.
+    /// All `nil` until then; every `/stations/*` handler that needs one
+    /// answers `503 catalogue unavailable` while it is.
+    public var listStations: (@MainActor () -> [Station])?
+    /// Create a validated generative station (throws
+    /// ``StationManager/StationEditError``); the returned station carries
+    /// its actual, possibly collision-bumped, name.
+    public var createStation: (@MainActor (StationDraft, String?) throws -> Station)?
+    /// Apply a sparse ``StationUpdate`` (throws the same error set).
+    public var updateStation: (@MainActor (Station.ID, StationUpdate) throws -> Station)?
+    /// Remove a station; `false` means the id resolved to nothing.
+    public var deleteStation: (@MainActor (Station.ID) -> Bool)?
+    /// Flip a station's launch-time auto-start flag (enabled, slug).
+    /// Auto-start membership lives in slug-keyed per-machine preferences,
+    /// so the write goes through the seam like every other mutation the
+    /// web can cause — the broadcaster stays a reader.
+    public var setAutoStart: (@MainActor (Bool, String) -> Void)?
 
     /// Failed-attempt throttle state for ``ownerGate(_:)``. The three
     /// knobs are `var`s rather than constants only so the tests that
@@ -510,6 +536,13 @@ public final class RadioBroadcaster: ObservableObject {
     /// recomputed from the name alone (its empty-name fallback embeds the
     /// station's own uuid), so it has to be remembered like the name is.
     private var stationSlugs: [Station.ID: String] = [:]
+    /// The list handed to the most recent ``registerStations(_:)`` call,
+    /// verbatim. Exists only so the next call can tell "the catalogue
+    /// actually changed" from "RootView re-registered the same list" and
+    /// push the `stations` SSE nudge only for the former. Full `Station`
+    /// values, not names — a query-only edit changes nothing about a
+    /// station's name or slug but is still a change the web must hear.
+    private var lastRegisteredStations: [Station] = []
     /// When this broadcaster came up. `/health` reports the difference as
     /// `uptimeSeconds` — the broadcaster lives for the whole process, so
     /// this is effectively app uptime, which is what "● on air · 3d 4h"
@@ -1073,6 +1106,9 @@ public final class RadioBroadcaster: ObservableObject {
         logger.info(
             "station broadcast started: \(station.slug, privacy: .public) on port \(self.port.rawValue, privacy: .public)"
         )
+        // Every start — web, desktop, launch resume — is a station-set
+        // change the web should hear about without polling.
+        pushStationsSSE()
     }
 
     /// Take a station off air and put it straight back on with the value
@@ -1176,6 +1212,10 @@ public final class RadioBroadcaster: ObservableObject {
         }
 
         logger.info("station broadcast stopped: \(pipeline.station.slug, privacy: .public)")
+        // One push point covers every way a station leaves the air —
+        // owner stop, restart, ran-dry, delete — because they all funnel
+        // through here.
+        pushStationsSSE()
     }
 
     /// Stop every running broadcast and tear the listener down. Idempotent.
@@ -1215,6 +1255,14 @@ public final class RadioBroadcaster: ObservableObject {
     /// bookkeeping update: it never starts, stops or restarts anything, and
     /// stations it doesn't mention are left exactly as they are.
     public func registerStations(_ stations: [Station]) {
+        // A *desktop-side* create/rename/edit/delete reaches web clients
+        // through this call (RootView re-registers on every catalogue
+        // change), so an actual change gets an SSE nudge. Compared
+        // against the previous registration, not `stationNames` — that
+        // map deliberately keeps deleted stations (so /history can still
+        // name them), which would hide exactly the deletes we're after.
+        let changed = lastRegisteredStations != stations
+        lastRegisteredStations = stations
         for station in stations {
             stationNames[station.id] = station.name
             stationSlugs[station.id] = station.slug
@@ -1236,6 +1284,9 @@ public final class RadioBroadcaster: ObservableObject {
                     "station renamed while live: \(previousSlug, privacy: .public) → \(station.slug, privacy: .public)"
                 )
             }
+        }
+        if changed {
+            pushStationsSSE()
         }
         objectWillChange.send()
     }
@@ -1741,6 +1792,28 @@ public final class RadioBroadcaster: ObservableObject {
                 return
             }
 
+            // Station-form vocabulary — tag palettes, enum spellings,
+            // region codes. Public and cacheable: it is compiled-in
+            // constants, nothing about this owner's stations, and an
+            // hour of client caching spares the tunnel a request the
+            // answer to which changes once per deploy at most.
+            if path == "/vocab" {
+                _ = await Self.send(
+                    data: Self.buildHTTPResponse(
+                        status: 200,
+                        headers: [
+                            "Content-Type": "application/json",
+                            "Access-Control-Allow-Origin": "*",
+                            "Cache-Control": "public, max-age=3600"
+                        ],
+                        body: Self.buildVocabPayload()
+                    ),
+                    on: connection
+                )
+                connection.cancel()
+                return
+            }
+
             // Deploy-verification and capability surface. No auth, same
             // posture as /now.json: it names only stations that have been
             // on air, which were public knowledge while they were. Serves
@@ -1989,6 +2062,24 @@ public final class RadioBroadcaster: ObservableObject {
         }
     }
 
+    /// Tell every `/events` subscriber the station picture changed —
+    /// something started, stopped, or the catalogue itself mutated.
+    ///
+    /// The body is deliberately an empty object: `/events` is public,
+    /// and the owner catalogue must never ride it. The event is a nudge,
+    /// not a snapshot — clients re-fetch what they are entitled to
+    /// (public `/now.json`, owner `/stations/list`) on receipt.
+    func pushStationsSSE() {
+        guard !sseSubscribers.isEmpty else { return }
+        let event = Self.sseEvent(Data("{}".utf8), name: "stations")
+        for (id, conn) in sseSubscribers {
+            Task { [weak self] in
+                let ok = await Self.send(data: event, on: conn)
+                if !ok { await MainActor.run { self?.removeSSE(id) } }
+            }
+        }
+    }
+
     /// Frame a JSON payload as a single SSE event. SSE is line-oriented
     /// and terminates an event with a blank line; our payload is
     /// single-line JSON so one `data:` line suffices. `name` becomes an
@@ -2014,7 +2105,10 @@ public final class RadioBroadcaster: ObservableObject {
     /// both, so a new route can never ship answering POSTs while
     /// stonewalling the preflight browsers send first (or vice versa).
     nonisolated static let jsonPostPaths: Set<String> = [
-        "/auth", "/like", "/skip", "/next", "/boost", "/unlike"
+        "/auth", "/like", "/skip", "/next", "/boost", "/unlike",
+        "/stations/list", "/stations/create", "/stations/update",
+        "/stations/delete", "/stations/start", "/stations/stop",
+        "/stations/autostart"
     ]
 
     /// Ceiling on a JSON POST body. The largest legitimate payload today
@@ -2098,6 +2192,42 @@ public final class RadioBroadcaster: ObservableObject {
                 return Self.badRequest()
             }
             return await performUnlikeAsync(stationID: stationID, token: req.token)
+        case "/stations/list":
+            // The owner's full catalogue, idle stations included. Token
+            // is the whole body — same envelope as /auth.
+            return await performStationsListAsync(
+                token: (try? decoder.decode(AuthRequest.self, from: body))?.token
+            )
+        case "/stations/create":
+            guard let req = try? decoder.decode(StationCreateRequest.self, from: body) else {
+                return Self.badRequest()
+            }
+            return await performStationCreateAsync(req)
+        case "/stations/update":
+            guard let req = try? decoder.decode(StationUpdateRequest.self, from: body) else {
+                return Self.badRequest()
+            }
+            return await performStationUpdateAsync(req)
+        case "/stations/delete":
+            guard let req = try? decoder.decode(StationActionRequest.self, from: body) else {
+                return Self.badRequest()
+            }
+            return await performStationDeleteAsync(req)
+        case "/stations/start":
+            guard let req = try? decoder.decode(StationActionRequest.self, from: body) else {
+                return Self.badRequest()
+            }
+            return await performStationStartAsync(req)
+        case "/stations/stop":
+            guard let req = try? decoder.decode(StationActionRequest.self, from: body) else {
+                return Self.badRequest()
+            }
+            return await performStationStopAsync(req)
+        case "/stations/autostart":
+            guard let req = try? decoder.decode(StationAutoStartRequest.self, from: body) else {
+                return Self.badRequest()
+            }
+            return await performStationAutoStartAsync(req)
         default:
             // Unreachable while dispatch is gated on ``jsonPostPaths``,
             // but a path added to the set without a case must land here
@@ -3048,7 +3178,7 @@ public final class RadioBroadcaster: ObservableObject {
     /// Append-only: a control appears on the web iff its capability is
     /// listed, so entries are added as features land (`stations` will
     /// join with the CRUD routes) and never renamed.
-    nonisolated static let healthCapabilities = ["health"]
+    nonisolated static let healthCapabilities = ["health", "stations", "vocab"]
     /// Window over which `/health` judges each station's liveness.
     /// Ten minutes ≈ a handful of heartbeats: long enough that one
     /// missed beat doesn't flap the answer, short enough to notice an

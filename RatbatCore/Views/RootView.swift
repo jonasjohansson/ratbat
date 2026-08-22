@@ -205,6 +205,32 @@ public struct RootView: View {
                             BroadcastPreferences.shared.setAutoStart(false, slug: slug)
                             BroadcastPreferences.shared.forgetLive(slug: slug)
                         }
+                        // Catalogue capabilities for the web control
+                        // plane (/stations/*). Closures, not a
+                        // StationManager handle — the broadcaster
+                        // deliberately never holds the manager, same
+                        // idiom as selectionPolicyProvider. Desktop
+                        // reflection of web mutations is free: every
+                        // closure goes through the manager, whose
+                        // @Published list feeds the onChange below.
+                        radio.listStations = { stations.stations }
+                        radio.createStation = { draft, name in
+                            try stations.createStation(draft, name: name)
+                        }
+                        radio.updateStation = { id, update in
+                            try stations.applyUpdate(id, update)
+                        }
+                        radio.deleteStation = { id in
+                            guard stations.station(id: id) != nil else { return false }
+                            stations.delete(id)
+                            return true
+                        }
+                        // Auto-start membership is slug-keyed per-machine
+                        // preference state — the same store the slug
+                        // lifecycle closures above keep consistent.
+                        radio.setAutoStart = { enabled, slug in
+                            BroadcastPreferences.shared.setAutoStart(enabled, slug: slug)
+                        }
                         // The broadcaster names history rows and live
                         // stations from this catalogue — without it a row
                         // for an idle station comes back nameless.

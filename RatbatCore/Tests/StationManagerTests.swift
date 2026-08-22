@@ -244,4 +244,239 @@ final class StationManagerTests: XCTestCase {
         XCTAssertEqual(manager.stations[0].kind, playlistStation.kind)
         XCTAssertEqual(manager.stations[1].kind, ntsStation.kind)
     }
+
+    // MARK: - station(id:)
+
+    func testStationByIDFindsMatch() {
+        let manager = StationManager()
+        let a = manager.create(from: makePlaylist(name: "Jazz"))
+        _ = manager.create(from: makePlaylist(name: "Blues"))
+
+        XCTAssertEqual(manager.station(id: a.id)?.id, a.id)
+        XCTAssertNil(manager.station(id: UUID()))
+    }
+
+    // MARK: - Validated creation (the single surface)
+
+    func testCreateStationFallsBackToSuggestedNameAndUniquifies() throws {
+        let manager = StationManager()
+        let query = FacetedQuery(genreTags: ["techno"])
+
+        let first = try manager.createStation(
+            .nts(query: query, shufflePool: true), name: nil
+        )
+        XCTAssertEqual(first.name, query.suggestedName)
+
+        // A second nameless creation with the same query collides on slug
+        // and gets the desktop's "(2)" bump, exactly like the old creators.
+        let second = try manager.createStation(
+            .nts(query: query, shufflePool: true), name: nil
+        )
+        XCTAssertTrue(second.name.contains("(2)"), "got: \(second.name)")
+        XCTAssertNotEqual(first.slug, second.slug)
+    }
+
+    func testCreateStationThrowsOnEmptyTagsForEveryKind() {
+        let manager = StationManager()
+        let empty = FacetedQuery(genreTags: [])
+        let drafts: [StationDraft] = [
+            .nts(query: empty, shufflePool: true),
+            .lastFM(query: empty, shufflePool: true, exploration: 0.25),
+            .bandcamp(query: empty, sort: .date, shufflePool: true)
+        ]
+        for draft in drafts {
+            XCTAssertThrowsError(try manager.createStation(draft, name: "Named")) { error in
+                XCTAssertEqual(
+                    error as? StationManager.StationEditError, .emptyGenreTags
+                )
+            }
+        }
+        XCTAssertTrue(manager.stations.isEmpty, "a refused create must leave nothing behind")
+    }
+
+    func testCreateStationThrowsOnBlankProvidedName() {
+        let manager = StationManager()
+        // A *provided* name that trims to nothing is an error — the
+        // caller typed something and silently ignoring it would be worse.
+        // (No name at all falls back to suggestedName instead.)
+        XCTAssertThrowsError(try manager.createStation(
+            .nts(query: FacetedQuery(genreTags: ["dub"]), shufflePool: true),
+            name: "   "
+        )) { error in
+            XCTAssertEqual(error as? StationManager.StationEditError, .emptyName)
+        }
+        XCTAssertTrue(manager.stations.isEmpty)
+    }
+
+    func testCreateStationCarriesTheDraftKnobs() throws {
+        let manager = StationManager()
+        let query = FacetedQuery(genreTags: ["jazz"])
+        let station = try manager.createStation(
+            .lastFM(query: query, shufflePool: false, exploration: 0.8),
+            name: "Knobs"
+        )
+        guard case .lastFM(let config) = station.kind else {
+            return XCTFail("expected a Last.fm station")
+        }
+        XCTAssertEqual(config.query, query)
+        XCTAssertFalse(config.shufflePool)
+        XCTAssertEqual(config.exploration, 0.8)
+    }
+
+    // MARK: - applyUpdate
+
+    private func makeGenerativeTrio(
+        _ manager: StationManager
+    ) -> (nts: Station, lastFM: Station, bandcamp: Station) {
+        (
+            manager.createNTS(NTSStationConfig(
+                name: "NTS", query: FacetedQuery(genreTags: ["ambient"])
+            )),
+            manager.createLastFM(LastFMStationConfig(
+                name: "LastFM", query: FacetedQuery(genreTags: ["jazz"])
+            )),
+            manager.createBandcamp(BandcampStationConfig(
+                name: "Bandcamp", query: FacetedQuery(genreTags: ["techno"])
+            ))
+        )
+    }
+
+    /// The 225bb06 invariant, through the general editor: the station id
+    /// AND its config id survive an update — the config id keys
+    /// HistoryStore dedup and taste affinity, so letting either move
+    /// would orphan everything the station ever played.
+    func testApplyUpdatePreservesStationAndConfigIdentity() throws {
+        let manager = StationManager()
+        let trio = makeGenerativeTrio(manager)
+        let newQuery = FacetedQuery(genreTags: ["drone", "dub"], yearMin: 1990)
+
+        for original in [trio.nts, trio.lastFM, trio.bandcamp] {
+            let updated = try manager.applyUpdate(
+                original.id, StationUpdate(query: newQuery)
+            )
+            XCTAssertEqual(updated.id, original.id, "station id must not move")
+            let configID: UUID? = {
+                switch updated.kind {
+                case .playlist: return nil
+                case .nts(let c): return c.id
+                case .lastFM(let c): return c.id
+                case .bandcamp(let c): return c.id
+                }
+            }()
+            XCTAssertEqual(configID, original.id, "config id keys history — it must not move")
+        }
+    }
+
+    func testApplyUpdateRenameFiresSlugDidChangeAndUniquifies() throws {
+        let manager = StationManager()
+        _ = manager.create(from: makePlaylist(name: "Jazz"))
+        let station = manager.createNTS(NTSStationConfig(
+            name: "Ambient", query: FacetedQuery(genreTags: ["ambient"])
+        ))
+
+        var observed: (old: String, new: String)?
+        manager.slugDidChange = { observed = (old: $0, new: $1) }
+
+        // Renaming onto an existing station's slug gets the "(2)" bump —
+        // same collision handling as rename(_:to:), through one persist.
+        let updated = try manager.applyUpdate(
+            station.id, StationUpdate(name: "Radio based on Jazz")
+        )
+        XCTAssertEqual(updated.name, "Radio based on Jazz (2)")
+        XCTAssertEqual(observed?.old, "ambient")
+        XCTAssertEqual(observed?.new, "radio-based-on-jazz-2")
+    }
+
+    func testApplyUpdateErrorCases() {
+        let manager = StationManager()
+        let playlist = manager.create(from: makePlaylist(name: "Fixed"))
+        let trio = makeGenerativeTrio(manager)
+        let query = FacetedQuery(genreTags: ["dub"])
+
+        func assertThrows(
+            _ id: Station.ID, _ update: StationUpdate,
+            _ expected: StationManager.StationEditError,
+            line: UInt = #line
+        ) {
+            XCTAssertThrowsError(try manager.applyUpdate(id, update)) { error in
+                XCTAssertEqual(
+                    error as? StationManager.StationEditError, expected,
+                    line: line
+                )
+            }
+        }
+
+        assertThrows(UUID(), StationUpdate(name: "New"), .unknownStation)
+        assertThrows(playlist.id, StationUpdate(query: query), .kindHasNoQuery)
+        assertThrows(playlist.id, StationUpdate(shufflePool: false), .wrongKind)
+        assertThrows(
+            trio.nts.id,
+            StationUpdate(query: FacetedQuery(genreTags: [])),
+            .emptyGenreTags
+        )
+        assertThrows(trio.nts.id, StationUpdate(name: "  "), .emptyName)
+        assertThrows(trio.nts.id, StationUpdate(sort: .pop), .wrongKind)
+        assertThrows(trio.bandcamp.id, StationUpdate(exploration: 0.5), .wrongKind)
+    }
+
+    /// Validation runs before any mutation — a refused update leaves the
+    /// station byte-for-byte as it was, even when *some* of its fields
+    /// were individually valid.
+    func testApplyUpdateValidatesBeforeMutating() {
+        let manager = StationManager()
+        let trio = makeGenerativeTrio(manager)
+        let before = manager.stations
+
+        // Valid rename + invalid empty-tags query in one update: the
+        // rename must not land.
+        XCTAssertThrowsError(try manager.applyUpdate(
+            trio.nts.id,
+            StationUpdate(name: "Half Applied", query: FacetedQuery(genreTags: []))
+        ))
+        XCTAssertEqual(manager.stations, before, "a refused update must change nothing")
+    }
+
+    func testApplyUpdateClampsExplorationAndFlipsShufflePool() throws {
+        let manager = StationManager()
+        let trio = makeGenerativeTrio(manager)
+
+        let updated = try manager.applyUpdate(
+            trio.lastFM.id,
+            StationUpdate(exploration: 2.5, shufflePool: false)
+        )
+        guard case .lastFM(let config) = updated.kind else {
+            return XCTFail("expected the station to stay Last.fm-backed")
+        }
+        XCTAssertEqual(config.exploration, 1.0, "exploration clamps to [0, 1]")
+        XCTAssertFalse(config.shufflePool)
+
+        let sorted = try manager.applyUpdate(
+            trio.bandcamp.id, StationUpdate(sort: .pop)
+        )
+        guard case .bandcamp(let bandcampConfig) = sorted.kind else {
+            return XCTFail("expected the station to stay Bandcamp-backed")
+        }
+        XCTAssertEqual(bandcampConfig.sort, .pop)
+    }
+
+    /// The edit has to survive a relaunch — applyUpdate persists in the
+    /// same tick, like every other mutation here.
+    func testApplyUpdatePersists() throws {
+        let first = StationManager()
+        first.setStorage(root: tempRoot)
+        let station = first.createNTS(NTSStationConfig(
+            name: "Before", query: FacetedQuery(genreTags: ["ambient"])
+        ))
+        let newQuery = FacetedQuery(genreTags: ["drone"], yearMax: 1999)
+        _ = try first.applyUpdate(
+            station.id, StationUpdate(name: "After", query: newQuery)
+        )
+
+        let second = StationManager()
+        second.setStorage(root: tempRoot)
+        XCTAssertEqual(second.stations.count, 1)
+        XCTAssertEqual(second.stations[0].id, station.id)
+        XCTAssertEqual(second.stations[0].name, "After")
+        XCTAssertEqual(second.stations[0].ntsConfig?.query, newQuery)
+    }
 }

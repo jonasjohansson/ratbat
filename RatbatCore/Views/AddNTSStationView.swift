@@ -88,9 +88,14 @@ public struct AddNTSStationView: View {
 
     private func create() {
         let trimmedName = name.trimmingCharacters(in: .whitespaces)
-        let finalName = trimmedName.isEmpty ? query.suggestedName : trimmedName
-        let config = NTSStationConfig(name: finalName, query: query)
-        stations.createNTS(config)
+        // Through the validated surface the web CRUD also rides, so the
+        // sheet and /stations/create can never drift on what a valid
+        // station is. `canSubmit` already guarantees a tag, so a throw
+        // here is unreachable; `try?` merely acknowledges the signature.
+        _ = try? stations.createStation(
+            .nts(query: query, shufflePool: true),
+            name: trimmedName.isEmpty ? nil : trimmedName
+        )
         dismiss()
     }
 }

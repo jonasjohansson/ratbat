@@ -102,9 +102,12 @@ public struct AddBandcampStationView: View {
 
     private func create() {
         let trimmedName = name.trimmingCharacters(in: .whitespaces)
-        let finalName = trimmedName.isEmpty ? query.suggestedName : trimmedName
-        let config = BandcampStationConfig(name: finalName, query: query, sort: sort)
-        stations.createBandcamp(config)
+        // Through the validated surface the web CRUD also rides — see
+        // AddNTSStationView.create() for why the `try?` is safe here.
+        _ = try? stations.createStation(
+            .bandcamp(query: query, sort: sort, shufflePool: true),
+            name: trimmedName.isEmpty ? nil : trimmedName
+        )
         dismiss()
     }
 }

@@ -137,8 +137,12 @@ public struct AddLastFMStationView: View {
         if !trimmedKey.isEmpty {
             preferences.lastFMAPIKey = trimmedKey
         }
-        let config = LastFMStationConfig(name: finalName, query: query, exploration: exploration)
-        stations.createLastFM(config)
+        // Through the validated surface the web CRUD also rides — see
+        // AddNTSStationView.create() for why the `try?` is safe here.
+        _ = try? stations.createStation(
+            .lastFM(query: query, shufflePool: true, exploration: exploration),
+            name: finalName
+        )
         dismiss()
     }
 }

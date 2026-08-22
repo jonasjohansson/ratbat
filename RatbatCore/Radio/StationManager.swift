@@ -266,6 +266,174 @@ public final class StationManager: ObservableObject {
         stations.first(where: { $0.slug == slug })
     }
 
+    /// Find a station by id. The id-keyed sibling of
+    /// ``station(forSlug:)`` — the web control plane addresses stations
+    /// by UUID (the identifier that survives renames), not by slug.
+    public func station(id: Station.ID) -> Station? {
+        stations.first(where: { $0.id == id })
+    }
+
+    // MARK: - Validated editing
+
+    /// Why a create or edit was refused. Thrown (rather than the `nil`
+    /// the older setters return) because the web has to answer with a
+    /// *reason* — "no tags" and "no such station" are different HTTP
+    /// statuses, and a `nil` can't carry the distinction.
+    public enum StationEditError: Error, Equatable {
+        /// The id resolved to nothing — deleted, or never existed here.
+        case unknownStation
+        /// A playlist station was asked to change its query or pool
+        /// behavior. A fixed queue has neither.
+        case kindHasNoQuery
+        /// Every generative station needs at least one genre tag — the
+        /// rule the SwiftUI Add sheets used to gate in `canSubmit`,
+        /// moved down here so the web can't create what the desktop
+        /// couldn't.
+        case emptyGenreTags
+        /// A name was supplied but trims to nothing. Distinct from *no*
+        /// name, which falls back to ``FacetedQuery/suggestedName``.
+        case emptyName
+        /// A knob was aimed at a kind that doesn't have it — sort on a
+        /// non-Bandcamp station, exploration on a non-Last.fm one.
+        case wrongKind
+    }
+
+    /// The single validated creation surface for generative stations —
+    /// the Add sheets and the web `/stations/create` route both land
+    /// here, so the two can never drift on what a valid station is.
+    ///
+    /// `name` is optional: `nil` (or the sheets' empty field) falls back
+    /// to the query's ``FacetedQuery/suggestedName``, and either way the
+    /// final name gets the same `(2)`-style collision bump the older
+    /// creators apply. A *provided* name that trims to nothing is an
+    /// error rather than a silent fallback — the caller typed something,
+    /// and "we ignored it" is worse than "it was empty".
+    @discardableResult
+    public func createStation(_ draft: StationDraft, name: String?) throws -> Station {
+        guard !draft.query.genreTags.isEmpty else {
+            throw StationEditError.emptyGenreTags
+        }
+        let finalName: String
+        if let name {
+            let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { throw StationEditError.emptyName }
+            finalName = trimmed
+        } else {
+            finalName = draft.query.suggestedName
+        }
+        switch draft {
+        case .nts(let query, let shufflePool):
+            return createNTS(NTSStationConfig(
+                name: finalName, query: query, shufflePool: shufflePool
+            ))
+        case .lastFM(let query, let shufflePool, let exploration):
+            return createLastFM(LastFMStationConfig(
+                name: finalName, query: query,
+                shufflePool: shufflePool, exploration: exploration
+            ))
+        #if os(macOS)
+        case .bandcamp(let query, let sort, let shufflePool):
+            return createBandcamp(BandcampStationConfig(
+                name: finalName, query: query,
+                sort: sort, shufflePool: shufflePool
+            ))
+        #endif
+        }
+    }
+
+    /// Apply a sparse edit — every non-nil field of `update` — as one
+    /// atomic mutation with a single persist. The general successor to
+    /// the per-knob setters above (``updateQuery(_:to:)``,
+    /// ``updateBandcampSort(_:to:)``, ``updateExploration(_:to:)``):
+    /// the desktop edit sheet and the web `/stations/update` route both
+    /// save through here, so one edit is one disk write and one
+    /// `@Published` tick, however many knobs it turns.
+    ///
+    /// The station keeps its `id` and so does its config — the config id
+    /// keys ``HistoryStore`` dedup, skips, saves and taste affinity, so
+    /// letting it move would orphan everything the station ever played
+    /// (the delete-and-recreate bug this API exists to prevent).
+    ///
+    /// Validation happens before any mutation: an update either applies
+    /// whole or leaves the station exactly as it was. A rename rides the
+    /// same trimmed/uniquify logic as ``rename(_:to:)`` and fires
+    /// ``slugDidChange`` when the computed slug moves.
+    ///
+    /// The pool is not rebuilt here — same division of labour as
+    /// ``updateQuery(_:to:)``: the caller restarts the broadcast
+    /// deliberately, or doesn't.
+    @discardableResult
+    public func applyUpdate(_ id: Station.ID, _ update: StationUpdate) throws -> Station {
+        guard let index = stations.firstIndex(where: { $0.id == id }) else {
+            throw StationEditError.unknownStation
+        }
+        let isPlaylist: Bool = {
+            if case .playlist = stations[index].kind { return true }
+            return false
+        }()
+        if let query = update.query {
+            guard !isPlaylist else { throw StationEditError.kindHasNoQuery }
+            guard !query.genreTags.isEmpty else { throw StationEditError.emptyGenreTags }
+        }
+        if update.shufflePool != nil, isPlaylist {
+            throw StationEditError.wrongKind
+        }
+        #if os(macOS)
+        if update.sort != nil {
+            guard case .bandcamp = stations[index].kind else {
+                throw StationEditError.wrongKind
+            }
+        }
+        #endif
+        if update.exploration != nil {
+            guard case .lastFM = stations[index].kind else {
+                throw StationEditError.wrongKind
+            }
+        }
+        var trimmedName: String?
+        if let name = update.name {
+            let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { throw StationEditError.emptyName }
+            trimmedName = trimmed
+        }
+
+        // Validation is done — from here the update applies in full.
+        let oldSlug = stations[index].slug
+        if let trimmedName {
+            stations[index].name = uniquifyName(trimmedName, ignoring: id)
+        }
+        switch stations[index].kind {
+        case .playlist:
+            break
+        case .nts(var config):
+            if let query = update.query { config.query = query }
+            if let shuffle = update.shufflePool { config.shufflePool = shuffle }
+            stations[index].kind = .nts(config: config)
+        case .lastFM(var config):
+            if let query = update.query { config.query = query }
+            if let shuffle = update.shufflePool { config.shufflePool = shuffle }
+            if let exploration = update.exploration {
+                // The config's `var` bypasses its clamping init, so clamp
+                // here — same rule as ``updateExploration(_:to:)``.
+                config.exploration = LastFMStationConfig.clampExploration(exploration)
+            }
+            stations[index].kind = .lastFM(config: config)
+        #if os(macOS)
+        case .bandcamp(var config):
+            if let query = update.query { config.query = query }
+            if let shuffle = update.shufflePool { config.shufflePool = shuffle }
+            if let sort = update.sort { config.sort = sort }
+            stations[index].kind = .bandcamp(config: config)
+        #endif
+        }
+        persist()
+        let newSlug = stations[index].slug
+        if oldSlug != newSlug {
+            slugDidChange?(oldSlug, newSlug)
+        }
+        return stations[index]
+    }
+
     // MARK: - Slug collision handling
 
     /// Nudge `candidate` into a name whose ``Station/slug`` is unique among
