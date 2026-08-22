@@ -15,6 +15,15 @@ public actor LastFMSource: TrackSource {
         self.controller = controller
     }
 
+    /// Boost steering: mark the controller's pool stale so the next
+    /// `nextTrack()` rebuilds it with the boosted artist leading the
+    /// similar-artist expansion. Deliberately does not refill here — the
+    /// refill happens on the encode loop's own next call, so steering can
+    /// never interrupt the track on air.
+    public func noteSteeringChanged() async {
+        await controller.requestReseed()
+    }
+
     public func nextURL() async throws -> TrackSourceItem? {
         do {
             let track = try await controller.nextTrack()

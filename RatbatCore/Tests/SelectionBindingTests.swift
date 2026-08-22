@@ -292,6 +292,11 @@ private actor ExclusionBox {
 final class StubURLProtocol: URLProtocol {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var routes: [String: Data] = [:]
+    /// Every `path?query` key served, in arrival order. The reseed tests
+    /// assert on ORDER (boost overrides must hit the similar-artist API
+    /// before affinity seeds do), which the response fixtures alone
+    /// cannot show.
+    nonisolated(unsafe) private static var requestLog: [String] = []
 
     static func set(_ routes: [String: Data]) {
         lock.lock(); defer { lock.unlock() }
@@ -301,10 +306,17 @@ final class StubURLProtocol: URLProtocol {
     static func reset() {
         lock.lock(); defer { lock.unlock() }
         routes = [:]
+        requestLog = []
+    }
+
+    static func requestedKeys() -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        return requestLog
     }
 
     private static func body(forPath path: String) -> Data? {
         lock.lock(); defer { lock.unlock() }
+        requestLog.append(path)
         return routes[path]
     }
 

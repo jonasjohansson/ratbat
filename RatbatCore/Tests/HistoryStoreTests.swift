@@ -108,6 +108,38 @@ final class HistoryStoreTests: XCTestCase {
         XCTAssertTrue(s2Ranked.isEmpty, "affinity is station-scoped")
     }
 
+    func testSignalCounts_talliesEverySignalAndScopesPerStation() async throws {
+        let store = try await HistoryStore(databaseURL: tempURL)
+        let station = UUID(), other = UUID()
+        // Three rows on the station: one saved, one boosted, one skipped.
+        // `plays` counts rows — every row is a play record, whatever else
+        // happened to it — so the same row can tally in two columns.
+        let a = try await store.record(station: station, artist: "A", title: "a1")
+        try await store.markSaved(id: a, cachedPath: "/tmp/a.m4a")
+        let b = try await store.record(station: station, artist: "B", title: "b1")
+        try await store.markBoosted(id: b)
+        let c = try await store.record(station: station, artist: "C", title: "c1")
+        try await store.markSkipped(id: c)
+        // Noise on another station must not leak into the tallies.
+        let d = try await store.record(station: other, artist: "D", title: "d1")
+        try await store.markSaved(id: d, cachedPath: "/tmp/d.m4a")
+
+        let counts = try await store.signalCounts(forStation: station)
+        XCTAssertEqual(counts.plays, 3)
+        XCTAssertEqual(counts.saves, 1)
+        XCTAssertEqual(counts.boosts, 1)
+        XCTAssertEqual(counts.skips, 1)
+    }
+
+    func testSignalCounts_allZeroOnAnUnheardStation() async throws {
+        let store = try await HistoryStore(databaseURL: tempURL)
+        // SUM over zero rows is NULL in SQLite — the COALESCE in the
+        // query is what turns "never played" into honest zeros instead
+        // of a decode failure.
+        let counts = try await store.signalCounts(forStation: UUID())
+        XCTAssertEqual(counts, HistoryStore.SignalCounts(plays: 0, saves: 0, boosts: 0, skips: 0))
+    }
+
     func testDedupIsCaseInsensitive() async throws {
         let store = try await HistoryStore(databaseURL: tempURL)
         let station = UUID()

@@ -479,6 +479,53 @@ public actor HistoryStore {
         return weighted
     }
 
+    /// Per-station tallies of the four listener signals, for the owner's
+    /// taste-transparency surface (`/taste`). One row scan per station.
+    public struct SignalCounts: Sendable, Hashable {
+        public let plays: Int
+        public let saves: Int
+        public let boosts: Int
+        public let skips: Int
+
+        public init(plays: Int, saves: Int, boosts: Int, skips: Int) {
+            self.plays = plays
+            self.saves = saves
+            self.boosts = boosts
+            self.skips = skips
+        }
+    }
+
+    /// How often each signal fired on a station, in one SQL round trip.
+    ///
+    /// `plays` is the row count — every history row is a play record
+    /// (affinity-♥ rows on owned tracks included, deliberately: the row
+    /// exists because the track was on air). The other three read the
+    /// signal columns exactly as the migrations spell them: `saved` (v1),
+    /// `boosted_at IS NOT NULL` (v3) and `skipped` (v2). COALESCE keeps
+    /// the SUMs honest on a station with no rows, where SUM is NULL.
+    public func signalCounts(forStation station: UUID) throws -> SignalCounts {
+        let sql = """
+            SELECT COUNT(*),
+                   COALESCE(SUM(saved), 0),
+                   COALESCE(SUM(CASE WHEN boosted_at IS NOT NULL THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(skipped), 0)
+            FROM history
+            WHERE station_id = ?;
+            """
+        let stmt = try prepare(sql)
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, station.uuidString, -1, SQLITE_TRANSIENT)
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            throw Error.queryFailed(lastError())
+        }
+        return SignalCounts(
+            plays: Int(sqlite3_column_int64(stmt, 0)),
+            saves: Int(sqlite3_column_int64(stmt, 1)),
+            boosts: Int(sqlite3_column_int64(stmt, 2)),
+            skips: Int(sqlite3_column_int64(stmt, 3))
+        )
+    }
+
     /// Artists the user engages with most on this station, ranked by a
     /// blend of ♥-saves (weighted heavier) and full play-throughs. These
     /// are the seeds for similar-artist discovery — "find more like the

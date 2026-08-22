@@ -3161,20 +3161,424 @@ final class RadioBroadcasterTests: XCTestCase {
     }
 
     /// The capability anchor grows with the build: this one answers the
-    /// station CRUD routes and /vocab, and /health says so.
+    /// station CRUD routes, /vocab, the policy dials and the two
+    /// transparency surfaces — and /health says so.
     @MainActor
     func testHealthAdvertisesTheControlPlaneCapabilities() async throws {
-        XCTAssertEqual(
-            RadioBroadcaster.healthCapabilities,
-            ["health", "stations", "vocab"]
-        )
+        let expected = ["health", "stations", "vocab", "policy", "taste", "exclusions"]
+        XCTAssertEqual(RadioBroadcaster.healthCapabilities, expected)
         let radio = RadioBroadcaster(port: 18_113)
         defer { radio.stopAll() }
         struct Health: Decodable { let capabilities: [String] }
         let health = try JSONDecoder().decode(
             Health.self, from: await radio.buildHealthPayload()
         )
-        XCTAssertEqual(health.capabilities, ["health", "stations", "vocab"])
+        XCTAssertEqual(health.capabilities, expected)
+    }
+
+    // MARK: - Policy over HTTP (/policy/get, /policy/set)
+
+    /// The wire contract's whole reason for a hand-written decode: the
+    /// dial has THREE states on the wire — key absent (leave it alone),
+    /// explicit null (dial off) and a number — and a synthesized
+    /// `Double?` collapses the first two into one.
+    func testPolicySetRequestDecodesAllThreeDialStates() throws {
+        let dec = JSONDecoder()
+
+        let absent = try dec.decode(
+            RadioBroadcaster.PolicySetRequest.self,
+            from: Data("{\"token\":\"t\"}".utf8)
+        )
+        XCTAssertNil(absent.newMusicShare, "absent key must decode to outer nil")
+
+        let null = try dec.decode(
+            RadioBroadcaster.PolicySetRequest.self,
+            from: Data("{\"token\":\"t\",\"newMusicShare\":null}".utf8)
+        )
+        XCTAssertEqual(null.newMusicShare, .some(nil),
+                       "explicit null is 'dial off', NOT 'leave alone'")
+
+        let value = try dec.decode(
+            RadioBroadcaster.PolicySetRequest.self,
+            from: Data("{\"token\":\"t\",\"newMusicShare\":0.4}".utf8)
+        )
+        XCTAssertEqual(value.newMusicShare, .some(.some(0.4)))
+    }
+
+    /// Body of an HTTP response string, JSON-parsed. `fetchRawResponse`
+    /// hands back headers + body as one string.
+    nonisolated private static func jsonBody(of response: String) throws -> [String: Any] {
+        let parts = response.components(separatedBy: "\r\n\r\n")
+        guard parts.count >= 2 else { throw XCTSkip("no body in: \(response)") }
+        let body = parts.dropFirst().joined(separator: "\r\n\r\n")
+        let obj = try JSONSerialization.jsonObject(with: Data(body.utf8))
+        return (obj as? [String: Any]) ?? [:]
+    }
+
+    /// The full dial arc over a real socket: null at rest, a set value
+    /// round-trips, a toggle-only set leaves the dial alone, an explicit
+    /// null turns it off again — and every answer carries the read-only
+    /// mix-set threshold.
+    @MainActor
+    func testPolicyGetSetRoundTripOverTheSocket() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let port: UInt16 = 18_120
+        let prefs = BroadcastPreferences()
+        prefs.resetToDefaults()
+        prefs.ownerToken = "policy-roundtrip-passcode"
+        prefs.port = Int(port)
+        defer {
+            prefs.resetToDefaults()
+            prefs.port = 18_000
+        }
+        let radio = RadioBroadcaster(preferences: prefs)
+        let filler = Station(name: "Policy Filler", kind: .playlist(queue: tracks))
+        await radio.startBroadcast(station: filler)
+        defer { radio.stopAll() }
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        func post(_ path: String, _ body: String) async throws -> [String: Any] {
+            let response = try await Self.fetchRawResponse(
+                port: port, path: path,
+                requestHeaders: ["Content-Type: application/json"],
+                method: "POST", body: body
+            )
+            XCTAssertTrue(response.contains("HTTP/1.1 200"), "\(path): \(response)")
+            return try Self.jsonBody(of: response)
+        }
+
+        // At rest: the dial has never been set — explicit null, and the
+        // threshold rides along as read-only information.
+        var payload = try await post("/policy/get", "{\"token\":\"\(prefs.ownerToken)\"}")
+        XCTAssertTrue(payload.keys.contains("newMusicShare"), "\(payload)")
+        XCTAssertTrue(payload["newMusicShare"] is NSNull, "unset dial is an explicit null")
+        XCTAssertEqual(payload["excludeMixSets"] as? Bool, false)
+        XCTAssertEqual(payload["mixSetMinimumDuration"] as? Double, MixSetRule.defaultMinimumDuration)
+
+        // Set the dial; the answer reflects what persisted.
+        payload = try await post(
+            "/policy/set",
+            "{\"token\":\"\(prefs.ownerToken)\",\"newMusicShare\":0.4}"
+        )
+        XCTAssertEqual(payload["newMusicShare"] as? Double, 0.4)
+
+        // A toggle-only set must not touch the dial.
+        payload = try await post(
+            "/policy/set",
+            "{\"token\":\"\(prefs.ownerToken)\",\"excludeMixSets\":true}"
+        )
+        XCTAssertEqual(payload["excludeMixSets"] as? Bool, true)
+        XCTAssertEqual(payload["newMusicShare"] as? Double, 0.4,
+                       "an absent key means 'leave the dial alone'")
+
+        // Explicit null = dial off. Verified through a fresh get so the
+        // -1 sentinel provably stays server-internal.
+        payload = try await post(
+            "/policy/set",
+            "{\"token\":\"\(prefs.ownerToken)\",\"newMusicShare\":null}"
+        )
+        XCTAssertTrue(payload["newMusicShare"] is NSNull, "explicit null turns the dial off")
+        payload = try await post("/policy/get", "{\"token\":\"\(prefs.ownerToken)\"}")
+        XCTAssertTrue(payload["newMusicShare"] is NSNull)
+        XCTAssertEqual(payload["excludeMixSets"] as? Bool, true, "the toggle survived the dial-off")
+
+        // An out-of-range value clamps through SelectionPolicy's init
+        // rather than reaching storage.
+        payload = try await post(
+            "/policy/set",
+            "{\"token\":\"\(prefs.ownerToken)\",\"newMusicShare\":1.7}"
+        )
+        XCTAssertEqual(payload["newMusicShare"] as? Double, 1.0, "clamped, not stored raw")
+    }
+
+    // MARK: - /taste + /exclusions transparency
+
+    /// `/taste` publishes both layers: the library profile (top artists
+    /// and tags by score) and the per-station behavioral layer (affinity
+    /// seeds + signal counts) — idle stations included, since they come
+    /// from the catalogue seam, not the live pipelines.
+    @MainActor
+    func testTasteAnswersProfileAndPerStationSignals() async throws {
+        let tempDB = FileManager.default.temporaryDirectory
+            .appendingPathComponent("taste-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: tempDB) }
+        let store = try await HistoryStore(databaseURL: tempDB)
+        let profile = TasteProfile()
+        await profile.restore(snapshot: TasteProfileSnapshot(
+            libraryArtists: ["Coil": 1.0, "Gas": 0.5],
+            libraryTags: ["ambient": 1.0, "dub": 0.25]
+        ))
+        let prefs = BroadcastPreferences()
+        prefs.resetToDefaults()
+        prefs.ownerToken = "taste-passcode"
+        prefs.port = 18_121
+        defer { prefs.port = 18_000 }
+        let radio = RadioBroadcaster(preferences: prefs, history: store, tasteProfile: profile)
+        defer { radio.stopAll() }
+
+        // One idle station in the catalogue, with all four signals on it.
+        let manager = StationManager()
+        let station = manager.createNTS(NTSStationConfig(
+            name: "Idle But Heard", query: FacetedQuery(genreTags: ["ambient"])
+        ))
+        radio.listStations = { manager.stations }
+        let a = try await store.record(station: station.id, artist: "Loved", title: "l1")
+        try await store.markSaved(id: a, cachedPath: "/tmp/l1.m4a")
+        let b = try await store.record(station: station.id, artist: "Boosted", title: "b1")
+        try await store.markBoosted(id: b)
+        let c = try await store.record(station: station.id, artist: "Skipped", title: "s1")
+        try await store.markSkipped(id: c)
+
+        let (status, payload) = await radio.performJSONRoute(
+            path: "/taste",
+            body: Data("{\"token\":\"\(prefs.ownerToken)\"}".utf8)
+        )
+        XCTAssertEqual(status, 200, String(data: payload, encoding: .utf8) ?? "")
+        let root = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: payload) as? [String: Any]
+        )
+
+        let artists = try XCTUnwrap(root["libraryArtists"] as? [[String: Any]])
+        XCTAssertEqual(artists.map { $0["artist"] as? String }, ["Coil", "Gas"],
+                       "sorted by score, strongest first")
+        XCTAssertEqual(artists.first?["score"] as? Double, 1.0)
+        let tags = try XCTUnwrap(root["libraryTags"] as? [[String: Any]])
+        XCTAssertEqual(tags.map { $0["tag"] as? String }, ["ambient", "dub"])
+
+        let stations = try XCTUnwrap(root["stations"] as? [[String: Any]])
+        XCTAssertEqual(stations.count, 1, "idle stations are included — the seam, not the pipelines")
+        let entry = try XCTUnwrap(stations.first)
+        XCTAssertEqual(entry["id"] as? String, station.id.uuidString)
+        XCTAssertEqual(entry["name"] as? String, "Idle But Heard")
+        let seeds = try XCTUnwrap(entry["topAffinityArtists"] as? [String])
+        XCTAssertEqual(seeds.first, "Boosted", "boost outranks ♥ in the seeding")
+        XCTAssertTrue(seeds.contains("Loved"))
+        let counts = try XCTUnwrap(entry["counts"] as? [String: Any])
+        XCTAssertEqual(counts["plays"] as? Int, 3)
+        XCTAssertEqual(counts["saves"] as? Int, 1)
+        XCTAssertEqual(counts["boosts"] as? Int, 1)
+        XCTAssertEqual(counts["skips"] as? Int, 1)
+    }
+
+    /// `/taste` before the catalogue seam is wired answers the same 503
+    /// the station routes do — "capable but unavailable".
+    @MainActor
+    func testTasteAnswers503BeforeACatalogueIsWired() async throws {
+        let prefs = BroadcastPreferences()
+        prefs.resetToDefaults()
+        prefs.ownerToken = "taste-passcode-2"
+        prefs.port = 18_122
+        defer { prefs.port = 18_000 }
+        let radio = RadioBroadcaster(preferences: prefs)
+        defer { radio.stopAll() }
+        let (status, payload) = await radio.performJSONRoute(
+            path: "/taste",
+            body: Data("{\"token\":\"\(prefs.ownerToken)\"}".utf8)
+        )
+        XCTAssertEqual(status, 503)
+        XCTAssertTrue(String(data: payload, encoding: .utf8)!.contains("catalogue unavailable"))
+    }
+
+    /// `/exclusions` is a straight map of the audit trail: station filter
+    /// honoured, limit honoured, explicit nulls for the fields a source
+    /// genuinely can't fill, and shadow rows (`enforced: false`) present —
+    /// they ARE the "what would the toggle remove" preview.
+    @MainActor
+    func testExclusionsMapsTheAuditTrailWithStationFilterAndLimit() async throws {
+        let tempDB = FileManager.default.temporaryDirectory
+            .appendingPathComponent("exclusions-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: tempDB) }
+        let store = try await HistoryStore(databaseURL: tempDB)
+        let prefs = BroadcastPreferences()
+        prefs.resetToDefaults()
+        prefs.ownerToken = "exclusions-passcode"
+        prefs.port = 18_123
+        defer { prefs.port = 18_000 }
+        let radio = RadioBroadcaster(preferences: prefs, history: store)
+        defer { radio.stopAll() }
+
+        let mine = UUID(), other = UUID()
+        try await store.recordExclusions([
+            HistoryStore.ExclusionInput(
+                artist: "Aaa", title: "Boiler Room 2019",
+                durationSeconds: nil, durationSource: nil,
+                arm: "title", matchedText: "boiler room",
+                sourceKind: "nts", sourceURL: nil, enforced: false
+            ),
+            HistoryStore.ExclusionInput(
+                artist: "Bbb", title: "Endless Mix",
+                durationSeconds: 3720, durationSource: "listing-featured-track",
+                arm: "duration", matchedText: nil,
+                sourceKind: "bandcamp",
+                sourceURL: URL(string: "https://example.bandcamp.com/x"),
+                enforced: true
+            )
+        ], stationID: mine)
+        try await store.recordExclusions([
+            HistoryStore.ExclusionInput(
+                artist: "Ccc", title: "Other Station Mix",
+                durationSeconds: nil, durationSource: nil,
+                arm: "title", matchedText: "mix",
+                sourceKind: "nts", sourceURL: nil, enforced: false
+            )
+        ], stationID: other)
+
+        func fetch(_ body: String) async throws -> [[String: Any]] {
+            let (status, payload) = await radio.performJSONRoute(
+                path: "/exclusions", body: Data(body.utf8)
+            )
+            XCTAssertEqual(status, 200, String(data: payload, encoding: .utf8) ?? "")
+            let root = try XCTUnwrap(
+                try JSONSerialization.jsonObject(with: payload) as? [String: Any]
+            )
+            return try XCTUnwrap(root["exclusions"] as? [[String: Any]])
+        }
+
+        // Unfiltered: every station's rows.
+        let all = try await fetch("{\"token\":\"\(prefs.ownerToken)\"}")
+        XCTAssertEqual(all.count, 3)
+
+        // Station-scoped, explicit null station means "across all".
+        let scoped = try await fetch(
+            "{\"token\":\"\(prefs.ownerToken)\",\"station\":\"\(mine.uuidString)\"}"
+        )
+        XCTAssertEqual(scoped.count, 2)
+        XCTAssertTrue(scoped.allSatisfy { ($0["stationID"] as? String) == mine.uuidString })
+        let nullStation = try await fetch(
+            "{\"token\":\"\(prefs.ownerToken)\",\"station\":null}"
+        )
+        XCTAssertEqual(nullStation.count, 3, "explicit null widens to every station")
+
+        // Limit honoured.
+        let limited = try await fetch("{\"token\":\"\(prefs.ownerToken)\",\"limit\":1}")
+        XCTAssertEqual(limited.count, 1)
+
+        // The straight-map shape: every pinned key present on every row,
+        // nulls explicit, dates as epoch seconds.
+        let title = try XCTUnwrap(scoped.first { ($0["arm"] as? String) == "title" })
+        XCTAssertEqual(title["artist"] as? String, "Aaa")
+        XCTAssertEqual(title["matchedText"] as? String, "boiler room")
+        XCTAssertTrue(title["durationSeconds"] is NSNull, "NTS has no duration — explicit null")
+        XCTAssertTrue(title["durationSource"] is NSNull)
+        XCTAssertTrue(title["sourceURL"] is NSNull)
+        XCTAssertEqual(title["enforced"] as? Bool, false, "the shadow log crosses the wire")
+        XCTAssertEqual(title["everEnforced"] as? Bool, false)
+        XCTAssertEqual(title["enforcedCount"] as? Int, 0)
+        XCTAssertEqual(title["hitCount"] as? Int, 1)
+        XCTAssertNotNil(title["firstExcludedAt"] as? Double)
+        XCTAssertNotNil(title["lastExcludedAt"] as? Double)
+        let duration = try XCTUnwrap(scoped.first { ($0["arm"] as? String) == "duration" })
+        XCTAssertEqual(duration["durationSeconds"] as? Double, 3720)
+        XCTAssertTrue(duration["matchedText"] is NSNull)
+        XCTAssertEqual(duration["sourceURL"] as? String, "https://example.bandcamp.com/x")
+        XCTAssertEqual(duration["enforced"] as? Bool, true)
+
+        // A station key that's present but not a UUID is malformed — a
+        // 400, never a silent widen to every station.
+        let (badStatus, _) = await radio.performJSONRoute(
+            path: "/exclusions",
+            body: Data("{\"token\":\"\(prefs.ownerToken)\",\"station\":\"not-a-uuid\"}".utf8)
+        )
+        XCTAssertEqual(badStatus, 400)
+    }
+
+    /// Every steering/transparency route is owner-gated: wrong (or
+    /// missing) token answers 403 listener-mode before anything is read
+    /// or written.
+    @MainActor
+    func testSteeringRoutesRejectGuestsWith403() async throws {
+        let prefs = BroadcastPreferences()
+        prefs.resetToDefaults()
+        prefs.ownerToken = "steering-gate-passcode"
+        prefs.port = 18_124
+        defer { prefs.port = 18_000 }
+        let radio = RadioBroadcaster(preferences: prefs)
+        radio.ownerThrottleStep = 0
+        defer { radio.stopAll() }
+
+        let body = Data("{\"token\":\"wrong\",\"newMusicShare\":0.4}".utf8)
+        for path in ["/policy/get", "/policy/set", "/taste", "/exclusions"] {
+            let (status, payload) = await radio.performJSONRoute(path: path, body: body)
+            XCTAssertEqual(status, 403, "\(path) must reject guests")
+            XCTAssertTrue(
+                String(data: payload, encoding: .utf8)!.contains("listener mode"),
+                "\(path) must answer listener-mode"
+            )
+        }
+    }
+
+    // MARK: - Boost steering (debounce + consume-once)
+
+    /// A ``TrackSource`` that plays a fixture playlist and counts the
+    /// steering nudges it receives — the seam the debounce test observes.
+    private actor RecordingSteerSource: TrackSource {
+        private let inner: PlaylistSource
+        private(set) var steeringNotes = 0
+        init(tracks: [Track]) {
+            inner = PlaylistSource(tracks: tracks, shuffle: false)
+        }
+        func nextURL() async throws -> TrackSourceItem? { try await inner.nextURL() }
+        func noteSteeringChanged() async { steeringNotes += 1 }
+    }
+
+    /// Rapid boosts coalesce into ONE debounced steering nudge, the
+    /// boosted artist waits in the override list, and the controller-side
+    /// provider drains it consume-once. The track on air is untouched —
+    /// the nudge reaches the SOURCE, never the encode loop.
+    @MainActor
+    func testBoostSchedulesOneDebouncedRefillAndOverridesDrainOnce() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let tempDB = FileManager.default.temporaryDirectory
+            .appendingPathComponent("boost-steer-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: tempDB) }
+        let store = try await HistoryStore(databaseURL: tempDB)
+        let prefs = BroadcastPreferences()
+        prefs.resetToDefaults()
+        prefs.ownerToken = "boost-steer-passcode"
+        prefs.port = 18_125
+        defer { prefs.port = 18_000 }
+        let radio = RadioBroadcaster(preferences: prefs, history: store)
+        radio.boostRefillDebounceOverride = 0.6
+        let station = Station(name: "Steer Test", kind: .playlist(queue: []))
+        let source = RecordingSteerSource(tracks: tracks)
+        await radio.startBroadcast(station: station, source: source)
+        defer { radio.stopAll() }
+
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+        let playing = try XCTUnwrap(radio.currentItemByStation[station.id])
+        let artist = try XCTUnwrap(playing.artist)
+
+        // Two boosts inside the debounce window.
+        let (s1, b1) = await radio.performBoostAsync(stationID: station.id, token: prefs.ownerToken)
+        XCTAssertEqual(s1, 200, String(data: b1, encoding: .utf8) ?? "")
+        let (s2, _) = await radio.performBoostAsync(stationID: station.id, token: prefs.ownerToken)
+        XCTAssertEqual(s2, 200)
+
+        // The override is queued (deduped — same artist twice is one
+        // entry) and nothing has fired yet.
+        XCTAssertEqual(radio.boostSeedOverrides[station.id], [artist])
+        let early = await source.steeringNotes
+        XCTAssertEqual(early, 0, "the nudge waits out the debounce window")
+
+        // …and the current track was not skipped by the boost.
+        XCTAssertEqual(radio.currentItemByStation[station.id]?.title, playing.title,
+                       "steering must not force-skip the track on air")
+
+        // After the window: exactly one nudge for the two boosts.
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+        let fired = await source.steeringNotes
+        XCTAssertEqual(fired, 1, "rapid boosts fold into one scheduled refill")
+
+        // Consume-once: the provider hands the override out exactly once.
+        let provider = radio.seedOverrideProvider(stationID: station.id)
+        let first = await provider()
+        XCTAssertEqual(first, [artist])
+        let second = await provider()
+        XCTAssertEqual(second, [], "a second refill must fall back to affinity seeding")
     }
 
     // MARK: - SSE `stations` events

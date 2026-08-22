@@ -451,7 +451,10 @@ public final class RadioBroadcaster: ObservableObject {
     /// these wired up logs an error and bails instead of crashing.
     private let downloadService: DownloadService?
     private let nts: NTSClient?
-    private let history: HistoryStore?
+    /// Internal (not private) for the same reason ``preferences`` is:
+    /// the `/taste` and `/exclusions` handlers live in SteeringWire.swift
+    /// — same type, different file — and read their rows off it.
+    let history: HistoryStore?
     /// Read-side handle on the user's music folder. Used by the ♥ save
     /// flow to know where to copy cached files. `nil` in test configs;
     /// `handleLike` returns a 500 when it's missing.
@@ -460,8 +463,9 @@ public final class RadioBroadcaster: ObservableObject {
     /// station. Optional so minimal-init tests can skip it — stations
     /// built without a profile just get an empty profile's zero-valued
     /// scores, which degrades to near-random selection rather than
-    /// crashing.
-    private let tasteProfile: TasteProfile?
+    /// crashing. Internal so SteeringWire.swift's `/taste` handler can
+    /// publish the snapshot.
+    let tasteProfile: TasteProfile?
     /// Long-lived MusicBrainz client shared across every Last.fm /
     /// Bandcamp station so the per-artist / per-recording caches
     /// accumulate across pool refills and across stations. Eagerly
@@ -515,16 +519,58 @@ public final class RadioBroadcaster: ObservableObject {
         /// the outer loop advances. Avoids the complexity of cancelling
         /// the decoder mid-track.
         var skipRequested: Bool = false
+        /// The live source feeding this pipeline's encode loop. Held here
+        /// (and not only captured by the loop) so boost steering's
+        /// debounced refill can reach the running station's source —
+        /// `pipelines[id]?.source.noteSteeringChanged()` — without
+        /// plumbing a side channel into the loop.
+        let source: TrackSource
 
-        init(station: Station, buffer: AACRingBuffer, bitrate: Int, sampleRate: Double) {
+        init(
+            station: Station,
+            buffer: AACRingBuffer,
+            bitrate: Int,
+            sampleRate: Double,
+            source: TrackSource
+        ) {
             self.station = station
             self.buffer = buffer
             self.bitrate = bitrate
             self.sampleRate = sampleRate
+            self.source = source
         }
     }
 
     private var pipelines: [Station.ID: BroadcastPipeline] = [:]
+
+    // MARK: - Boost steering
+
+    /// Artists the owner boosted on each station since its last refill,
+    /// most recent first, capped at 3 (case-insensitive dedup). Drained
+    /// consume-once by ``seedOverrideProvider(stationID:)`` so a natural
+    /// refill that beats the debounced one still steers exactly once —
+    /// the override must never keep re-front-loading every refill after
+    /// the gesture (that is `topAffinityArtists`' job, with decay).
+    /// Internal for the consume-once test.
+    var boostSeedOverrides: [Station.ID: [String]] = [:]
+
+    /// One pending debounced-refill task per station. A boost inside the
+    /// window folds into the pending task by only appending to the
+    /// override list — "one scheduled refill per station per few
+    /// minutes", so boosting five tracks in a minute cannot hammer the
+    /// sources with five refills.
+    private var boostRefillTasks: [Station.ID: Task<Void, Never>] = [:]
+
+    /// How long a boost waits before nudging the station's source to
+    /// refill. Long enough to coalesce a burst of boosts, short enough
+    /// that "more of this" is audible within a couple of tracks.
+    nonisolated static let boostRefillDebounce: TimeInterval = 120
+
+    /// Test override for the debounce window — the
+    /// `listenerRebindDelay(forAttempt:)` precedent: production never
+    /// assigns it, tests set it to something a test can afford to wait.
+    var boostRefillDebounceOverride: TimeInterval?
+
     /// Display names for every station the user has saved, live or not —
     /// see ``registerStations(_:)``. Absent id means "we have never heard
     /// of this station", which is how `/history` distinguishes a deleted
@@ -760,6 +806,54 @@ public final class RadioBroadcaster: ObservableObject {
         return { await MainActor.run { prefs.selectionPolicy } }
     }
 
+    /// Live read of a station's boost-seed overrides for its controller,
+    /// same idiom as ``selectionPolicyProvider()``. Consume-once: the
+    /// read REMOVES the entry, so whichever refill happens first — the
+    /// debounced one this class schedules, or a natural pool-empty
+    /// refill that beats it — steers, and later refills fall back to
+    /// affinity seeding alone. Internal so the consume-once contract is
+    /// testable directly.
+    func seedOverrideProvider(stationID: Station.ID) -> @Sendable () async -> [String] {
+        { [weak self] in
+            await MainActor.run {
+                guard let self else { return [] }
+                return self.boostSeedOverrides.removeValue(forKey: stationID) ?? []
+            }
+        }
+    }
+
+    /// The steering half of a successful boost: remember the artist for
+    /// the station's next pool refill and schedule the debounced nudge
+    /// that triggers it. Never touches the needle — the source decides
+    /// what a steering note means, and every source finishes the current
+    /// track regardless.
+    private func noteBoostSteering(stationID: Station.ID, artist: String?) {
+        guard let artist = artist?.trimmingCharacters(in: .whitespaces),
+              !artist.isEmpty else { return }
+        var overrides = boostSeedOverrides[stationID] ?? []
+        overrides.removeAll { $0.caseInsensitiveCompare(artist) == .orderedSame }
+        overrides.insert(artist, at: 0)
+        boostSeedOverrides[stationID] = Array(overrides.prefix(3))
+
+        // One pending task per station; boosts inside the window already
+        // folded themselves in by appending to the override list above.
+        guard boostRefillTasks[stationID] == nil else { return }
+        let delay = boostRefillDebounceOverride ?? Self.boostRefillDebounce
+        boostRefillTasks[stationID] = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard let self else { return }
+            // Clear the slot before the nudge so a boost arriving while
+            // the source refills starts a fresh window instead of being
+            // silently swallowed.
+            self.boostRefillTasks[stationID] = nil
+            // A station stopped inside the window simply has no pipeline
+            // any more — the note evaporates, which is correct: its next
+            // start builds a fresh pool through the affinity seeds the
+            // boost already earned.
+            await self.pipelines[stationID]?.source.noteSteeringChanged()
+        }
+    }
+
     #if os(macOS)
     /// Resolve an ``NTSStationController`` + ``NTSSource`` from the injected
     /// dependencies. Returns nil and surfaces an error if the broadcaster
@@ -911,7 +1005,8 @@ public final class RadioBroadcaster: ObservableObject {
             history: history,
             resolver: resolver,
             tasteProfile: profile,
-            selectionPolicy: selectionPolicyProvider()
+            selectionPolicy: selectionPolicyProvider(),
+            seedOverride: seedOverrideProvider(stationID: config.id)
         )
         return LastFMSource(controller: controller)
     }
@@ -1032,7 +1127,8 @@ public final class RadioBroadcaster: ObservableObject {
             station: station,
             buffer: AACRingBuffer(),
             bitrate: bitrate,
-            sampleRate: sampleRate
+            sampleRate: sampleRate,
+            source: source
         )
         pipelines[station.id] = pipeline
         let pipelineToken = pipeline.token
@@ -2108,7 +2204,8 @@ public final class RadioBroadcaster: ObservableObject {
         "/auth", "/like", "/skip", "/next", "/boost", "/unlike",
         "/stations/list", "/stations/create", "/stations/update",
         "/stations/delete", "/stations/start", "/stations/stop",
-        "/stations/autostart"
+        "/stations/autostart",
+        "/policy/get", "/policy/set", "/taste", "/exclusions"
     ]
 
     /// Ceiling on a JSON POST body. The largest legitimate payload today
@@ -2228,6 +2325,32 @@ public final class RadioBroadcaster: ObservableObject {
                 return Self.badRequest()
             }
             return await performStationAutoStartAsync(req)
+        case "/policy/get":
+            // The two listener dials plus the read-only mix-set
+            // threshold. Token is the whole body, /auth-style.
+            return await performPolicyGetAsync(
+                token: (try? decoder.decode(AuthRequest.self, from: body))?.token
+            )
+        case "/policy/set":
+            // Sparse overlay; the hand-written decode is what keeps
+            // "key absent" distinct from "explicit null" — see
+            // ``PolicySetRequest``.
+            guard let req = try? decoder.decode(PolicySetRequest.self, from: body) else {
+                return Self.badRequest()
+            }
+            return await performPolicySetAsync(req)
+        case "/taste":
+            // What the pipeline believes about the owner's taste —
+            // library scores + per-station signals, idle stations too.
+            return await performTasteAsync(
+                token: (try? decoder.decode(AuthRequest.self, from: body))?.token
+            )
+        case "/exclusions":
+            // The mix-set filter's audit trail, shadow rows included.
+            guard let req = try? decoder.decode(ExclusionsRequest.self, from: body) else {
+                return Self.badRequest()
+            }
+            return await performExclusionsAsync(req)
         default:
             // Unreachable while dispatch is gated on ``jsonPostPaths``,
             // but a path added to the set without a case must land here
@@ -2849,8 +2972,12 @@ public final class RadioBroadcaster: ObservableObject {
     /// its history row (creating one for owned tracks, same as affinity-♥),
     /// which puts the artist at the front of the next similar-artist
     /// expansion via ``HistoryStore/topAffinityArtists`` and feeds the
-    /// scoring term weighted above ♥-saves. No refill is forced: the next
-    /// natural refill steers, which also debounces rapid boosts for free.
+    /// scoring term weighted above ♥-saves. The refill no longer waits
+    /// for the pool to drain: the boosted artist becomes a seed override
+    /// and a debounced refill is scheduled
+    /// (``noteBoostSteering(stationID:artist:)``), with rapid boosts
+    /// folding into one refill. The track on air always finishes —
+    /// steering moves the pool, never the needle.
     func performBoostAsync(stationID: UUID, token: String?) async -> (Int, Data) {
         if let rejection = await ownerGate(token) { return rejection }
         guard pipelines[stationID] != nil,
@@ -2876,6 +3003,10 @@ public final class RadioBroadcaster: ObservableObject {
                 )
                 try await history.markBoosted(id: id)
             }
+            // Only after the signal is durably recorded: a steering nudge
+            // for a boost that failed to write would promise a change the
+            // profile never heard about.
+            noteBoostSteering(stationID: stationID, artist: item.artist)
             logger.info("boost: \(item.artist ?? "?", privacy: .public) — \(item.title ?? "?", privacy: .public)")
             return (200, Data("{\"status\":\"boosted\"}".utf8))
         } catch {
@@ -3178,7 +3309,9 @@ public final class RadioBroadcaster: ObservableObject {
     /// Append-only: a control appears on the web iff its capability is
     /// listed, so entries are added as features land (`stations` will
     /// join with the CRUD routes) and never renamed.
-    nonisolated static let healthCapabilities = ["health", "stations", "vocab"]
+    nonisolated static let healthCapabilities = [
+        "health", "stations", "vocab", "policy", "taste", "exclusions"
+    ]
     /// Window over which `/health` judges each station's liveness.
     /// Ten minutes ≈ a handful of heartbeats: long enough that one
     /// missed beat doesn't flap the answer, short enough to notice an

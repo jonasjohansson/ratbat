@@ -94,6 +94,21 @@ public actor LastFMStationController {
     /// broadcast. Re-read at every pool refill.
     private let selectionPolicy: @Sendable () async -> SelectionPolicy
 
+    /// Boost steering's seed override — artists the owner just boosted,
+    /// read fresh at every refill and placed at the FRONT of the
+    /// similar-artist expansion queue. A provider for the same reason
+    /// `selectionPolicy` is: the overrides live on the main-actor
+    /// broadcaster (which drains them consume-once), and a value
+    /// snapshotted at construction could never steer. The interaction
+    /// with ``HistoryStore/topAffinityArtists`` is self-healing — a
+    /// boosted artist earns weight-10 rank there, so the override is a
+    /// fast path for the very next refill, not a fork.
+    private let seedOverride: @Sendable () async -> [String]
+
+    /// Set by ``requestReseed()`` when a boost lands; the next
+    /// `nextTrack()` rebuilds the pool instead of draining the stale one.
+    private var pendingReseed = false
+
     private var pool: [SourceCandidate] = []
     private var cursor: Int = 0
 
@@ -122,7 +137,8 @@ public actor LastFMStationController {
         history: HistoryStore,
         resolver: TrackResolver,
         tasteProfile: TasteProfile,
-        selectionPolicy: @escaping @Sendable () async -> SelectionPolicy = { .default }
+        selectionPolicy: @escaping @Sendable () async -> SelectionPolicy = { .default },
+        seedOverride: @escaping @Sendable () async -> [String] = { [] }
     ) {
         self.config = config
         self.client = client
@@ -131,9 +147,18 @@ public actor LastFMStationController {
         self.resolver = resolver
         self.tasteProfile = tasteProfile
         self.selectionPolicy = selectionPolicy
+        self.seedOverride = seedOverride
     }
 
     // MARK: - Public
+
+    /// Boost steering's entry point: mark the pool stale. The actual
+    /// refill waits for the next ``nextTrack()`` call so steering can
+    /// never yank the track that is on air — "stations mid-track finish
+    /// the track" (signal-model design §3).
+    public func requestReseed() {
+        pendingReseed = true
+    }
 
     /// Produce the next resolved track for this station.
     ///
@@ -145,6 +170,11 @@ public actor LastFMStationController {
         // A dial moved since this pool was built? Re-choose from what is
         // left instead of waiting for the pool to drain.
         await reapplyPolicyIfChanged()
+
+        // A boost landed since this pool was built? Rebuild it with the
+        // boosted artist leading the expansion, instead of serving out
+        // the remainder of a pool that predates the steering gesture.
+        try await refillIfReseedPending()
 
         // Two budgets, deliberately separate. `attempts` counts candidates
         // the resolver genuinely cannot use; `transientFailures` counts
@@ -241,7 +271,45 @@ public actor LastFMStationController {
     /// split between taste-sorted top picks (80%) and random wildcards
     /// (20%) so the station doesn't converge to a predictable handful
     /// of "best scored" tracks.
-    private func refillPool() async throws {
+    /// Consume a pending boost-reseed request, if any. Split out of
+    /// ``nextTrack()`` so the reseed contract — one flag, one refill,
+    /// flag cleared even if the refill throws — is testable without
+    /// driving the resolver loop.
+    internal func refillIfReseedPending() async throws {
+        guard pendingReseed else { return }
+        // Cleared BEFORE the refill: a refill that throws must not leave
+        // the flag set, or every subsequent nextTrack() would re-throw a
+        // stale failure instead of retrying on its own schedule.
+        pendingReseed = false
+        try await refillPool()
+    }
+
+    /// Stage 1b's seed ordering, as a pure function: boost overrides go
+    /// to the front of the similar-artist expansion queue, affinity seeds
+    /// follow, duplicates collapse case-insensitively (first spelling
+    /// wins) and the total is capped so a refill can't blow the Last.fm
+    /// rate budget.
+    nonisolated internal static func mergeSeedArtists(
+        overrides: [String],
+        affinity: [String],
+        cap: Int = 4
+    ) -> [String] {
+        var merged: [String] = []
+        for artist in overrides + affinity {
+            let trimmed = artist.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            guard !merged.contains(where: {
+                $0.caseInsensitiveCompare(trimmed) == .orderedSame
+            }) else { continue }
+            merged.append(trimmed)
+        }
+        return Array(merged.prefix(cap))
+    }
+
+    // Internal, not private: the reseed tests drive a refill directly
+    // (the NTSStationController precedent) rather than through the
+    // resolver loop, which would need a live Python subprocess.
+    internal func refillPool() async throws {
         // Stage 1: raw per-tag fetch. Collect `(SourceCandidate, matchedTags)`
         // tuples directly so stage 2 can be a single call into the pipeline.
         // The per-DedupKey merge folds multi-tag hits together before we
@@ -302,7 +370,11 @@ public actor LastFMStationController {
         // which keeps the station on-theme while steadily broadening it
         // toward "more artists like the ones you love." Hard-bounded so a
         // refill can't blow the Last.fm rate budget.
-        let seedArtists = (try? await history.topAffinityArtists(forStation: config.id, limit: 3)) ?? []
+        // Boost overrides lead the queue; station affinity fills in
+        // behind them. See ``mergeSeedArtists`` for the ordering rules.
+        let overrides = await seedOverride()
+        let affinitySeeds = (try? await history.topAffinityArtists(forStation: config.id, limit: 3)) ?? []
+        let seedArtists = Self.mergeSeedArtists(overrides: overrides, affinity: affinitySeeds)
         if !seedArtists.isEmpty {
             var similarSeen = Set<String>()
             var added = 0
@@ -561,6 +633,8 @@ public actor LastFMStationController {
     internal func selectionSubjectForTesting(_ candidate: SourceCandidate) -> SelectionSubject {
         selectionSubject(for: candidate)
     }
+
+    internal func poolSnapshot() -> [SourceCandidate] { pool }
 
     // MARK: - Helpers
 

@@ -14,6 +14,21 @@ public protocol TrackSource: Actor {
     /// Next audio file URL to play, or nil if the source is exhausted.
     /// May take a noticeable amount of time (download-on-demand).
     func nextURL() async throws -> TrackSourceItem?
+
+    /// The owner steered (boosted a track): sources that can re-aim their
+    /// candidate pool should schedule a refill; the rest ignore it.
+    ///
+    /// A nudge, never a skip — steering affects the pool, not the needle,
+    /// so a station mid-track always finishes the track. Default is a
+    /// no-op because only Last.fm has a similar-artist graph to re-seed
+    /// from: NTS pools are show-based and Bandcamp's discover API has no
+    /// similar-artist endpoint, so on those kinds (and playlists) boost
+    /// remains a rating signal that steers at the next natural refill.
+    func noteSteeringChanged() async
+}
+
+public extension TrackSource {
+    func noteSteeringChanged() async {}
 }
 
 /// Where a ``TrackSourceItem`` came from.
