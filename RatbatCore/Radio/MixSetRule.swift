@@ -29,7 +29,7 @@ public enum MixSetVerdict: Sendable, Hashable {
 ///
 /// | source   | duration at selection time                                  |
 /// |----------|-------------------------------------------------------------|
-/// | Bandcamp | yes — `featured_track.duration`, 48/48 fixture items         |
+/// | Bandcamp | yes — `featured_track.duration`, 47/48 fixture items         |
 /// | NTS      | key present but `null` on all 21 rows of the tracklist fixture |
 /// | Last.fm  | no such field, before or after the fetch                     |
 /// | playlist | yes, exact — `Track.duration` from AVFoundation             |

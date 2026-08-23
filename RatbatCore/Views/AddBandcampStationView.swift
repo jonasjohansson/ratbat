@@ -7,7 +7,7 @@ import SwiftUI
 /// should feel like siblings in the UI. Differences are driven by the
 /// backing API:
 ///
-/// - Bandcamp's `/api/discover/3/get_web` endpoint is unauthenticated, so
+/// - Bandcamp's `/api/discover/1/discover_web` endpoint is unauthenticated, so
 ///   there is no API-key field (and therefore no ``BroadcastPreferences``
 ///   dependency).
 /// - The filter disclosure surfaces Bandcamp's own ``BandcampClient/Sort``

@@ -509,13 +509,20 @@ public actor BandcampStationController {
     ///
     /// The duration here is the length of the release's FEATURED TRACK, and
     /// the candidate is the release. Those are not the same thing: the
-    /// discover endpoint returns albums almost exclusively (48/48 items of
-    /// the `bandcamp-discover-techno` fixture are `type: "a"`), the title
-    /// this station plays is the release title, and 4 of those 48 exceed
-    /// the 20-minute threshold on the featured track alone. So when this
-    /// arm fires it removes a whole release on the strength of one track's
-    /// length. That is a real, unmitigated over-reach — this arm is not
-    /// conservative and must not be described as such.
+    /// discover endpoint now returns albums EXCLUSIVELY — `["a"]` is the
+    /// only `include_result_types` value it accepts — the title this
+    /// station plays is the release title, and the featured track is one
+    /// cut off it. So when this arm fires it removes a whole release on the
+    /// strength of one track's length. That is a real, unmitigated
+    /// over-reach — this arm is not conservative and must not be described
+    /// as such.
+    ///
+    /// The migration off `/api/discover/3` made the gap wider, not
+    /// narrower. That endpoint's featured tracks ran long enough that 4 of
+    /// 48 fixture items tripped the 20-minute threshold on their own; the
+    /// `/api/discover/1` fixture has none over 17 minutes even though its
+    /// releases carry a full-album `duration` field the model does not read.
+    /// So the arm fires more rarely now and is no more correct when it does.
     ///
     /// `duration_source` is `listing-featured-track`, never `listing`, so
     /// a reader of the audit log can tell what was measured apart from what

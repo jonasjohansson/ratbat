@@ -204,14 +204,19 @@ final class SelectionBindingTests: XCTestCase {
             bundle.url(forResource: "bandcamp-discover-techno", withExtension: "json", subdirectory: "Fixtures")
                 ?? bundle.url(forResource: "bandcamp-discover-techno", withExtension: "json")
         )
-        let (releases, _) = BandcampClient.parseDiscoverPage(data: try Data(contentsOf: url))
+        let (releases, _) = BandcampClient.parseDiscoverBatch(data: try Data(contentsOf: url))
         XCTAssertEqual(releases.count, 48)
-        XCTAssertTrue(
-            releases.allSatisfy { $0.featuredTrackDurationSeconds != nil },
-            "featured_track.duration is present on 48/48 fixture items and must no longer be discarded"
+        XCTAssertEqual(
+            releases.filter { $0.featuredTrackDurationSeconds != nil }.count, 47,
+            "featured_track.duration is present on 47/48 fixture items and must no longer be discarded"
         )
+        // The v3 fixture had 4 items over the 1200s threshold; this one has
+        // none. Asserting the zero on purpose: it is what makes the point
+        // below load-bearing rather than hypothetical — the arm still
+        // over-reaches by the same amount, it just fires less often, so the
+        // caveat cannot be retired on the grounds that nothing trips it.
         let longOnes = releases.filter { ($0.featuredTrackDurationSeconds ?? 0) >= 1200 }
-        XCTAssertEqual(longOnes.count, 4, "4 fixture items exceed 1200s on the featured track alone")
+        XCTAssertEqual(longOnes.count, 0, "no /api/discover/1 fixture item exceeds 1200s on the featured track alone")
     }
 
     /// The caveat, pinned so nobody papers over it later: every fixture item

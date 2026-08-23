@@ -4,7 +4,8 @@ import XCTest
 /// The classification rule is deliberately conservative about which title
 /// markers fire on their own. The reason is measured, not aesthetic: of the
 /// three generative sources, only Bandcamp supplies a duration at selection
-/// time (`featured_track.duration`, present on 48/48 fixture items). NTS
+/// time (`featured_track.duration`, present on 47 of the 48 fixture items —
+/// the 48th has no featured track at all). NTS
 /// carries a `duration` key that is `null` on all 21 rows of the shipped
 /// tracklist fixture, and Last.fm has no duration field at all. So on two of
 /// three sources the title arm is the *entire* classifier, with nothing to

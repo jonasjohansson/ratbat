@@ -1,29 +1,66 @@
 {
-  "items": [
+  "results": [
     {
-      "type": "t",
-      "primary_text": "Track Title",
-      "secondary_text": "Track Artist",
-      "publish_date": "1 Jan 2024 12:00:00 GMT",
-      "url_hints": {
-        "subdomain": "artistname",
-        "custom_domain": null,
-        "slug": "track-slug",
-        "item_type": "t"
+      "item_id": 1,
+      "item_type": "a",
+      "title": "Custom Domain Album",
+      "item_url": "https://records.example/album/custom-album?from=discover_page",
+      "band_name": "Label Name",
+      "album_artist": "Signed Artist",
+      "band_id": 11,
+      "band_location": "Berlin, Germany",
+      "release_date": "2025-03-15 08:30:00 UTC",
+      "track_count": 9,
+      "duration": 2700.0,
+      "featured_track": {
+        "id": 101,
+        "title": "Opening Statement",
+        "band_name": "Signed Artist",
+        "band_id": 11,
+        "stream_url": "https://t4.bcbits.com/stream/deadbeef/mp3-128/101",
+        "duration": 412.5
       }
     },
     {
-      "type": "a",
-      "primary_text": "Custom Domain Album",
-      "secondary_text": "Label Name",
-      "publish_date": "15 Mar 2025 08:30:00 GMT",
-      "url_hints": {
-        "subdomain": "labelname",
-        "custom_domain": "records.example",
-        "slug": "custom-album",
-        "item_type": "a"
-      }
+      "item_id": 2,
+      "item_type": "a",
+      "title": "No Featured Track",
+      "item_url": "https://artistname.bandcamp.com/album/bare-album",
+      "band_name": "Artist Name",
+      "album_artist": null,
+      "band_id": 12,
+      "band_location": null,
+      "release_date": "2024-01-01 12:00:00 UTC",
+      "track_count": 4,
+      "duration": 900.0,
+      "featured_track": null
+    },
+    {
+      "item_id": 3,
+      "item_type": "a",
+      "title": "",
+      "item_url": "https://artistname.bandcamp.com/album/untitled?from=discover_page",
+      "band_name": "Artist Name",
+      "album_artist": null,
+      "band_id": 12,
+      "release_date": "2024-02-02 12:00:00 UTC",
+      "featured_track": null
+    },
+    {
+      "item_id": 4,
+      "item_type": "a",
+      "title": "No URL At All",
+      "item_url": null,
+      "band_name": "Artist Name",
+      "album_artist": null,
+      "band_id": 12,
+      "release_date": "2024-03-03 12:00:00 UTC",
+      "featured_track": null
     }
   ],
-  "total_count": 2
+  "cursor": "SYNTHETIC_CURSOR_PAGE_1",
+  "result_count": 4,
+  "batch_result_count": 4,
+  "discover_spec_id": null,
+  "is_following_discover_spec": false
 }
