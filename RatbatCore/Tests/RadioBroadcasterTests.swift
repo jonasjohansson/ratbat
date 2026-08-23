@@ -3383,12 +3383,56 @@ final class RadioBroadcasterTests: XCTestCase {
 
     /// The capability anchor grows with the build: this one answers the
     /// station CRUD routes, /vocab, the policy dials, the two
-    /// transparency surfaces and /trackinfo — and /health says so.
+    /// transparency surfaces, /trackinfo and the transport relay — and
+    /// /health says so.
+    /// The remote control. Volume lives in each browser, so one of the
+    /// owner's browsers cannot reach another's speaker on its own — the
+    /// broadcaster relays the keypress, and only for the owner.
+    @MainActor
+    func testTransportRelayIsOwnerGatedOverTheSocket() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let port: UInt16 = 18_121
+        let prefs = BroadcastPreferences()
+        prefs.resetToDefaults()
+        prefs.ownerToken = "transport-passcode"
+        prefs.port = Int(port)
+        defer {
+            prefs.resetToDefaults()
+            prefs.port = 18_000
+        }
+        let radio = RadioBroadcaster(preferences: prefs)
+        let filler = Station(name: "Transport Filler", kind: .playlist(queue: tracks))
+        await radio.startBroadcast(station: filler)
+        defer { radio.stopAll() }
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        func post(_ body: String) async throws -> String {
+            try await Self.fetchRawResponse(
+                port: port, path: "/transport",
+                requestHeaders: ["Content-Type: application/json"],
+                method: "POST", body: body
+            )
+        }
+
+        let guest = try await post("{\"muted\":true,\"token\":\"wrong\"}")
+        XCTAssertTrue(guest.contains("403 Forbidden"), "a stranger cannot mute the house: \(guest)")
+
+        let owner = try await post("{\"muted\":true,\"token\":\"\(prefs.ownerToken)\"}")
+        XCTAssertTrue(owner.contains("HTTP/1.1 200"), "the owner can: \(owner)")
+
+        // Volume alone is a legal press too — the fields are independent
+        // so a mute never silently resets somebody's level.
+        let level = try await post("{\"volume\":0.4,\"token\":\"\(prefs.ownerToken)\"}")
+        XCTAssertTrue(level.contains("HTTP/1.1 200"), "\(level)")
+    }
+
     @MainActor
     func testHealthAdvertisesTheControlPlaneCapabilities() async throws {
         let expected = [
             "health", "stations", "vocab", "policy", "taste", "exclusions",
-            "trackinfo"
+            "trackinfo", "transport"
         ]
         XCTAssertEqual(RadioBroadcaster.healthCapabilities, expected)
         let radio = RadioBroadcaster(port: 18_113)

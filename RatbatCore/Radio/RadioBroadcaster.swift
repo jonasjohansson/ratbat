@@ -2289,6 +2289,28 @@ public final class RadioBroadcaster: ObservableObject {
     /// and the owner catalogue must never ride it. The event is a nudge,
     /// not a snapshot — clients re-fetch what they are entitled to
     /// (public `/now.json`, owner `/stations/list`) on receipt.
+    /// Relay a transport command to every listening client. The body
+    /// carries only what changed, so "mute" does not also reset volume.
+    func pushTransportSSE(muted: Bool?, volume: Double?) {
+        guard !sseSubscribers.isEmpty else { return }
+        var fields: [String] = []
+        if let muted { fields.append("\"muted\":\(muted)") }
+        if let volume {
+            // Clamp here rather than trusting the wire: a slider is a
+            // slider, but this endpoint is reachable by anything.
+            let v = min(1, max(0, volume))
+            fields.append("\"volume\":\(v)")
+        }
+        guard !fields.isEmpty else { return }
+        let event = Self.sseEvent(Data("{\(fields.joined(separator: ","))}".utf8), name: "transport")
+        for (id, conn) in sseSubscribers {
+            Task { [weak self] in
+                let ok = await Self.send(data: event, on: conn)
+                if !ok { await MainActor.run { self?.removeSSE(id) } }
+            }
+        }
+    }
+
     func pushStationsSSE() {
         guard !sseSubscribers.isEmpty else { return }
         let event = Self.sseEvent(Data("{}".utf8), name: "stations")
@@ -2329,7 +2351,8 @@ public final class RadioBroadcaster: ObservableObject {
         "/stations/list", "/stations/create", "/stations/update",
         "/stations/delete", "/stations/start", "/stations/stop",
         "/stations/autostart",
-        "/policy/get", "/policy/set", "/taste", "/exclusions"
+        "/policy/get", "/policy/set", "/taste", "/exclusions",
+        "/transport"
     ]
 
     /// Ceiling on a JSON POST body. The largest legitimate payload today
@@ -2405,6 +2428,20 @@ public final class RadioBroadcaster: ObservableObject {
                 return Self.badRequest()
             }
             return await performBoostAsync(stationID: stationID, token: req.token)
+        case "/transport":
+            // The remote control. Volume lives in each browser, so one of
+            // the owner's browsers cannot reach another's speaker on its
+            // own — the broadcaster relays the keypress and every owner
+            // browser applies it. Deliberately NOT stored: this is a
+            // press, not a setting, so a browser that joins later keeps
+            // whatever volume it already had rather than inheriting a
+            // mute somebody sent an hour ago.
+            guard let req = try? decoder.decode(TransportRequest.self, from: body) else {
+                return Self.badRequest()
+            }
+            if let rejection = await ownerGate(req.token) { return rejection }
+            pushTransportSSE(muted: req.muted, volume: req.volume)
+            return (200, Data("{\"status\":\"ok\"}".utf8))
         case "/unlike":
             // Un-♥ — a mis-tap shouldn't be forever: clears the signal and
             // removes the file the ♥ copied (never a library original).
@@ -2724,6 +2761,15 @@ public final class RadioBroadcaster: ObservableObject {
     /// takes the ordinary rejection path instead of a 400.
     struct AuthRequest: Decodable {
         let token: String?
+    }
+
+    /// JSON body accepted by `POST /transport` — the remote control.
+    /// Both fields optional and independent: sending `muted` alone must
+    /// not disturb a volume the other browsers already have.
+    struct TransportRequest: Decodable {
+        let token: String?
+        let muted: Bool?
+        let volume: Double?
     }
 
     /// JSON body accepted by `POST /like`. Kept internal to the broadcaster
@@ -3435,7 +3481,7 @@ public final class RadioBroadcaster: ObservableObject {
     /// join with the CRUD routes) and never renamed.
     nonisolated static let healthCapabilities = [
         "health", "stations", "vocab", "policy", "taste", "exclusions",
-        "trackinfo"
+        "trackinfo", "transport"
     ]
     /// Window over which `/health` judges each station's liveness.
     /// Ten minutes ≈ a handful of heartbeats: long enough that one
