@@ -55,6 +55,28 @@ public actor LastFMClient {
     /// more" boilerplate removed, capped at a sentence boundary (see
     /// ``plainBio(_:)``), so no caller ever has to sanitize HTML.
     public struct ArtistInfo: Sendable, Hashable {
+        /// True when Last.fm's biography is describing SEVERAL artists who
+        /// merely share this name, not the one that is playing.
+        ///
+        /// Last.fm keys artists by name, so a Japanese algorithmic composer
+        /// called "uro" collects the biography, tags, listener count and
+        /// neighbours of a Danish anarcho-punk band of the same name. The
+        /// wire drops the whole record when this is set: nothing in it can
+        /// be attributed to the artist on air, and confidently wrong facts
+        /// are worse than none.
+        public var isAmbiguous: Bool { Self.readsAsDisambiguation(bio) }
+
+        /// Last.fm writes those entries in one of two house styles — an
+        /// explicit preamble, or a bare enumeration that starts at "1)".
+        static func readsAsDisambiguation(_ bio: String?) -> Bool {
+            guard let bio else { return false }
+            let head = bio.prefix(200).lowercased()
+            if head.contains("more than one artist") { return true }
+            if head.contains("multiple artists") { return true }
+            let trimmed = bio.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.hasPrefix("1)") || trimmed.hasPrefix("1.)")
+        }
+
         public let bio: String?
         public let listeners: Int?
         public let playcount: Int?

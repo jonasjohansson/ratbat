@@ -210,6 +210,13 @@ extension RadioBroadcaster {
             // leaves nulls, never a 5xx.
             var lfArtist: LastFMClient.ArtistInfo?
             if let lastFM { lfArtist = try? await lastFM.artistInfo(artist) }
+            // Last.fm keys artists by NAME. When several share one, the
+            // record it returns belongs to all of them and therefore to
+            // none — a Bandcamp composer called "uro" was being given a
+            // Danish anarcho-punk band's biography, tags, neighbours and
+            // 11.6K listeners. Drop the lot: the card says nothing rather
+            // than something false.
+            if lfArtist?.isAmbiguous == true { lfArtist = nil }
             let country = await mb.countryCode(forArtist: artist)
             artistPayload = TrackInfoArtistPayload(
                 bio: lfArtist?.bio,

@@ -257,5 +257,31 @@ final class LastFMClientTests: XCTestCase {
             XCTFail("wrong error kind: \(error)")
         }
     }
+    // MARK: - Name collisions
+
+    /// Last.fm keys artists by name, so "uro" the Bandcamp composer is
+    /// handed URO the Danish anarcho-punk band. The record is flagged so
+    /// the wire can drop it instead of describing the wrong musician.
+    func testArtistInfoFlagsLastFMsDisambiguationEntries() throws {
+        let enumerated = LastFMClient.ArtistInfo(
+            bio: "1) Anarcho-punk from Denmark with female vocals and cello. 2) URO are based in Lecce (Italy).",
+            listeners: 11600, playcount: 90000, tags: ["crust"], similar: ["Paragraf 119"])
+        XCTAssertTrue(enumerated.isAmbiguous, "an entry that starts at 1) is a list of namesakes")
+
+        let preamble = LastFMClient.ArtistInfo(
+            bio: "There is more than one artist with this name, including: Caribou is Canadian Dan Snaith…",
+            listeners: 1, playcount: 1, tags: [], similar: [])
+        XCTAssertTrue(preamble.isAmbiguous, "so is the explicit preamble")
+
+        let plain = LastFMClient.ArtistInfo(
+            bio: "MJ Cole (born Matthew James Firth Coleman, 1973) is a house and UK garage producer.",
+            listeners: 331_900, playcount: 1, tags: ["uk garage"], similar: ["Wookie"])
+        XCTAssertFalse(plain.isAmbiguous, "a biography about one artist is not a collision")
+
+        XCTAssertFalse(
+            LastFMClient.ArtistInfo(bio: nil, listeners: nil, playcount: nil, tags: [], similar: []).isAmbiguous,
+            "no biography is not evidence of a collision")
+    }
 }
+
 #endif
