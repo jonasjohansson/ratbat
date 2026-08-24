@@ -2548,6 +2548,15 @@ final class RadioBroadcasterTests: XCTestCase {
             ("FAFA", nil),
             // A one-letter remnant is punctuation, not a name.
             ("A ft. B", nil),
+            // " and " and " with " are NOT separators. A band called
+            // "Horns And Drums" is one act, and splitting it handed a
+            // disco track the biography of a Chilean black metal band
+            // called Horns. Found in production after the first pass.
+            ("Horns And Drums", nil),
+            ("Florence and the Machine", nil),
+            ("Nick Cave with the Bad Seeds", nil),
+            // The unambiguous joins still split.
+            ("Horns And Drums, Someone Else", "Horns And Drums"),
         ]
         for (credit, expected) in cases {
             XCTAssertEqual(

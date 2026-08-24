@@ -131,12 +131,19 @@ extension RadioBroadcaster {
     /// shape of that, and the payload always reports the full credit as
     /// `artist` regardless of which name was asked about.
     nonisolated static func primaryArtist(_ credit: String) -> String? {
+        // Only the joins that are unambiguously joins. " and " and
+        // " with " are NOT here, deliberately: a band called "Horns And
+        // Drums" is one act, and splitting it handed a disco track the
+        // biography of a Chilean black metal band called Horns. The cost
+        // of not splitting is a missing dossier; the cost of splitting
+        // wrongly is a confident lie, so this list errs short.
+        //
         // Longest-first within each family so " feat. " is found before
         // " feat ", and the loop converges on the earliest separator.
         let separators = [
             ",", " & ", " + ", " x ", " × ",
             " featuring ", " feat. ", " feat ", " ft. ", " ft ",
-            " with ", " vs. ", " vs ", " and ",
+            " vs. ", " vs ",
         ]
         var cut = credit
         for sep in separators {
