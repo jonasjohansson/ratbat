@@ -111,6 +111,46 @@ extension RadioBroadcaster {
         }
     }
 
+    // MARK: - Artist names
+
+    /// The first name in a credit that lists several, or nil if the credit
+    /// names one artist.
+    ///
+    /// Sources join collaborators into a single string — NTS tracklists
+    /// and Bandcamp both do it — so a track credited to "Carrot Green,
+    /// Selvagem, Marvin & Guy" asks every catalogue about an artist of
+    /// that name, and no catalogue has one. Enrichment came back empty for
+    /// every track with more than one person on it.
+    ///
+    /// Only ever used as a FALLBACK, after the full credit has been looked
+    /// up and found nothing. That ordering is what makes the comma safe:
+    /// "Earth, Wind & Fire" is a real artist, Last.fm answers for it, and
+    /// this is never reached. The residual risk is a genuinely obscure
+    /// two-name act that no catalogue knows, where the first name happens
+    /// to be someone else — the disambiguation guard catches the common
+    /// shape of that, and the payload always reports the full credit as
+    /// `artist` regardless of which name was asked about.
+    nonisolated static func primaryArtist(_ credit: String) -> String? {
+        // Longest-first within each family so " feat. " is found before
+        // " feat ", and the loop converges on the earliest separator.
+        let separators = [
+            ",", " & ", " + ", " x ", " × ",
+            " featuring ", " feat. ", " feat ", " ft. ", " ft ",
+            " with ", " vs. ", " vs ", " and ",
+        ]
+        var cut = credit
+        for sep in separators {
+            if let r = cut.range(of: sep, options: [.caseInsensitive]) {
+                cut = String(cut[..<r.lowerBound])
+            }
+        }
+        let trimmed = cut.trimmingCharacters(in: .whitespacesAndNewlines)
+        // A one-letter remnant is punctuation, not a name.
+        guard trimmed.count >= 2,
+              trimmed.caseInsensitiveCompare(credit) != .orderedSame else { return nil }
+        return trimmed
+    }
+
     // MARK: - Query parsing
 
     /// Pull `station` / `entry` out of a `/trackinfo?…` path. The router
@@ -208,16 +248,34 @@ extension RadioBroadcaster {
             // is left to its own actor. `try?` throughout: enrichment
             // failing is not the radio failing, so upstream trouble
             // leaves nulls, never a 5xx.
-            var lfArtist: LastFMClient.ArtistInfo?
-            if let lastFM { lfArtist = try? await lastFM.artistInfo(artist) }
             // Last.fm keys artists by NAME. When several share one, the
             // record it returns belongs to all of them and therefore to
             // none — a Bandcamp composer called "uro" was being given a
             // Danish anarcho-punk band's biography, tags, neighbours and
             // 11.6K listeners. Drop the lot: the card says nothing rather
             // than something false.
-            if lfArtist?.isAmbiguous == true { lfArtist = nil }
-            let country = await mb.countryCode(forArtist: artist)
+            var lfArtist: LastFMClient.ArtistInfo?
+            var ambiguous = false
+            // The name to ASK about, which is not always the name on the
+            // track — see `primaryArtist`.
+            var lookupName = artist
+            if let lastFM {
+                if let full = try? await lastFM.artistInfo(artist) {
+                    if full.isAmbiguous { ambiguous = true } else { lfArtist = full }
+                }
+                if lfArtist == nil, let primary = Self.primaryArtist(artist),
+                   let retry = try? await lastFM.artistInfo(primary), !retry.isAmbiguous {
+                    lfArtist = retry
+                    lookupName = primary
+                    // The first name answered cleanly, so whatever the
+                    // full credit did is no longer the story.
+                    ambiguous = false
+                }
+            }
+            // MusicBrainz is keyed by name too, so a name we have just
+            // established is shared is no more trustworthy there. Ask only
+            // about a name we are willing to attribute an answer to.
+            let country = ambiguous ? nil : await mb.countryCode(forArtist: lookupName)
             artistPayload = TrackInfoArtistPayload(
                 bio: lfArtist?.bio,
                 listeners: lfArtist?.listeners,
@@ -229,9 +287,20 @@ extension RadioBroadcaster {
                 country: country
             )
             if !title.isEmpty {
+                // Same fallback for the track: "A, B — Title" is not a
+                // track by anyone, and `lookupName` already holds the name
+                // that answered for the artist.
                 var lfTrack: LastFMClient.TrackInfo?
-                if let lastFM { lfTrack = try? await lastFM.trackInfo(artist: artist, title: title) }
-                let year = await mb.firstReleaseYear(artist: artist, title: title)
+                if let lastFM {
+                    lfTrack = try? await lastFM.trackInfo(artist: artist, title: title)
+                    if lfTrack == nil, lookupName != artist {
+                        lfTrack = try? await lastFM.trackInfo(artist: lookupName, title: title)
+                    }
+                }
+                var year = await mb.firstReleaseYear(artist: lookupName, title: title)
+                if year == nil, lookupName != artist {
+                    year = await mb.firstReleaseYear(artist: artist, title: title)
+                }
                 trackPayload = TrackInfoTrackPayload(
                     album: lfTrack?.album,
                     playcount: lfTrack?.playcount,

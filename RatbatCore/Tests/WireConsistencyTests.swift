@@ -134,6 +134,48 @@ final class WireConsistencyTests: XCTestCase {
         )
     }
 
+    /// A listener who joins mid-track cannot infer how far in it is: the
+    /// stream carries no position. `elapsedSeconds` is the only thing that
+    /// tells them, and it is a delta rather than a start timestamp because
+    /// a browser's clock can be minutes off a server's.
+    func testElapsedSecondsIsMeasuredFromWhenTheTrackStarted() throws {
+        let item = TrackSourceItem(
+            url: URL(fileURLWithPath: "/tmp/x.m4a"),
+            duration: 390, origin: .nts
+        )
+        let started = Date().addingTimeInterval(-42)
+        let elapsed = try XCTUnwrap(
+            RadioBroadcaster.NowTrack(item, startedAt: started).elapsedSeconds
+        )
+        XCTAssertEqual(elapsed, 42, accuracy: 1.0, "42 seconds in, and it says so")
+
+        // Clamped to the track's own length: a station parked at a
+        // boundary with no listener holds its last track as `current`, and
+        // must not report it as more than finished.
+        let overrun = try XCTUnwrap(
+            RadioBroadcaster.NowTrack(item, startedAt: Date().addingTimeInterval(-9_000))
+                .elapsedSeconds
+        )
+        XCTAssertEqual(overrun, 390, "never past the end of what it describes")
+
+        // A track nobody measured cannot be clamped, but it can still be
+        // counted — an unknown length is not an unknown position.
+        let unmeasured = TrackSourceItem(url: URL(fileURLWithPath: "/tmp/y.m4a"), origin: .nts)
+        let counted = try XCTUnwrap(
+            RadioBroadcaster.NowTrack(unmeasured, startedAt: Date().addingTimeInterval(-10))
+                .elapsedSeconds
+        )
+        XCTAssertEqual(counted, 10, accuracy: 1.0)
+
+        // No start time is not a position of zero. Recent and upcoming
+        // tracks are built this way, and a zero would invite a client to
+        // render a clock for something silent.
+        XCTAssertNil(
+            RadioBroadcaster.NowTrack(item).elapsedSeconds,
+            "a track that is not playing has no position"
+        )
+    }
+
     /// A decoder with nothing open has no duration to report, and must say
     /// so rather than returning zero — zero is a playing time.
     func testClosedDecoderReportsNoDuration() {

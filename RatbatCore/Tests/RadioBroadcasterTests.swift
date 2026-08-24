@@ -2287,6 +2287,79 @@ final class RadioBroadcasterTests: XCTestCase {
         XCTAssertNotNil(only.currentTrack, "Expected current track after warmup")
     }
 
+    /// A listener who joins mid-track cannot infer how far in it is: the
+    /// stream carries no position and, until this, neither did the wire.
+    /// A browser reloaded three minutes into a six-minute track therefore
+    /// started its own clock at zero and read "0:00 / 6:30".
+    @MainActor
+    func testNowJSONSaysHowFarIntoTheTrackTheBroadcastIs() async throws {
+        guard let tracks = try await Self.loadFixtureTracks(bundle: Bundle(for: Self.self)) else {
+            throw XCTSkip("Fixtures missing")
+        }
+        let port: UInt16 = 18_141
+        let radio = RadioBroadcaster(port: port)
+        let station = Station(name: "Elapsed", kind: .playlist(queue: tracks))
+        await radio.startBroadcast(station: station)
+        defer { radio.stopAll() }
+
+        struct Wire: Decodable {
+            struct Station: Decodable {
+                let currentTrack: Track?
+                let nextTrack: Track?
+                let recent: [Track]
+            }
+            struct Track: Decodable {
+                let durationSeconds: Double?
+                let elapsedSeconds: Double?
+            }
+            let stations: [Station]
+        }
+        func read() async throws -> Wire.Station {
+            let (data, _) = try await Self.fetchPayload(port: port, path: "/now.json")
+            let decoded = try JSONDecoder().decode(Wire.self, from: data)
+            return try XCTUnwrap(decoded.stations.first)
+        }
+
+        var first: Wire.Station?
+        for _ in 0..<10 {
+            try await Task.sleep(nanoseconds: 500_000_000)
+            let s = try await read()
+            if s.currentTrack?.elapsedSeconds != nil { first = s; break }
+        }
+        let early = try XCTUnwrap(
+            first?.currentTrack?.elapsedSeconds,
+            "the current track must report a position"
+        )
+
+        XCTAssertGreaterThanOrEqual(early, 0)
+
+        // It only ever moves forward within a track. The rate is not
+        // asserted here: these fixtures are seconds long and nothing is
+        // listening, so the station parks at the first boundary and the
+        // clock stops at the track's length — which is the clamp doing its
+        // job. WireConsistencyTests covers the arithmetic exactly.
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+        let station2 = try await read()
+        let later = try XCTUnwrap(station2.currentTrack?.elapsedSeconds)
+        XCTAssertGreaterThanOrEqual(later, early, "the position never runs backwards")
+
+        // Never past the end of the track it is describing: a station
+        // parked at a boundary must not report a track more than finished.
+        if let d = station2.currentTrack?.durationSeconds {
+            XCTAssertLessThanOrEqual(later, d, "clamped to the track's own length")
+        }
+
+        // Only the CURRENT track has a position. One in the recent ring is
+        // over and one in `nextTrack` has not begun; a number for either
+        // would invite a client to render a clock for something silent.
+        for t in station2.recent {
+            XCTAssertNil(t.elapsedSeconds, "a finished track has no position")
+        }
+        if let next = station2.nextTrack {
+            XCTAssertNil(next.elapsedSeconds, "nor has one that hasn't started")
+        }
+    }
+
     /// Startup edge: the broadcaster is running (we need *something* to
     /// bind the listener) but then we stop the only station. That
     /// immediately tears the listener down — so verifying "empty /now.json"
@@ -2457,6 +2530,36 @@ final class RadioBroadcasterTests: XCTestCase {
     private actor CannedMusicBrainz: MusicBrainzLookup {
         func firstReleaseYear(artist: String, title: String) async -> Int? { 1998 }
         func countryCode(forArtist artist: String) async -> String? { "SE" }
+    }
+
+    /// Sources join collaborators into one string, so a track credited to
+    /// "Carrot Green, Selvagem, Marvin & Guy" asks every catalogue about
+    /// an artist of that name and no catalogue has one. Enrichment came
+    /// back empty for every track with more than one person on it.
+    func testPrimaryArtistSplitsCollaborationCredits() {
+        let cases: [(String, String?)] = [
+            ("Carrot Green, Selvagem, Marvin & Guy", "Carrot Green"),
+            ("Rinzen, Michael Sundius", "Rinzen"),
+            ("Khalab, Tamar Collocutor", "Khalab"),
+            ("Aphex Twin feat. Someone", "Aphex Twin"),
+            ("Massive Attack vs. Mad Professor", "Massive Attack"),
+            // Nothing to fall back to: no second lookup should be made.
+            ("Bernard Wright", nil),
+            ("FAFA", nil),
+            // A one-letter remnant is punctuation, not a name.
+            ("A ft. B", nil),
+        ]
+        for (credit, expected) in cases {
+            XCTAssertEqual(
+                RadioBroadcaster.primaryArtist(credit), expected,
+                "credit: \(credit)"
+            )
+        }
+        // Documented trap: a band whose own name contains a separator
+        // splits wrongly in isolation. It is never reached, because the
+        // fallback only runs after the FULL credit has been looked up and
+        // found nothing, and Last.fm answers for this one.
+        XCTAssertEqual(RadioBroadcaster.primaryArtist("Earth, Wind & Fire"), "Earth")
     }
 
     /// `/trackinfo` answers only for tracks the station is (or just was)

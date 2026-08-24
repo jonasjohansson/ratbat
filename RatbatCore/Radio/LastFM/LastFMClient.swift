@@ -66,15 +66,34 @@ public actor LastFMClient {
         /// are worse than none.
         public var isAmbiguous: Bool { Self.readsAsDisambiguation(bio) }
 
-        /// Last.fm writes those entries in one of two house styles — an
-        /// explicit preamble, or a bare enumeration that starts at "1)".
+        /// Last.fm writes these entries in two house styles: an explicit
+        /// preamble, or a bare enumeration of the acts that share the name.
+        ///
+        /// The enumeration is hand-typed by whoever edited the page, so its
+        /// punctuation is whatever they felt like — "1)", "1 )", "1.", "1
+        /// -". A Bandcamp producer called FAFA was handed an Indonesian
+        /// rapper and a Connecticut punk band merged into one biography
+        /// because the check tested for "1)" and the page began "1 )".
+        /// Strip the spaces before looking, and read past the marker: a
+        /// leading "1" only means a list if a "2" follows it.
         static func readsAsDisambiguation(_ bio: String?) -> Bool {
             guard let bio else { return false }
-            let head = bio.prefix(200).lowercased()
+            let head = String(bio.prefix(400)).lowercased()
             if head.contains("more than one artist") { return true }
             if head.contains("multiple artists") { return true }
-            let trimmed = bio.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.hasPrefix("1)") || trimmed.hasPrefix("1.)")
+            if head.contains("may refer to") { return true }
+            if head.contains("there are several artists") { return true }
+
+            // Whitespace is the part the editors disagree about, so it is
+            // the part to discard before matching.
+            let squeezed = head.filter { !$0.isWhitespace }
+            let opens = ["1)", "1.", "1-", "1:"]
+            let follows = ["2)", "2.", "2-", "2:"]
+            guard opens.contains(where: { squeezed.hasPrefix($0) }) else { return false }
+            // "1. " opening a perfectly ordinary sentence is rare but a
+            // biography that enumerates artists always reaches a second
+            // one. Requiring it keeps a real bio from being thrown away.
+            return follows.contains(where: { squeezed.contains($0) })
         }
 
         public let bio: String?

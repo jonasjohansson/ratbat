@@ -282,6 +282,39 @@ final class LastFMClientTests: XCTestCase {
             LastFMClient.ArtistInfo(bio: nil, listeners: nil, playcount: nil, tags: [], similar: []).isAmbiguous,
             "no biography is not evidence of a collision")
     }
+
+    /// The enumeration is hand-typed, so its punctuation is whatever the
+    /// editor felt like. A Bandcamp producer called FAFA was handed an
+    /// Indonesian rapper and a Connecticut punk band merged into one
+    /// biography because the check tested for "1)" and the page began
+    /// "1 )" — one space.
+    func testDisambiguationSurvivesTheEditorsPunctuation() throws {
+        let info = { (bio: String) in
+            LastFMClient.ArtistInfo(bio: bio, listeners: 882, playcount: 1, tags: [], similar: [])
+        }
+        let listed = [
+            "1 )  Indonesian female rapper\n\n2)   Meriden, Connecticut punk rock band",
+            "1) A band from Leeds\n2) A producer from Osaka",
+            "1. A band from Leeds\n2. A producer from Osaka",
+            "1 - A band from Leeds\n2 - A producer from Osaka",
+            "FAFA may refer to two unrelated acts.",
+            "There are several artists with this name.",
+        ]
+        for bio in listed {
+            XCTAssertTrue(info(bio).isAmbiguous, "should read as a list: \(bio.prefix(40))")
+        }
+
+        // A leading "1" is only a list if a "2" follows it, or every
+        // biography that opens with a year would be thrown away.
+        let single = [
+            "1963 was the year Bernard Wright was born in Queens, New York.",
+            "1. was how they titled the debut, and there was never a second.",
+            "Bernard Wright was an American keyboardist, born in Queens in 1963.",
+        ]
+        for bio in single {
+            XCTAssertFalse(info(bio).isAmbiguous, "should read as one artist: \(bio.prefix(40))")
+        }
+    }
 }
 
 #endif
