@@ -52,6 +52,17 @@ public final class RadioBroadcaster: ObservableObject {
     /// (not `Track`) so NTS-backed stations — which don't have a full
     /// library ``Track`` — can publish the same way as playlist stations.
     @Published public private(set) var currentItemByStation: [Station.ID: TrackSourceItem] = [:]
+
+    /// When each station's current track began playing out, so `/now.json`
+    /// can say how far into it the broadcast is.
+    ///
+    /// Nothing else on the wire carried this, and a listener cannot infer
+    /// it: a browser that joins a live stream three minutes into a track
+    /// has no way to know, so it started its own clock at zero and showed
+    /// `0:00 / 6:30` for something two thirds gone. Stamped in
+    /// ``updateCurrentItem`` — the one place a track becomes current, and
+    /// called once per track, right after the decoder opens the file.
+    private var currentItemStartedAt: [Station.ID: Date] = [:]
     /// Per-station prefetched next track. The encode loop resolves one
     /// track ahead (the dropout fix); publishing it lets /now.json show
     /// a truthful "next" — the only future track that's actually certain.
@@ -1383,6 +1394,7 @@ public final class RadioBroadcaster: ObservableObject {
         broadcasting.remove(stationID)
         listenerCount.removeValue(forKey: stationID)
         currentItemByStation.removeValue(forKey: stationID)
+        currentItemStartedAt.removeValue(forKey: stationID)
         upcomingByStation.removeValue(forKey: stationID)
         recentByStation.removeValue(forKey: stationID)
 
@@ -1581,8 +1593,10 @@ public final class RadioBroadcaster: ObservableObject {
             currentItemByStation[stationID] = item.withProbedFile(
                 artworkURL: probedArtwork, duration: measuredDuration
             )
+            currentItemStartedAt[stationID] = Date()
         } else {
             currentItemByStation.removeValue(forKey: stationID)
+            currentItemStartedAt.removeValue(forKey: stationID)
         }
         // A track change is exactly what /events subscribers are waiting
         // for — push the fresh now-playing snapshot.
@@ -3640,8 +3654,14 @@ public final class RadioBroadcaster: ObservableObject {
         let sourceURL: String?
         let youtubeURL: String?
         let origin: String
+        /// How far into this track the broadcast is, in seconds. Non-null
+        /// only for a station's CURRENT track — a track in the recent ring
+        /// is over and one in `nextTrack` has not begun, and publishing a
+        /// number for either would invite a client to render a clock for
+        /// something that is not playing.
+        let elapsedSeconds: Double?
 
-        init(_ item: TrackSourceItem) {
+        init(_ item: TrackSourceItem, startedAt: Date? = nil) {
             self.title = item.title ?? ""
             self.artist = item.artist ?? ""
             self.album = item.album
@@ -3650,11 +3670,23 @@ public final class RadioBroadcaster: ObservableObject {
             self.sourceURL = item.sourceURL
             self.youtubeURL = item.youtubeURL
             self.origin = item.origin.rawValue
+            // Elapsed rather than a start timestamp: a client's clock can
+            // be minutes off a server's, and a delta measured at the
+            // moment of the response needs neither side to agree on what
+            // time it is. Clamped to the track's own length so a station
+            // parked at a boundary cannot report a track more than
+            // finished.
+            if let startedAt {
+                let raw = Date().timeIntervalSince(startedAt)
+                self.elapsedSeconds = max(0, item.duration.map { min(raw, $0) } ?? raw)
+            } else {
+                self.elapsedSeconds = nil
+            }
         }
 
         enum CodingKeys: String, CodingKey {
             case title, artist, album, durationSeconds, artworkURL
-            case sourceURL, youtubeURL, origin
+            case sourceURL, youtubeURL, origin, elapsedSeconds
         }
 
         func encode(to encoder: Encoder) throws {
@@ -3669,6 +3701,7 @@ public final class RadioBroadcaster: ObservableObject {
             try c.encode(sourceURL, forKey: .sourceURL)
             try c.encode(youtubeURL, forKey: .youtubeURL)
             try c.encode(origin, forKey: .origin)
+            try c.encode(elapsedSeconds, forKey: .elapsedSeconds)
         }
     }
 
@@ -3741,7 +3774,9 @@ public final class RadioBroadcaster: ObservableObject {
                 broadcasting: true,
                 streamURL: "/stream/\(pipeline.station.slug).aac",
                 listeners: listenerCount[stationID] ?? 0,
-                currentTrack: currentItemByStation[stationID].map(NowTrack.init),
+                currentTrack: currentItemByStation[stationID].map {
+                    NowTrack($0, startedAt: currentItemStartedAt[stationID])
+                },
                 recent: (recentByStation[stationID] ?? []).map {
                     RecentPayload(
                         track: NowTrack($0.item),
@@ -3749,7 +3784,7 @@ public final class RadioBroadcaster: ObservableObject {
                         playedAt: $0.playedAt.timeIntervalSince1970
                     )
                 },
-                nextTrack: upcomingByStation[stationID].map(NowTrack.init)
+                nextTrack: upcomingByStation[stationID].map { NowTrack($0) }
             )
         }
 

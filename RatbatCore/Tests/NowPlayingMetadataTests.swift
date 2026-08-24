@@ -17,8 +17,13 @@ final class NowPlayingMetadataTests: XCTestCase {
 
     /// The key set every track object in `/now.json` must carry, whatever
     /// its source. `recent` entries add `entryID` + `playedAt` on top.
+    /// Every track object carries every key, in every position — the
+    /// invariant this file exists to defend. `elapsedSeconds` is null
+    /// anywhere but the current track (a finished one has no position and
+    /// an upcoming one has not started), but the KEY is there, so a client
+    /// can tell "not playing" from "this build doesn't say".
     static let trackKeys: Set<String> = [
-        "album", "artist", "artworkURL", "durationSeconds",
+        "album", "artist", "artworkURL", "durationSeconds", "elapsedSeconds",
         "origin", "sourceURL", "title", "youtubeURL",
     ]
 
