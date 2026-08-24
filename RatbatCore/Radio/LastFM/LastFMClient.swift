@@ -79,19 +79,36 @@ public actor LastFMClient {
         static func readsAsDisambiguation(_ bio: String?) -> Bool {
             guard let bio else { return false }
             let head = String(bio.prefix(400)).lowercased()
-            if head.contains("more than one artist") { return true }
-            if head.contains("multiple artists") { return true }
-            if head.contains("may refer to") { return true }
-            if head.contains("there are several artists") { return true }
+            // The preambles, in the wordings Last.fm's editors actually
+            // use. "there are at least 7 bands called Horns" is one of
+            // them, and it matched none of the phrases this list started
+            // with — which is how a disco track came to be described as
+            // Chilean raw black metal.
+            let preambles = [
+                "more than one artist", "multiple artists", "may refer to",
+                "several artists", "bands called", "artists called",
+                "artists named", "artists with this name", "bands with this name",
+                "bands named", "at least",
+            ]
+            if preambles.contains(where: { head.contains($0) }) { return true }
 
             // Whitespace is the part the editors disagree about, so it is
             // the part to discard before matching.
             let squeezed = head.filter { !$0.isWhitespace }
-            let opens = ["1)", "1.", "1-", "1:"]
-            let follows = ["2)", "2.", "2-", "2:"]
+
+            // A parenthesised enumeration ANYWHERE in the opening is the
+            // giveaway, not just one that starts the biography: the list
+            // often follows a sentence of preamble, and requiring it at
+            // the front is what let the "Horns" entry through.
+            if squeezed.contains("1)") && squeezed.contains("2)") { return true }
+
+            // The other punctuations are weaker — a discography can be
+            // numbered "1." — so for those, keep requiring the list to
+            // open the biography.
+            let opens = ["1.", "1-", "1:"]
+            let follows = ["2.", "2-", "2:"]
             guard opens.contains(where: { squeezed.hasPrefix($0) }) else { return false }
-            // "1. " opening a perfectly ordinary sentence is rare but a
-            // biography that enumerates artists always reaches a second
+            // A biography that enumerates artists always reaches a second
             // one. Requiring it keeps a real bio from being thrown away.
             return follows.contains(where: { squeezed.contains($0) })
         }

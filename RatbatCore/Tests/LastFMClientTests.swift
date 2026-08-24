@@ -299,6 +299,14 @@ final class LastFMClientTests: XCTestCase {
             "1 - A band from Leeds\n2 - A producer from Osaka",
             "FAFA may refer to two unrelated acts.",
             "There are several artists with this name.",
+            // Found in the wild after the first pass shipped: the
+            // enumeration follows a sentence of preamble rather than
+            // opening the entry, and the preamble is worded in a way the
+            // first list of phrases did not cover. A disco track credited
+            // to "Horns And Drums" was handed this.
+            "There are at least 7 bands called Horns.\n\n1) A raw black metal from Chile.\n\n2) A black metal band from Poland.",
+            "There are at least two artists using this name.",
+            "Two bands named Mirror have released records.",
         ]
         for bio in listed {
             XCTAssertTrue(info(bio).isAmbiguous, "should read as a list: \(bio.prefix(40))")
