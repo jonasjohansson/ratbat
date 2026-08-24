@@ -306,7 +306,11 @@ final class LastFMClientTests: XCTestCase {
             // to "Horns And Drums" was handed this.
             "There are at least 7 bands called Horns.\n\n1) A raw black metal from Chile.\n\n2) A black metal band from Poland.",
             "There are at least two artists using this name.",
-            "Two bands named Mirror have released records.",
+            // Found in production one deploy after "Horns": the preamble
+            // counts the acts in yet another wording, with a typo, and the
+            // enumeration underneath uses dots rather than parens.
+            "There are two artists usung the name Via Maris \n\n1. Bristol-based electronica. \n\n2. An Israeli duo.",
+            "There are three bands named Mirror.",
         ]
         for bio in listed {
             XCTAssertTrue(info(bio).isAmbiguous, "should read as a list: \(bio.prefix(40))")
@@ -318,6 +322,12 @@ final class LastFMClientTests: XCTestCase {
             "1963 was the year Bernard Wright was born in Queens, New York.",
             "1. was how they titled the debut, and there was never a second.",
             "Bernard Wright was an American keyboardist, born in Queens in 1963.",
+            "Antonio \"Tony\" Esposito is a musician and drummer from Italy, born July 15, 1950.",
+            // The counting sentence needs a COUNT. Without requiring one,
+            // this reads as a disambiguation entry and a real biography is
+            // thrown away for containing the word "artist".
+            "There is a warmth to this artist's records that comes from tape.",
+            "Releases: 1. First Album 2. Second Album — all by the same producer.",
         ]
         for bio in single {
             XCTAssertFalse(info(bio).isAmbiguous, "should read as one artist: \(bio.prefix(40))")

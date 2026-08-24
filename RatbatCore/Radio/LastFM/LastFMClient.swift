@@ -79,38 +79,40 @@ public actor LastFMClient {
         static func readsAsDisambiguation(_ bio: String?) -> Bool {
             guard let bio else { return false }
             let head = String(bio.prefix(400)).lowercased()
-            // The preambles, in the wordings Last.fm's editors actually
-            // use. "there are at least 7 bands called Horns" is one of
-            // them, and it matched none of the phrases this list started
-            // with — which is how a disco track came to be described as
-            // Chilean raw black metal.
-            let preambles = [
-                "more than one artist", "multiple artists", "may refer to",
-                "several artists", "bands called", "artists called",
-                "artists named", "artists with this name", "bands with this name",
-                "bands named", "at least",
-            ]
-            if preambles.contains(where: { head.contains($0) }) { return true }
+
+            // The dominant house style is a sentence that COUNTS the acts
+            // sharing a name: "There are two artists using the name X",
+            // "There is more than one artist with this name", "There are
+            // at least 7 bands called Horns". Matched by shape rather than
+            // by a list of phrases, because three of these reached
+            // production one after another, each worded in a way the
+            // previous phrase list did not cover — one of them with a typo
+            // in it ("usung").
+            //
+            // The quantifier is the whole signal, and is required: without
+            // it, "There is a warmth to this artist's records" reads as a
+            // disambiguation entry and a real biography gets thrown away.
+            let counted = #"there (are|is)\b[^.]{0,40}?\b(\d+|two|three|four|five|six|seven|eight|nine|ten|several|many|multiple|numerous|at least|more than one)\b[^.]{0,40}?\b(artist|artists|band|bands|act|acts|project|projects)\b"#
+            if head.range(of: counted, options: .regularExpression) != nil { return true }
+            if head.contains("may refer to") { return true }
+            if head.contains("multiple artists") { return true }
+            if head.contains("more than one artist") { return true }
 
             // Whitespace is the part the editors disagree about, so it is
-            // the part to discard before matching.
+            // the part to discard before matching an enumeration.
             let squeezed = head.filter { !$0.isWhitespace }
-
-            // A parenthesised enumeration ANYWHERE in the opening is the
-            // giveaway, not just one that starts the biography: the list
-            // often follows a sentence of preamble, and requiring it at
-            // the front is what let the "Horns" entry through.
+            // Parenthesised, it is a list wherever it appears — the entry
+            // often opens with a sentence of preamble first.
             if squeezed.contains("1)") && squeezed.contains("2)") { return true }
-
-            // The other punctuations are weaker — a discography can be
-            // numbered "1." — so for those, keep requiring the list to
-            // open the biography.
+            // The weaker punctuations are ambiguous, because a numbered
+            // discography looks exactly the same. They need corroboration:
+            // either the list opens the entry, or the entry is talking
+            // about artists in the plural.
             let opens = ["1.", "1-", "1:"]
             let follows = ["2.", "2-", "2:"]
-            guard opens.contains(where: { squeezed.hasPrefix($0) }) else { return false }
-            // A biography that enumerates artists always reaches a second
-            // one. Requiring it keeps a real bio from being thrown away.
-            return follows.contains(where: { squeezed.contains($0) })
+            guard follows.contains(where: { squeezed.contains($0) }) else { return false }
+            if opens.contains(where: { squeezed.hasPrefix($0) }) { return true }
+            return head.contains("artists") || head.contains("bands") || head.contains("projects")
         }
 
         public let bio: String?
