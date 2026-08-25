@@ -119,4 +119,41 @@ final class StreamPacingTests: XCTestCase {
             "the client clamps at 30s; a larger lead would arrive silently truncated"
         )
     }
+
+    // MARK: - The ring has to be able to hold the lead
+
+    /// `pace()` deliberately writes up to `broadcastLeadSeconds` past the
+    /// playout head, and that audio sits in the ring until a listener
+    /// drains it. A ring smaller than the lead therefore laps every reader
+    /// at steady state — not merely after a stalled read.
+    ///
+    /// The old fixed 128KB was exactly that: 8.2s at 128 kbps but 4.1s at
+    /// the 256 kbps the station actually broadcasts, i.e. under the 5s
+    /// lead. Sizing in bytes hid it, because the number only looked wrong
+    /// once you divided by a bitrate.
+    func testRingHoldsTheEncoderLeadAtEveryQuality() {
+        let lead = RadioBroadcaster.broadcastLeadSeconds
+        for quality in AudioQuality.allCases {
+            let bytes = AACRingBuffer.capacity(
+                bitrate: quality.bitrate, seconds: lead * 2
+            )
+            let seconds = Double(bytes) / (Double(quality.bitrate) / 8)
+            XCTAssertGreaterThan(
+                seconds, lead,
+                "\(quality.rawValue) (\(quality.bitrate) bps): ring holds \(seconds)s, under the \(lead)s lead"
+            )
+        }
+    }
+
+    /// Pins the specific regression, so the old constant cannot come back
+    /// without someone reading why it went.
+    func testFixedByteRingWasUnderTheLeadAtMaxQuality() {
+        let lead = RadioBroadcaster.broadcastLeadSeconds
+        let legacySeconds = Double(128 * 1024) / (256_000.0 / 8)
+        XCTAssertEqual(legacySeconds, 4.096, accuracy: 0.001)
+        XCTAssertLessThan(legacySeconds, lead, "this is the bug: ring smaller than the lead")
+
+        let fixed = AACRingBuffer.capacity(bitrate: 256_000, seconds: lead * 2)
+        XCTAssertGreaterThan(Double(fixed) / (256_000.0 / 8), lead)
+    }
 }

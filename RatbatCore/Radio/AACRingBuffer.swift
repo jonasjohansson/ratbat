@@ -51,16 +51,39 @@ final class AACRingBuffer: @unchecked Sendable {
     /// stays gapless; only rejection cuts the backlog.
     private var liveEdgeFloor: UInt64 = 0
 
+    /// Bytes needed to hold `seconds` of audio encoded at `bitrate` bps.
+    ///
+    /// Sizing in *seconds* rather than bytes is the whole point: a fixed
+    /// byte count silently means different amounts of audio at different
+    /// quality presets, and the preset in use is the one it was wrong for.
+    static func capacity(bitrate: Int, seconds: Double) -> Int {
+        max(Int(Double(bitrate) / 8 * seconds), 1024)
+    }
+
+    /// Ring sized to hold `seconds` of audio at `bitrate`.
+    convenience init(bitrate: Int, seconds: Double) {
+        self.init(capacity: Self.capacity(bitrate: bitrate, seconds: seconds))
+    }
+
+    /// - Parameter capacity: bytes. Prefer ``init(bitrate:seconds:)`` —
+    ///   this overload exists for tests that want an exact, tiny ring.
     init(capacity: Int = 128 * 1024) {
-        // Default ~128KB. At 128 kbps that's roughly 8s of AAC. The
-        // one-track-ahead prefetch in the encode loop now hides the big
-        // per-track resolve/decode-open gaps, so this ring no longer has
-        // to cover a track boundary — it's purely jitter insurance for
-        // mid-track read hiccups (e.g. a slow Drive block fetch). A few
-        // extra seconds of runway is a cheap trade against the ~8s it
-        // adds between the broadcaster's "Now:" UI and what the listener
-        // hears; clients buffer 5-30s on top of this anyway, so the ring
-        // is a minor contributor to total desync.
+        // This default used to be the only way to build a ring, described
+        // as "~128KB, at 128 kbps roughly 8s of AAC". Both halves were a
+        // trap: the station broadcasts at `max` (256 kbps), where the same
+        // 128KB is 4.1s — and the encode loop deliberately runs
+        // `broadcastLeadSeconds` (5s) ahead of the playout head. So the
+        // encoder's own runway did not fit in the buffer holding it, and
+        // every listener was lapped at steady state rather than only after
+        // a stalled read.
+        //
+        // Callers now size in seconds against the real bitrate. The
+        // one-track-ahead prefetch does hide the per-track resolve gaps,
+        // so this ring is not covering a track boundary — but it must
+        // still hold the encoder's full lead, plus margin for a reader
+        // whose socket stalls (a slow Drive block fetch). It does not add
+        // to listener desync: the lead is what sets that, and the ring
+        // merely has to be big enough to contain it.
         self.capacity = max(capacity, 1024)
         self.storage = [UInt8](repeating: 0, count: self.capacity)
     }

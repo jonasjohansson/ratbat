@@ -1276,7 +1276,16 @@ public final class RadioBroadcaster: ObservableObject {
 
         let pipeline = BroadcastPipeline(
             station: station,
-            buffer: AACRingBuffer(),
+            // The ring has to hold the encoder's whole lead — `pace()`
+            // writes up to `broadcastLeadSeconds` past the playout head,
+            // and that audio lives here until a listener drains it — plus
+            // as much again as margin for a reader whose socket stalls.
+            // Sized against the real bitrate, because the old fixed 128KB
+            // was under the lead itself at this station's 256 kbps.
+            buffer: AACRingBuffer(
+                bitrate: bitrate,
+                seconds: Self.broadcastLeadSeconds * 2
+            ),
             bitrate: bitrate,
             sampleRate: sampleRate,
             source: source
