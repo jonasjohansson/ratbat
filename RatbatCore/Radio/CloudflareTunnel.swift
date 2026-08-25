@@ -206,6 +206,18 @@ public final class CloudflareTunnel: ObservableObject {
             return
         }
 
+        // Adopt-and-kill anything the last run leaked, before adding a
+        // replica of our own. `applicationWillTerminate` covers ordinary
+        // exits, but SIGKILL is uncatchable, so orphans still happen and
+        // this is where they get cleaned up. Scoped to our own bundle's
+        // binary with PPID 1 — see ``TunnelReaper.orphans``, which is
+        // deliberately narrow because its output is fed to `kill`.
+        //
+        // Done before spawning so the edge is not briefly serving three
+        // replicas, and so a reaped one has drained by the time ours
+        // registers.
+        TunnelReaper.reapOrphans(bundledBinary: binary.path, logger: logger)
+
         let useNamed = environment.namedTunnelConfigured()
         let args: [String]
         if useNamed {
@@ -487,33 +499,89 @@ public final class CloudflareTunnel: ObservableObject {
         })
     }
 
-    /// Line-buffer a pipe on a background task, handing each complete line
-    /// to `sink`. Ends at EOF, which is also when the child has gone.
+    /// Line-buffer a pipe, handing each complete line to `sink`. Ends at
+    /// EOF, which is also when the child has gone.
+    ///
+    /// Event-driven, via `readabilityHandler`, rather than a blocking
+    /// `read(upToCount:)` in a `Task.detached`. The old shape delivered
+    /// cloudflared's output **13 minutes late** — measured: a line
+    /// cloudflared emitted at 18:24:35 reached the log at 18:38:00, and
+    /// then only because the process was killed and the pipe hit EOF. Nine
+    /// lines would land inside the same millisecond carrying internal
+    /// timestamps minutes apart, which is the signature of a reader that
+    /// waits for a full 4096-byte buffer rather than taking what is there.
+    ///
+    /// cloudflared was ruled out as the cause first: run standalone with a
+    /// trivial reader, its stderr is prompt to sub-second precision. The
+    /// delay was entirely on our side.
+    ///
+    /// That mattered because tunnel logs are what you reach for during an
+    /// outage, and being a quarter of an hour stale — arriving only once
+    /// the tunnel has already died — is the same as not having them.
+    ///
+    /// The blocking read also occupied a Swift cooperative-pool thread for
+    /// the entire life of the tunnel, twice over (stderr and stdout).
+    /// `readabilityHandler` runs on its own dispatch queue and holds no
+    /// cooperative thread at all.
     nonisolated private static func streamLines(
         from pipe: Pipe,
         to sink: @escaping @Sendable (String) -> Void
     ) {
         let handle = pipe.fileHandleForReading
-        Task.detached {
-            var buffer = ""
-            while !Task.isCancelled {
-                let data: Data
-                do {
-                    data = try handle.read(upToCount: 4096) ?? Data()
-                } catch {
-                    break
-                }
-                if data.isEmpty { break }
-                guard let chunk = String(data: data, encoding: .utf8) else {
-                    continue
-                }
-                buffer += chunk
-                while let nl = buffer.firstIndex(of: "\n") {
-                    let line = String(buffer[..<nl])
-                    buffer.removeSubrange(...nl)
-                    sink(line)
+        // Line assembly spans callbacks, so it lives in a locked box: the
+        // handler can fire on the dispatch queue at any time.
+        let state = LineBuffer()
+        handle.readabilityHandler = { h in
+            let data = h.availableData
+            if data.isEmpty {
+                // EOF: flush any trailing partial line, then unsubscribe so
+                // the handler cannot be called again after the child exits.
+                if let last = state.takeRemainder() { sink(last) }
+                h.readabilityHandler = nil
+                return
+            }
+            for line in state.append(data) { sink(line) }
+        }
+    }
+
+    /// Accumulates pipe bytes and yields complete lines.
+    ///
+    /// Byte-oriented on purpose. The previous version decoded each chunk
+    /// with `String(data:encoding:.utf8)` and `continue`d when that
+    /// returned nil — so a read that split a multi-byte character silently
+    /// discarded the whole chunk. Splitting on the newline byte first and
+    /// decoding whole lines cannot lose data that way.
+    /// Internal rather than private so the assembly rules can be tested
+    /// directly — the split-UTF-8 case is exactly what the old code got
+    /// wrong, and it is unreachable through the public surface.
+    final class LineBuffer: @unchecked Sendable {
+        private var pending = Data()
+        private let lock = NSLock()
+
+        func append(_ data: Data) -> [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            pending.append(data)
+            var lines: [String] = []
+            while let nl = pending.firstIndex(of: 0x0A) {
+                let raw = pending[pending.startIndex..<nl]
+                pending.removeSubrange(pending.startIndex...nl)
+                if let s = String(data: Data(raw), encoding: .utf8) {
+                    lines.append(s.hasSuffix("\r") ? String(s.dropLast()) : s)
                 }
             }
+            return lines
+        }
+
+        /// Whatever is left when the pipe closes without a final newline.
+        func takeRemainder() -> String? {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !pending.isEmpty,
+                  let s = String(data: pending, encoding: .utf8),
+                  !s.isEmpty else { return nil }
+            pending.removeAll()
+            return s
         }
     }
 

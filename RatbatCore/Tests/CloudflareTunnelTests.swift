@@ -439,4 +439,54 @@ final class CloudflareTunnelTests: XCTestCase {
         let url = CloudflareTunnel.firstHostnameURL(in: yaml)
         XCTAssertEqual(url?.absoluteString, "https://radio.example.com")
     }
+
+    // MARK: - Pipe line assembly
+
+    /// Tunnel output used to arrive ~13 minutes late (measured: emitted
+    /// 18:24:35, logged 18:38:00) because the reader waited on a blocking
+    /// 4096-byte read. These cover the assembly rules of its replacement.
+
+    func testAssemblesLinesAcrossChunkBoundaries() {
+        let b = CloudflareTunnel.LineBuffer()
+        XCTAssertEqual(b.append(Data("INF star".utf8)), [], "no newline yet, nothing to emit")
+        XCTAssertEqual(b.append(Data("ted\nINF next\n".utf8)), ["INF started", "INF next"])
+    }
+
+    /// The old reader decoded each raw chunk with String(data:encoding:)
+    /// and `continue`d on nil, so a read that split a multi-byte character
+    /// discarded the entire chunk. Splitting on the newline byte first
+    /// makes that unrepresentable.
+    func testDoesNotDropAChunkThatSplitsAMultiByteCharacter() {
+        let b = CloudflareTunnel.LineBuffer()
+        let full = Array("hej så mycket\n".utf8)          // 'å' is two bytes
+        let cut = full.firstIndex(of: 0xC3)!               // split mid-character
+        XCTAssertEqual(b.append(Data(full[..<(cut + 1)])), [], "half a character is not a line")
+        XCTAssertEqual(b.append(Data(full[(cut + 1)...])), ["hej så mycket"], "chunk must not be lost")
+    }
+
+    func testEmitsEachLineOnceForAMultiLineChunk() {
+        let b = CloudflareTunnel.LineBuffer()
+        XCTAssertEqual(b.append(Data("a\nb\nc\n".utf8)), ["a", "b", "c"])
+        XCTAssertEqual(b.append(Data()), [], "empty append yields nothing")
+    }
+
+    func testStripsCarriageReturn() {
+        let b = CloudflareTunnel.LineBuffer()
+        XCTAssertEqual(b.append(Data("windows\r\n".utf8)), ["windows"])
+    }
+
+    /// cloudflared can die mid-line; that last fragment is often the most
+    /// interesting thing it ever said, so EOF must flush it.
+    func testRemainderIsFlushedAtEOF() {
+        let b = CloudflareTunnel.LineBuffer()
+        XCTAssertEqual(b.append(Data("ERR dying".utf8)), [])
+        XCTAssertEqual(b.takeRemainder(), "ERR dying")
+        XCTAssertNil(b.takeRemainder(), "remainder is consumed once")
+    }
+
+    func testNoRemainderWhenEverythingWasAWholeLine() {
+        let b = CloudflareTunnel.LineBuffer()
+        _ = b.append(Data("done\n".utf8))
+        XCTAssertNil(b.takeRemainder())
+    }
 }
