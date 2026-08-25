@@ -69,8 +69,8 @@ public actor PlaylistSource: TrackSource {
         // your own records taught Ratbat nothing and left the history
         // view blank for the station you play most.
         let historyID = await recordPlay?(
-            track.artist ?? "Unknown",
-            track.title ?? track.url.lastPathComponent,
+            track.artist,
+            track.title,
             track.url
         )
         // `album` and `duration` come off the indexed ``Track`` — the
