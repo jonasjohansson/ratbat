@@ -181,6 +181,54 @@ public final class RadioBroadcaster: ObservableObject {
 
     @Published public private(set) var lastOffAir: [Station.ID: OffAirRecord] = [:]
 
+    // MARK: - Stream pacing
+
+    /// How far ahead of real time the encode loop is allowed to run: the
+    /// runway a listener's buffer holds against a stalled read (a slow
+    /// Drive block fetch, a track boundary that has to open a file).
+    ///
+    /// It is also the floor on how far behind `/now.json` the audio runs,
+    /// which is why it rides the wire — the web client subtracts it when
+    /// deciding *when* to show a track change, so that the title flips as
+    /// the track arrives in your ears rather than as it leaves the Mac.
+    nonisolated public static let broadcastLeadSeconds: Double = 5
+
+    /// Monotonic seconds, for pacing only. `Date` is wall time and can
+    /// step (NTP correction, the user changing the clock); a backwards
+    /// step would stall the encoder for the length of the jump and take
+    /// every listener down with it.
+    nonisolated static func monotonicSeconds() -> Double {
+        Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+    }
+
+    /// One step of the encode loop's pacing.
+    ///
+    /// `playoutHead` is the instant at which the audio written so far
+    /// would finish playing. Having just written `chunkSeconds` of audio,
+    /// this advances the head and says how long to wait before writing
+    /// more — nothing at all while the head is still within `lead` of the
+    /// wall clock, so the encoder keeps a constant runway ahead of the
+    /// listener and never accumulates drift.
+    ///
+    /// Pulled out of the loop because it is the arithmetic that was wrong:
+    /// a flat sleep per chunk is a *rate multiplier*, not a lead, and no
+    /// amount of reading the loop made that visible. Here it can be asked
+    /// directly.
+    nonisolated static func pace(
+        playoutHead: Double,
+        now: Double,
+        chunkSeconds: Double,
+        lead: Double
+    ) -> (head: Double, sleep: Double) {
+        let head = playoutHead + chunkSeconds
+        // Behind real time: a slow decode, or the first chunk after the
+        // listener gate released. Re-anchor rather than sprint to repay
+        // the debt — sprinting hands the listener a burst of audio and
+        // desyncs them all over again, which is the whole bug.
+        guard head >= now else { return (now, 0) }
+        return (head, max(0, head - now - lead))
+    }
+
     // MARK: - Heartbeat
 
     /// How often each live station records that it is still on air.
@@ -3760,6 +3808,10 @@ public final class RadioBroadcaster: ObservableObject {
         }
         struct NowResponse: Encodable {
             let stations: [NowStation]
+            /// How far ahead of the listener the encoder deliberately runs.
+            /// The client needs it to answer "is the track I am announcing
+            /// the one in your ears yet?" — see ``broadcastLeadSeconds``.
+            let leadSeconds: Double
         }
 
         // Stable ordering by station name so UI doesn't jitter between
@@ -3788,10 +3840,14 @@ public final class RadioBroadcaster: ObservableObject {
             )
         }
 
-        let response = NowResponse(stations: stations)
+        let response = NowResponse(
+            stations: stations,
+            leadSeconds: Self.broadcastLeadSeconds
+        )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        return (try? encoder.encode(response)) ?? Data("{\"stations\":[]}".utf8)
+        return (try? encoder.encode(response))
+            ?? Data("{\"leadSeconds\":\(Self.broadcastLeadSeconds),\"stations\":[]}".utf8)
     }
 
     // MARK: - Client serving (detached)
@@ -4071,6 +4127,13 @@ public final class RadioBroadcaster: ObservableObject {
         // tracks only resolve while at least one listener is connected.
         var trackIndex = 0
 
+        // Wall-clock pacing: the instant at which the audio written so far
+        // would finish playing. Anchored on the first chunk and re-anchored
+        // whenever the loop falls behind, so an idle gate or a slow source
+        // never leaves a debt for the encoder to sprint off. See the pacing
+        // block at the bottom of the inner loop.
+        var playoutHead = Self.monotonicSeconds()
+
         // One-track-ahead prefetch. Generative sources resolve + download
         // via yt-dlp inside `nextURL()` (and occasionally run a slow pool
         // refill); doing that inline at the track boundary stalled the
@@ -4247,9 +4310,15 @@ public final class RadioBroadcaster: ObservableObject {
                     if skip {
                         // Deliberate rejection: cut the buffered backlog so
                         // listeners jump to the new track in a beat instead
-                        // of draining ~8s of audio they just skipped. The
-                        // browser's own buffer is the only remaining lag.
+                        // of draining the ring of audio they just skipped.
+                        // The browser's own buffer is the only remaining lag.
                         buffer.markDiscontinuity()
+                        // The backlog that was the listener's runway is gone,
+                        // so the playout head is *now*. Without this the
+                        // encoder would think it was still a lead ahead and
+                        // sleep through the first seconds of the new track —
+                        // silence, exactly where the point was to cut it.
+                        playoutHead = Self.monotonicSeconds()
                         break
                     }
                 }
@@ -4257,6 +4326,13 @@ public final class RadioBroadcaster: ObservableObject {
                     playedThrough = true
                     break   // EOF — advance to next item
                 }
+                // Measured off the buffer rather than assumed: the decoder
+                // reads a fixed frame count in the *source* file's sample
+                // rate, so one chunk of a 48 kHz file is not the same amount
+                // of time as one chunk of a 44.1 kHz file.
+                let chunkSeconds = pcm.format.sampleRate > 0
+                    ? Double(pcm.frameLength) / pcm.format.sampleRate
+                    : 0
                 do {
                     if let encoded = try encoder.encode(pcm) {
                         buffer.write(encoded)
@@ -4266,11 +4342,31 @@ public final class RadioBroadcaster: ObservableObject {
                     break
                 }
 
-                // Rate-limit so we don't fill the ring buffer faster than
-                // real time. At 44.1 kHz / 4096 frames-per-read, the
-                // nominal wall-clock duration of one chunk is ~93 ms.
-                // We sleep slightly less to stay ~1 chunk ahead.
-                try? await Task.sleep(nanoseconds: 70_000_000)
+                // Pace against a wall clock, not a fixed sleep.
+                //
+                // This used to sleep a flat 70 ms per ~93 ms chunk, "to stay
+                // ~1 chunk ahead". That is not a lead, it is a 1.2–1.3x
+                // overfeed, and it compounds: measured against the live
+                // station, 37.1s of audio left the encoder every 30.1s of
+                // wall clock. A listener's buffer therefore grew by ~14s for
+                // every minute they stayed tuned in, so how far the audio
+                // ran behind /now.json depended on how long they had been
+                // listening — a moving target no fixed delay in the client
+                // can correct for, and eventually far enough behind that the
+                // ring lapped the reader and dropped audio outright.
+                //
+                // Writing only up to `broadcastLeadSeconds` past the playout
+                // head keeps the runway constant and knowable instead.
+                let paced = Self.pace(
+                    playoutHead: playoutHead,
+                    now: Self.monotonicSeconds(),
+                    chunkSeconds: chunkSeconds,
+                    lead: Self.broadcastLeadSeconds
+                )
+                playoutHead = paced.head
+                if paced.sleep > 0 {
+                    try? await Task.sleep(nanoseconds: UInt64(paced.sleep * 1_000_000_000))
+                }
             }
 
             decoder.close()
