@@ -28,11 +28,27 @@
 #   2  the public endpoint never answered (DNS, Cloudflare, or tunnel down)
 #   3  it answered, but no station is broadcasting
 #   4  a station is live but the stream produced no usable audio
+#   5  a station never resolved a first track within the startup budget
 
 set -uo pipefail
 
 BASE="${1:-https://radio.jonasjohansson.se}"
 DEADLINE_SECS="${2:-90}"
+
+# A station that is broadcasting but has no current track has not failed
+# — it is still resolving one. NTS has to reach the API, choose a show
+# and pull the track through yt-dlp before a single byte is encoded, and
+# on a cold start that runs well past the deadline above.
+#
+# Spending the same budget on it as on "the tunnel is down" is what made
+# every deploy from 2026-08-24 on report a failure that never happened:
+# four runs in a row, always /stream/nts-disco.aac, always HTTP 000 —
+# curl hanging up on a connection the origin was holding open with
+# nothing yet to send. The audio was fine minutes later, every time.
+#
+# So: a separate, longer patience, spent only while the one thing
+# outstanding is a station waiting on its first track.
+STARTUP_DEADLINE_SECS="${RATBAT_STARTUP_DEADLINE_SECS:-480}"
 
 # A few seconds of AAC. Small enough to be quick, large enough that a
 # stalled or empty stream can't pass by dribbling out a header.
@@ -58,11 +74,21 @@ started=$(date +%s)
 attempt=0
 last_reason="never attempted"
 last_code=2
+# Set at the bottom of a pass when every audible station was audible and
+# the only thing left is one still resolving its first track. It selects
+# which budget the next pass is measured against.
+waiting_on_startup=0
+last_progress=-1
 
 while :; do
   attempt=$((attempt + 1))
   elapsed=$(( $(date +%s) - started ))
-  if [ "$elapsed" -ge "$DEADLINE_SECS" ]; then
+  if [ "$waiting_on_startup" -eq 1 ]; then
+    budget="$STARTUP_DEADLINE_SECS"
+  else
+    budget="$DEADLINE_SECS"
+  fi
+  if [ "$elapsed" -ge "$budget" ]; then
     echo "✗ giving up after ${elapsed}s / ${attempt} attempts: ${last_reason}" >&2
     record fail "$last_code" "$(printf '%s' "$last_reason" | tr ' ' '-')"
     exit "$last_code"
@@ -89,8 +115,13 @@ while :; do
     continue
   fi
 
-  # --- 2. Is anything actually broadcasting, and where? ---
-  stream_paths=$(printf '%s' "$now_json" | python3 -c '
+  # --- 2. Is anything actually broadcasting, where, and is it ready? ---
+  #
+  # `broadcasting` means the pipeline exists, NOT that audio is flowing.
+  # A station with no `currentTrack` has not resolved anything to play
+  # yet, so asking it for bytes can only ever time out. That difference
+  # is already on the wire; reading it is the whole fix.
+  station_rows=$(printf '%s' "$now_json" | python3 -c '
 import json, sys
 try:
     doc = json.load(sys.stdin)
@@ -101,16 +132,21 @@ except Exception:
 # was an accident of ordering, not a decision.
 for s in doc.get("stations", []):
     if s.get("broadcasting") and s.get("streamURL"):
-        print(s["streamURL"])
+        state = "ready" if s.get("currentTrack") else "starting"
+        print("\t".join([state, s["streamURL"], s.get("name") or "?"]))
 ' 2>/dev/null)
 
-  if [ -z "$stream_paths" ]; then
+  if [ -z "$station_rows" ]; then
     last_reason="reached the origin, but no station reports broadcasting"
     last_code=3
+    waiting_on_startup=0
     echo "  attempt ${attempt}: ${last_reason}"
     sleep 5
     continue
   fi
+
+  stream_paths=$(printf '%s\n' "$station_rows" | awk -F'\t' '$1 == "ready" { print $2 }')
+  starting=$(printf '%s\n' "$station_rows" | awk -F'\t' '$1 == "starting" { print $3 }' | paste -sd', ' -)
 
   # --- 3. Do real audio bytes arrive, for EVERY live station? ---
   # curl exits 28 when the range request is still streaming at the
@@ -157,14 +193,37 @@ $stream_paths
 EOF
 
   if [ "$all_ok" -ne 1 ]; then
+    # A station with a track that still sends no bytes is broken, not
+    # slow — fail it on the short budget, as before.
+    waiting_on_startup=0
     echo "  attempt ${attempt}: ${last_reason}"
     printf '%b' "$results"
     sleep 5
     continue
   fi
 
+  # --- 4. Anything still resolving its first track? ---
+  # Every station that HAS something to play is audible. If one is still
+  # looking, keep waiting on the long budget rather than calling the
+  # deploy broken — but say so, distinctly, so an operator watching a
+  # slow NTS cold start knows nothing is wrong.
+  if [ -n "$starting" ]; then
+    waiting_on_startup=1
+    last_reason="still resolving a first track after ${elapsed}s: ${starting}"
+    last_code=5
+    # One line every 30s, not one every attempt: a four-minute cold start
+    # would otherwise bury the deploy in fifty identical lines.
+    progress=$(( elapsed / 30 ))
+    if [ "$progress" -ne "$last_progress" ]; then
+      last_progress="$progress"
+      echo "  waiting ${elapsed}s/${STARTUP_DEADLINE_SECS}s for a first track: ${starting}"
+    fi
+    sleep 10
+    continue
+  fi
+
   station_count=$(printf '%s\n' "$stream_paths" | grep -c .)
-  echo "✓ listening confirmed from outside — ${station_count} station(s)"
+  echo "✓ listening confirmed from outside — ${station_count} station(s) in ${elapsed}s"
   printf '%b' "$results"
   record ok 0 "${station_count}-stations-audible"
   exit 0
