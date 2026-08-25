@@ -118,6 +118,11 @@ if [ "$VERIFY_RC" -ne 0 ]; then
        echo "    and the library path, not the tunnel." >&2
        echo "    /usr/bin/log show --last 15m --predicate 'subsystem == \"se.jonasjohansson.ratbat\" AND category == \"broadcaster.encode\"'" >&2
        ;;
+    5) echo "  → A station never resolved a first track. Everything that HAS one" >&2
+       echo "    is audible, so this is the source, not the tunnel and not the" >&2
+       echo "    encoder: an NTS/Bandcamp/Last.fm lookup or a yt-dlp download." >&2
+       echo "    /usr/bin/log show --last 15m --predicate 'subsystem == \"se.jonasjohansson.ratbat\" AND category BEGINSWITH \"broadcaster\"'" >&2
+       ;;
     *) echo "  → verify-listening.sh exited $VERIFY_RC." >&2 ;;
   esac
   echo "  Verdict history: ${RATBAT_VERIFY_LOG:-$HOME/Library/Logs/ratbat-verify.log}" >&2
