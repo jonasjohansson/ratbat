@@ -376,6 +376,10 @@ public struct RootView: View {
             if nowPlaying == nil {
                 nowPlaying = NowPlayingController(player: player)
             }
+            // Let the app delegate reach the broadcaster on quit, so the
+            // tunnel is torn down instead of being orphaned. Weak on the
+            // other side; this is a publication, not an owning reference.
+            RadioBroadcaster.current = radio
         }
     }
 

@@ -118,6 +118,19 @@ public final class RadioBroadcaster: ObservableObject {
     public let tunnel: CloudflareTunnel = CloudflareTunnel()
     #endif
 
+    /// The broadcaster the app is currently driving, for code that cannot
+    /// be handed one directly.
+    ///
+    /// Exists for the macOS app delegate: `applicationWillTerminate` is an
+    /// AppKit callback in the app target, and the view that owns the
+    /// broadcaster lives down here in the framework, so there is no way to
+    /// pass a reference up. `RootView` publishes it here on appear.
+    ///
+    /// `weak` on purpose — a termination hook must never be the thing
+    /// keeping the broadcaster alive. Tests construct many broadcasters and
+    /// harmlessly overwrite this; nothing reads it except the delegate.
+    @MainActor public static weak var current: RadioBroadcaster?
+
     /// Whether starting a station may open the public tunnel.
     ///
     /// Defaults to `false` under XCTest. `namedTunnelConfigured()` only
@@ -1886,7 +1899,6 @@ public final class RadioBroadcaster: ObservableObject {
     private func routeIncoming(_ connection: NWConnection) {
         connection.start(queue: .global(qos: .userInitiated))
 
-        let port = self.port.rawValue
         let pipelineLookup: @Sendable (String) async -> (Station.ID, AACRingBuffer, String)? = { [weak self] slug in
             await MainActor.run { [weak self] in
                 guard let self, let pipeline = self.pipelines.first(where: { $0.value.station.slug == slug })?.value else {
