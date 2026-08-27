@@ -559,4 +559,67 @@ final class CloudflareTunnelTests: XCTestCase {
         XCTAssertEqual(fake.launches.count, 1)
         XCTAssertTrue(tunnel.isRunning)
     }
+
+    /// A *wedged* tunnel must still be killable.
+    ///
+    /// `Process.terminate()` sends SIGTERM. A stopped process cannot run a
+    /// signal *handler*, so a handled SIGTERM stays pending — and
+    /// cloudflared handles SIGTERM ("Initiating graceful shutdown due to
+    /// signal terminated"). Restarting a SIGSTOPped cloudflared therefore
+    /// left the frozen one running indefinitely, which is how this was
+    /// found: the liveness probe restarted correctly and the old process
+    /// was still there afterwards in state T.
+    ///
+    /// The stand-in installs a TERM trap for exactly that reason. A process
+    /// with the *default* disposition (`/bin/sleep`) is killed by SIGTERM
+    /// even while stopped, so it cannot tell the two implementations apart
+    /// and would make this test vacuous.
+    @MainActor
+    func testTerminateKillsAWedgedProcessThatHandlesSIGTERM() async throws {
+        // Run the trap inline under /bin/sh so `ps comm=` reports a path we
+        // can match — for a script file it reports the interpreter instead.
+        let handle = try CloudflareTunnel.spawnProcess(
+            binary: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", "trap 'exit 0' TERM; while : ; do /bin/sleep 1; done"],
+            onOutputLine: { _ in },
+            onExit: { _ in }
+        )
+        let me = ProcessInfo.processInfo.processIdentifier
+        let pid = try XCTUnwrap(
+            TunnelReaper.snapshotProcesses()
+                .filter { $0.executablePath == "/bin/sh" && $0.parentPID == me }
+                .last?.pid,
+            "spawned helper not found in the process table"
+        )
+        // Freeze it: the wedge, reproduced in miniature.
+        XCTAssertEqual(kill(pid, SIGSTOP), 0)
+        var state = ""
+        for _ in 0..<10 where !state.hasPrefix("T") {
+            state = Self.processState(pid) ?? ""
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+
+        handle.terminate()
+
+        let deadline = Date().addingTimeInterval(CloudflareTunnel.terminateGraceSeconds + 10)
+        while Date() < deadline {
+            if kill(pid, 0) != 0 { break }
+            try await Task.sleep(nanoseconds: 200_000_000)
+        }
+        XCTAssertNotEqual(
+            kill(pid, 0), 0,
+            "a wedged tunnel must still be terminated, not left running forever"
+        )
+    }
+
+    private static func processState(_ pid: Int32) -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/ps")
+        p.arguments = ["-o", "stat=", "-p", "\(pid)"]
+        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice
+        try? p.run()
+        let d = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return String(data: d, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 }

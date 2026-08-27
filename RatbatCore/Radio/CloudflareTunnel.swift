@@ -662,9 +662,34 @@ public final class CloudflareTunnel: ObservableObject {
         Self.streamLines(from: outPipe, to: onOutputLine)
 
         return ProcessHandle(terminate: {
-            if proc.isRunning { proc.terminate() }
+            guard proc.isRunning else { return }
+            let pid = proc.processIdentifier
+            // SIGCONT first. A stopped process cannot act on SIGTERM — the
+            // signal just sits pending until something resumes it — so
+            // terminating a *wedged* tunnel with SIGTERM alone leaves it
+            // running forever. Found exactly that way: the liveness probe
+            // correctly restarted a SIGSTOPped cloudflared, and the frozen
+            // one was still there afterwards in state T, now a leak of the
+            // same shape the reaper exists to prevent.
+            kill(pid, SIGCONT)
+            proc.terminate()
+            // Escalate if it does not go. cloudflared normally exits on
+            // SIGTERM within a moment ("Initiating graceful shutdown due to
+            // signal terminated"), so anything still alive after the grace
+            // period is not going to leave politely.
+            Task.detached {
+                try? await Task.sleep(nanoseconds: UInt64(terminateGraceSeconds * 1_000_000_000))
+                if proc.isRunning { kill(pid, SIGKILL) }
+            }
         })
     }
+
+    /// How long a tunnel gets to exit on SIGTERM before SIGKILL.
+    ///
+    /// Generous: a graceful shutdown lets cloudflared unregister from the
+    /// edge, which avoids the brief window where Cloudflare still routes to
+    /// a replica that has gone.
+    nonisolated static let terminateGraceSeconds: Double = 5
 
     /// Line-buffer a pipe, handing each complete line to `sink`. Ends at
     /// EOF, which is also when the child has gone.
