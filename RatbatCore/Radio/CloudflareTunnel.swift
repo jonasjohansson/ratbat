@@ -133,6 +133,18 @@ public final class CloudflareTunnel: ObservableObject {
     // MARK: - Internals
 
     private var handle: ProcessHandle?
+    /// Increments on every launch. An exit callback carries the generation
+    /// it belongs to, so a process that dies *after* its replacement has
+    /// started cannot be mistaken for the replacement crashing.
+    ///
+    /// `isStopping` alone could not carry this: `stop()` sets it, `start()`
+    /// clears it, and a terminated cloudflared can take longer to actually
+    /// exit than that pair takes to run — especially a wedged one, which
+    /// needs SIGCONT before it can process SIGTERM at all. The late exit
+    /// then read as a crash and the supervisor launched a *second* tunnel,
+    /// leaving two replicas serving one tunnel. Same shape as the zombie
+    /// encode loop that `pipelineToken` guards against in the broadcaster.
+    private var launchGeneration = 0
     private var restartTask: Task<Void, Never>?
     private var startedAt: Date?
     private var lastPort: UInt16?
@@ -253,6 +265,9 @@ public final class CloudflareTunnel: ObservableObject {
             args = ["tunnel", "--url", "http://localhost:\(localPort)"]
         }
 
+        launchGeneration += 1
+        let generation = launchGeneration
+
         do {
             handle = try launcher(
                 binary,
@@ -261,7 +276,9 @@ public final class CloudflareTunnel: ObservableObject {
                     Task { @MainActor [weak self] in self?.ingest(line: line) }
                 },
                 { code in
-                    Task { @MainActor [weak self] in self?.handleExit(code: code) }
+                    Task { @MainActor [weak self] in
+                        self?.handleExit(code: code, generation: generation)
+                    }
                 }
             )
             startedAt = Date()
@@ -452,7 +469,10 @@ public final class CloudflareTunnel: ObservableObject {
 
     /// cloudflared exited without us asking. Record *why* at a level that
     /// survives, then bring it back.
-    private func handleExit(code: Int32) {
+    private func handleExit(code: Int32, generation: Int) {
+        // A superseded process exiting is not news: something already
+        // replaced it, deliberately.
+        guard generation == launchGeneration else { return }
         guard !isStopping else { return }
         guard isRunning || handle != nil else { return }
 

@@ -622,4 +622,40 @@ final class CloudflareTunnelTests: XCTestCase {
         p.waitUntilExit()
         return String(data: d, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
+
+    /// A tunnel that exits *after* its replacement has started must not be
+    /// mistaken for the replacement crashing.
+    ///
+    /// This is how a liveness restart ended up with two cloudflareds serving
+    /// one tunnel: `stop()` sets `isStopping`, `start()` clears it, and the
+    /// old process — wedged, so it needed SIGCONT before it could even act
+    /// on SIGTERM — did not actually exit until after that pair had run. The
+    /// late exit read as a crash and the supervisor launched another.
+    @MainActor
+    func testLateExitOfAReplacedProcessDoesNotSpawnADuplicate() async throws {
+        let fake = FakeLauncher()
+        let tunnel = CloudflareTunnel(
+            launcher: fake.launcher(),
+            environment: Self.fakeEnvironment(),
+            restartDelayOverride: 0
+        )
+        await tunnel.start(forwardingTo: 18_000)
+        XCTAssertEqual(fake.launches.count, 1)
+        let staleExit = fake.onExit                 // generation 1's callback
+
+        // Replace it, the way a liveness restart does.
+        tunnel.stop()
+        await tunnel.start(forwardingTo: 18_000)
+        XCTAssertEqual(fake.launches.count, 2)
+
+        // Generation 1 finally dies, long after generation 2 is serving.
+        staleExit?(143)
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        XCTAssertEqual(
+            fake.launches.count, 2,
+            "a superseded process exiting must not be answered with another launch"
+        )
+        XCTAssertTrue(tunnel.isRunning, "the live tunnel must be left alone")
+    }
 }
