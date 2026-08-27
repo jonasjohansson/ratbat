@@ -136,6 +136,32 @@ public final class CloudflareTunnel: ObservableObject {
     private var restartTask: Task<Void, Never>?
     private var startedAt: Date?
     private var lastPort: UInt16?
+
+    // MARK: - Liveness
+
+    /// Watches from outside for a tunnel that is running but not serving.
+    /// See ``TunnelLiveness`` for why this is separate from the exit-driven
+    /// supervisor and what it refuses to act on.
+    private var liveness = TunnelLiveness()
+    private var livenessTask: Task<Void, Never>?
+
+    /// How often the public hostname is probed.
+    ///
+    /// Every 30s is ~2,880 small JSON requests a day, which is nothing to
+    /// Cloudflare and nothing to us, while keeping detection inside a
+    /// couple of minutes when combined with the three-strike rule. Faster
+    /// buys little: a wedge lasting under a minute and a half is within
+    /// what a listener's buffer absorbs anyway.
+    nonisolated public static let livenessProbeInterval: TimeInterval = 30
+
+    /// Per-probe timeout. Short enough that a hung edge is a failure rather
+    /// than a stalled probe loop, long enough not to punish a slow round
+    /// trip through Cloudflare (measured p95 ~233ms, so this is generous).
+    nonisolated public static let livenessProbeTimeout: TimeInterval = 8
+
+    /// Test seam: substitute the probe so the loop can be exercised without
+    /// a network. Returns (localHealthy, publicOutcome).
+    public var probeOverride: (@Sendable (URL, UInt16) async -> (Bool, TunnelLiveness.PublicOutcome))?
     private var restartAttempt = 0
     /// Set across a deliberate `stop()` so the resulting exit callback
     /// isn't mistaken for a crash and answered with a relaunch.
@@ -264,12 +290,151 @@ public final class CloudflareTunnel: ObservableObject {
         if useNamed, let named = environment.namedTunnelHostname() {
             self.publicURL = named
         }
+        // Named tunnels know their hostname immediately; quick tunnels only
+        // learn it from cloudflared's banner, so that path arms the probe
+        // in `ingest` instead.
+        startLivenessIfPossible()
+    }
+
+    // MARK: - Liveness probing
+
+    /// Begin watching the public hostname, if there is one to watch.
+    ///
+    /// Only meaningful once a public URL is known — a quick tunnel gets one
+    /// from cloudflared's banner, a named one from config.yml. Without it
+    /// there is nothing to probe and the loop stays off rather than
+    /// guessing at a hostname.
+    private func startLivenessIfPossible() {
+        guard livenessTask == nil, let publicURL, let port = lastPort else { return }
+        liveness = TunnelLiveness()
+        livenessTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(
+                    nanoseconds: UInt64(Self.livenessProbeInterval * 1_000_000_000)
+                )
+                if Task.isCancelled { return }
+                await self?.probeOnce(publicURL: publicURL, port: port)
+            }
+        }
+    }
+
+    private func stopLiveness() {
+        livenessTask?.cancel()
+        livenessTask = nil
+        liveness = TunnelLiveness()
+    }
+
+    /// One probe → one decision → at most one action.
+    ///
+    /// Internal rather than private so a test can drive the real path —
+    /// probe, decide, restart — without waiting out the 30s interval or
+    /// touching the network.
+    func probeOnce(publicURL: URL, port: UInt16) async {
+        let (localHealthy, outcome): (Bool, TunnelLiveness.PublicOutcome)
+        if let probeOverride {
+            (localHealthy, outcome) = await probeOverride(publicURL, port)
+        } else {
+            async let local = Self.probeLocal(port: port)
+            async let remote = Self.probePublic(publicURL)
+            (localHealthy, outcome) = await (local, remote)
+        }
+
+        let sample = TunnelLiveness.Sample(
+            at: Date().timeIntervalSince1970,
+            localHealthy: localHealthy,
+            publicOutcome: outcome
+        )
+        // `isRunning && !isStopping` is the "supposed to be up" signal. A
+        // deliberate stop or a shutdown must never be answered with a
+        // repair.
+        let decision = liveness.record(sample, tunnelRunning: isRunning && !isStopping)
+
+        switch decision {
+        case .healthy, .suppressed:
+            break
+
+        case .watching(let n):
+            logger.notice(
+                "tunnel unreachable from outside (\(n, privacy: .public)/\(self.liveness.failuresBeforeRestart, privacy: .public)) — local is healthy, outcome \(String(describing: outcome), privacy: .public)"
+            )
+
+        case .restart(let attempt):
+            logger.error(
+                "tunnel is running but not serving — restarting (attempt \(attempt, privacy: .public)/\(self.liveness.maxRestarts, privacy: .public)); last outcome \(String(describing: outcome), privacy: .public)"
+            )
+            restartForLiveness()
+
+        case .gaveUp(let attempts):
+            // Loud on purpose: past this point the radio is off air from
+            // the outside and nothing automatic will fix it.
+            logger.fault(
+                "tunnel STILL not serving after \(attempts, privacy: .public) restarts — giving up. The origin is healthy, so this is Cloudflare or the network. Public URL: \(publicURL.absoluteString, privacy: .public)"
+            )
+        }
+    }
+
+    /// Relaunch the tunnel in place. Deliberately goes through `stop()` and
+    /// `start()` so the supervisor's own bookkeeping (suppression across a
+    /// deliberate exit, backoff counters) is not bypassed.
+    private func restartForLiveness() {
+        guard let port = lastPort else { return }
+        // Keep the probe loop alive across the bounce — `stop()` would
+        // otherwise cancel it, losing the escalation state that decides
+        // whether the *next* failure means giving up.
+        let preserved = liveness
+        let task = livenessTask
+        livenessTask = nil
+        stop()
+        livenessTask = task
+        liveness = preserved
+        Task { [weak self] in
+            await self?.start(forwardingTo: port)
+        }
+    }
+
+    /// `localhost` on the broadcast port. Cheap, and the control for every
+    /// public failure: without it "public is down" cannot be told apart
+    /// from "everything is down".
+    nonisolated static func probeLocal(port: UInt16) async -> Bool {
+        guard let url = URL(string: "http://localhost:\(port)/now.json") else { return false }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = livenessProbeTimeout
+        req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        do {
+            let (_, response) = try await URLSession.shared.data(for: req)
+            return (response as? HTTPURLResponse).map { (200..<400).contains($0.statusCode) } ?? false
+        } catch {
+            return false
+        }
+    }
+
+    /// The public hostname, out through Cloudflare and back down the
+    /// tunnel. `now.json` rather than the stream: a wedge shows up just as
+    /// clearly in a few hundred bytes of JSON as in an audio stream, and
+    /// this runs every 30s forever.
+    nonisolated static func probePublic(_ url: URL) async -> TunnelLiveness.PublicOutcome {
+        var req = URLRequest(url: url)
+        req.timeoutInterval = livenessProbeTimeout
+        req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        do {
+            let (_, response) = try await URLSession.shared.data(for: req)
+            guard let http = response as? HTTPURLResponse else {
+                return .unreachable(reason: "non-HTTP response")
+            }
+            return TunnelLiveness.classify(publicStatus: http.statusCode)
+        } catch {
+            // Never reached an HTTP status: DNS, refused, timed out. Could
+            // be a wedged tunnel, could be no internet at all — and the
+            // monitor refuses to guess between them.
+            return .unreachable(reason: (error as NSError).localizedDescription)
+        }
     }
 
     /// Stop the tunnel. Idempotent — safe to call before `start`,
     /// mid-boot, or after a failure. Suppresses the supervisor, so the
     /// exit this causes is not answered with a relaunch.
     public func stop() {
+        stopLiveness()
         isStopping = true
         restartTask?.cancel()
         restartTask = nil
@@ -345,6 +510,8 @@ public final class CloudflareTunnel: ObservableObject {
         if let url = Self.extractPublicURL(from: trimmed) {
             publicURL = url
             logger.notice("tunnel URL: \(url.absoluteString, privacy: .public)")
+            // A quick tunnel's hostname arrives here, not at start().
+            startLivenessIfPossible()
         }
 
         if Self.looksLikeError(trimmed) {

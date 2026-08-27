@@ -489,4 +489,74 @@ final class CloudflareTunnelTests: XCTestCase {
         _ = b.append(Data("done\n".utf8))
         XCTAssertNil(b.takeRemainder())
     }
+
+    // MARK: - Liveness (a tunnel that is running but not serving)
+
+    /// The wedge, driven through the real runtime path: probe -> decide ->
+    /// restart. Reproduced live with `kill -STOP` on cloudflared, where the
+    /// process stays up so nothing exits and the exit-driven supervisor
+    /// never fires.
+    @MainActor
+    func testWedgedTunnelIsDetectedAndRestarted() async throws {
+        let fake = FakeLauncher()
+        let tunnel = CloudflareTunnel(
+            launcher: fake.launcher(),
+            environment: Self.fakeEnvironment(named: true,
+                                              hostname: URL(string: "https://radio.example.com")),
+            restartDelayOverride: 0
+        )
+        tunnel.probeOverride = { _, _ in (true, .tunnelSuspect(status: 530)) }
+        await tunnel.start(forwardingTo: 18_000)
+        XCTAssertEqual(fake.launches.count, 1)
+
+        let url = URL(string: "https://radio.example.com")!
+        await tunnel.probeOnce(publicURL: url, port: 18_000)
+        XCTAssertEqual(fake.launches.count, 1, "one bad sample must not act")
+        await tunnel.probeOnce(publicURL: url, port: 18_000)
+        XCTAssertEqual(fake.launches.count, 1, "two is still not enough")
+        await tunnel.probeOnce(publicURL: url, port: 18_000)
+
+        try await Task.sleep(nanoseconds: 400_000_000)
+        XCTAssertEqual(fake.launches.count, 2, "third consecutive failure must restart the tunnel")
+    }
+
+    /// Both ends down is our fault, not the tunnel's. Restarting it would
+    /// take the radio off air to fix a problem it does not have.
+    @MainActor
+    func testWedgeDetectorRefusesWhenLocalIsAlsoDown() async throws {
+        let fake = FakeLauncher()
+        let tunnel = CloudflareTunnel(
+            launcher: fake.launcher(),
+            environment: Self.fakeEnvironment(named: true,
+                                              hostname: URL(string: "https://radio.example.com")),
+            restartDelayOverride: 0
+        )
+        tunnel.probeOverride = { _, _ in (false, .tunnelSuspect(status: 530)) }
+        await tunnel.start(forwardingTo: 18_000)
+
+        let url = URL(string: "https://radio.example.com")!
+        for _ in 0..<8 { await tunnel.probeOnce(publicURL: url, port: 18_000) }
+        try await Task.sleep(nanoseconds: 400_000_000)
+        XCTAssertEqual(fake.launches.count, 1, "must never restart while the origin itself is down")
+    }
+
+    /// A healthy tunnel must never be restarted, however long it runs.
+    @MainActor
+    func testHealthyTunnelIsNeverRestarted() async throws {
+        let fake = FakeLauncher()
+        let tunnel = CloudflareTunnel(
+            launcher: fake.launcher(),
+            environment: Self.fakeEnvironment(named: true,
+                                              hostname: URL(string: "https://radio.example.com")),
+            restartDelayOverride: 0
+        )
+        tunnel.probeOverride = { _, _ in (true, .ok) }
+        await tunnel.start(forwardingTo: 18_000)
+
+        let url = URL(string: "https://radio.example.com")!
+        for _ in 0..<40 { await tunnel.probeOnce(publicURL: url, port: 18_000) }
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(fake.launches.count, 1)
+        XCTAssertTrue(tunnel.isRunning)
+    }
 }
