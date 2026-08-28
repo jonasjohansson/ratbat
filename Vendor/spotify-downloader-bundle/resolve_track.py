@@ -39,6 +39,7 @@ import os
 import shutil
 import sys
 
+import query_variants
 from ytmusicapi import YTMusic
 from yt_dlp import YoutubeDL
 
@@ -67,34 +68,71 @@ def _locate_ffmpeg() -> str | None:
     return None
 
 
-def best_match(artist: str, title: str) -> tuple[str, str]:
-    """Return (youtube_id, matched_title) or raise RuntimeError('NO_MATCH')."""
-    client = YTMusic()
-    query = f"{title} {artist}".strip()
-    results = client.search(query) or []
+def _pick(results: list, title: str) -> dict | None:
+    """Best result for a query that still carried the artist.
 
-    title_lc = title.lower().strip()
-
-    # 1. Prefer songs whose title contains the requested title (robust to
-    #    YT's "(Remastered 2015)" suffixes).
+    Unchanged ranking: prefer songs whose title contains the requested one
+    (robust to YT's "(Remastered 2015)" suffixes), then any song, then
+    song-or-video — official artist channels often list tracks as videos.
+    """
     songs = [r for r in results if r.get("resultType") == "song"]
-    title_matches = [s for s in songs if title_lc in (s.get("title") or "").lower()]
-
-    # 2. Fall back to any song result.
-    # 3. Then any song-or-video result (official artist channels often list
-    #    tracks as videos rather than songs).
-    pool = title_matches or songs or [
+    matches = [s for s in songs if query_variants.title_matches(title, s.get("title"))]
+    pool = matches or songs or [
         r for r in results if r.get("resultType") in ("song", "video")
     ]
+    return pool[0] if pool else None
 
-    if not pool:
-        raise RuntimeError("NO_MATCH")
 
-    top = pool[0]
-    vid = top.get("videoId")
-    if not vid:
-        raise RuntimeError("NO_MATCH")
-    return vid, top.get("title") or title
+def _pick_title_only(results: list, title: str, artist: str) -> dict | None:
+    """Best result for the title-only rung, which must verify, not accept.
+
+    Dropping the artist from the query means the top hit is frequently a
+    different act's song of the same name, so this rung requires BOTH a
+    title match AND artist evidence. "52 Street" and "52nd Street" share
+    "street" and match; an unrelated act sharing only a stopword does not.
+    Without that, the last resort would quietly play the wrong song, which
+    is worse than reporting NO_MATCH.
+    """
+    for r in results:
+        if r.get("resultType") not in ("song", "video"):
+            continue
+        if not query_variants.title_matches(title, r.get("title")):
+            continue
+        found = ", ".join(
+            a.get("name", "") for a in (r.get("artists") or []) if isinstance(a, dict)
+        )
+        if query_variants.artists_plausibly_match(artist, found):
+            return r
+    return None
+
+
+def best_match(artist: str, title: str) -> tuple[str, str]:
+    """Return (youtube_id, matched_title) or raise RuntimeError('NO_MATCH').
+
+    Tries progressively simpler queries rather than giving up after one.
+    NTS artist fields are scraped free text, and a trailing "_" or a
+    colon-joined second artist is enough to zero the result set while the
+    track is sitting right there in the catalogue.
+
+    The full query runs first and unchanged, so anything that resolves today
+    resolves identically and never reaches the fallbacks.
+    """
+    client = YTMusic()
+    variants = query_variants.build_query_variants(artist, title)
+    title_only = variants[-1] if len(variants) > 1 else None
+
+    for query in variants:
+        results = client.search(query) or []
+        if not results:
+            continue
+        if query == title_only:
+            top = _pick_title_only(results, title, artist)
+        else:
+            top = _pick(results, title)
+        if top and top.get("videoId"):
+            return top["videoId"], top.get("title") or title
+
+    raise RuntimeError("NO_MATCH")
 
 
 def _download_url(url: str, output: str) -> dict:

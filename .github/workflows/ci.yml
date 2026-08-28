@@ -24,6 +24,11 @@ jobs:
       - name: Generate Xcode project
         run: xcodegen generate
 
+      # The resolver's query fallback is Python and stdlib-only, so it runs
+      # without the ytmusicapi/yt_dlp bundle being installed.
+      - name: Resolver — query fallback tests
+        run: python3 -m unittest discover -s Vendor/spotify-downloader-bundle -p 'test_*.py' -v
+
       - name: RatbatCore — macOS tests
         run: |
           set -o pipefail
