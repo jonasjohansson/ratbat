@@ -183,6 +183,32 @@ public actor NTSStationController {
         self.selectionPolicy = selectionPolicy
     }
 
+    // MARK: - Test seams
+
+    /// Substitute resolution so the pool/budget logic can be exercised
+    /// without a Python subprocess or the live YouTube Music catalogue.
+    ///
+    /// Follows the `selectionPolicy` closure this type already takes: the
+    /// alternative is that `nextTrack()` — where a station decides whether
+    /// it is still alive — stays untestable, which is how a counter bug
+    /// took a station off air unnoticed.
+    internal var resolveOverride: (@Sendable (String, String) async throws -> TrackResolver.Resolution)?
+
+    /// Seed the pool directly, bypassing the NTS scrape.
+    internal func seedPoolForTesting(_ candidates: [SourceCandidate]) {
+        pool = candidates
+        cursor = 0
+    }
+
+    internal func setResolveOverrideForTesting(
+        _ fn: @escaping @Sendable (String, String) async throws -> TrackResolver.Resolution
+    ) {
+        resolveOverride = fn
+    }
+
+    /// The station id `history` rows are keyed on.
+    internal var stationIDForTesting: UUID { config.id }
+
     /// Produce the next resolved track for this station.
     ///
     /// Skips anything already in history. Skips candidates with no
@@ -206,12 +232,26 @@ public actor NTSStationController {
         // and take the station off air.
         let maxAttempts = 30
         let maxTransientFailures = 8
+        // Pool traversals allowed in one call. Refilling resets `cursor` to
+        // 0, so without a bound a pool that is entirely already-played would
+        // re-walk itself forever. Each refill drains up to 8 more shows, so
+        // four is a meaningful amount of new supply before concluding there
+        // is none.
+        let maxRefills = 4
         var attempts = 0
         var transientFailures = 0
+        var refills = 0
+        // Counted but NOT budgeted — see below. Kept for the log line on the
+        // way out, because when this station folded the logs said only
+        // "exhausted" and gave no way to tell a spent pool from a spent
+        // counter.
+        var alreadyPlayed = 0
 
         while attempts < maxAttempts, transientFailures < maxTransientFailures {
 
             if cursor >= pool.count {
+                guard refills < maxRefills else { break }
+                refills += 1
                 try await refillPool()
             }
             guard cursor < pool.count else {
@@ -227,7 +267,26 @@ public actor NTSStationController {
                 artist: candidate.artist,
                 title: candidate.title
             )
-            if seen { attempts += 1; continue }
+            // Deliberately does NOT spend the candidate budget.
+            //
+            // It used to. `attempts` was one counter for "this candidate is
+            // unusable" and "we have played this already", and the second is
+            // not evidence of anything — it is the normal state of every
+            // track a station has ever played. NTS Techno had 28 plays and
+            // two tracks the resolver could not match: 28 + 2 = 30 =
+            // maxAttempts, so it threw poolExhausted on the FIRST track of
+            // every run, surfaced as `nil`, and the station went off air and
+            // vanished from now.json. The website showed it offline.
+            //
+            // The bug scaled with success: every station folds once its play
+            // count reaches the cap. NTS Disco only escaped because it has
+            // `shufflePool: true`, so a reshuffle kept finding unplayed
+            // tracks before the counter ran out.
+            //
+            // Termination does not depend on this counter: each iteration
+            // advances `cursor`, and pool traversals are bounded by
+            // `maxRefills`.
+            if seen { alreadyPlayed += 1; continue }
 
             let dedup = DedupKey(
                 artist: candidate.artist.lowercased(),
@@ -241,10 +300,15 @@ public actor NTSStationController {
                 ?? URL(string: "https://www.nts.live/")!
 
             do {
-                let resolution = try await resolver.resolve(
-                    artist: candidate.artist,
-                    title: candidate.title
-                )
+                let resolution: TrackResolver.Resolution
+                if let resolveOverride {
+                    resolution = try await resolveOverride(candidate.artist, candidate.title)
+                } else {
+                    resolution = try await resolver.resolve(
+                        artist: candidate.artist,
+                        title: candidate.title
+                    )
+                }
                 let rowid = try await history.record(
                     station: config.id,
                     artist: candidate.artist,
@@ -296,6 +360,16 @@ public actor NTSStationController {
         if transientFailures >= maxTransientFailures {
             throw Error.transientResolveFailure(count: transientFailures)
         }
+        // Say which budget ran out. "exhausted" alone was undiagnosable:
+        // it could not distinguish an empty pool from a spent counter.
+        logger.notice(
+            """
+            pool exhausted for \(self.config.name, privacy: .public): \
+            \(attempts, privacy: .public) unusable candidates, \
+            \(alreadyPlayed, privacy: .public) already played, \
+            \(refills, privacy: .public) refills, pool \(self.pool.count, privacy: .public)
+            """
+        )
         throw Error.poolExhausted
     }
 
