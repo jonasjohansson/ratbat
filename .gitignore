@@ -46,3 +46,6 @@ __pycache__/
 # Chat attachment uploads — land in the working tree and can contain
 # screenshots of secrets. This repo is public; never let these in.
 .roder-uploads/
+
+# Xcode iOS build output (local only)
+build-ios/
